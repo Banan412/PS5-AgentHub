@@ -1,0 +1,125 @@
+[workspace]
+resolver = "2"
+exclude = [
+    "crates/ps5-sys",
+    "crates/ps5",
+    "crates/ps5-std-rt",
+    "bins/m1-ps5-probe",
+]
+members = [
+    "crates/ps5-agent-core",
+    "crates/ps5-agent-config",
+    "crates/ps5-agent-logging",
+    "crates/ps5-agent-database",
+    "crates/ps5-agent-memory",
+    "crates/ps5-agent-inference",
+    "crates/ps5-agent-tools",
+    "crates/ps5-agent-messaging",
+    "crates/ps5-agent-manager",
+    "crates/ps5-agent-runtime",
+    "crates/ps5-agent-dashboard",
+    "crates/ps5-agent-http",
+    "crates/mock-ps5lm",
+    ".",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("sie"))', 'cfg(mio_unsupported_force_waker_pipe)'] }
+
+[workspace.dependencies]
+ps5-agent-core = { path = "crates/ps5-agent-core" }
+ps5-agent-config = { path = "crates/ps5-agent-config" }
+ps5-agent-logging = { path = "crates/ps5-agent-logging" }
+ps5-agent-database = { path = "crates/ps5-agent-database" }
+ps5-agent-memory = { path = "crates/ps5-agent-memory" }
+ps5-agent-inference = { path = "crates/ps5-agent-inference" }
+ps5-agent-tools = { path = "crates/ps5-agent-tools" }
+ps5-agent-messaging = { path = "crates/ps5-agent-messaging" }
+ps5-agent-manager = { path = "crates/ps5-agent-manager" }
+ps5-agent-runtime = { path = "crates/ps5-agent-runtime" }
+ps5-agent-dashboard = { path = "crates/ps5-agent-dashboard" }
+ps5-agent-http = { path = "crates/ps5-agent-http" }
+mock-ps5lm = { path = "crates/mock-ps5lm" }
+
+async-trait = "0.1"
+argon2 = "0.5"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+bytes = "1.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+futures-util = "0.3"
+hex = "0.4"
+http = "1.3"
+libc = "0.2"
+rand = "0.8"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "fs", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit", "set-header", "trace"] }
+url = "2.5"
+uuid = { version = "1.12", features = ["v4", "serde"] }
+
+[package]
+name = "ps5-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Autonomous multi-agent AI runtime and web dashboard for jailbroken PS5 (FW 13.40) + PS5LM"
+
+[lints]
+workspace = true
+
+[dependencies]
+ps5-agent-core.workspace = true
+ps5-agent-config.workspace = true
+ps5-agent-logging.workspace = true
+ps5-agent-database.workspace = true
+ps5-agent-memory.workspace = true
+ps5-agent-inference.workspace = true
+ps5-agent-tools.workspace = true
+ps5-agent-messaging.workspace = true
+ps5-agent-manager.workspace = true
+ps5-agent-runtime.workspace = true
+ps5-agent-dashboard.workspace = true
+ps5-agent-http.workspace = true
+
+async-trait.workspace = true
+hex.workspace = true
+libc.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[target.'cfg(target_vendor = "sie")'.dependencies]
+ps5 = { path = "crates/ps5", features = ["notify", "hw"] }
+ps5-std-rt = { path = "crates/ps5-std-rt" }
+
+[dev-dependencies]
+mock-ps5lm.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile = "3.15"
+tokio.workspace = true
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = false

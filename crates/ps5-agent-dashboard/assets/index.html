@@ -1,0 +1,1752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>PS5 Agent Command Center</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+
+  <!-- Login Overlay -->
+  <div id="login-overlay" class="login-overlay" role="dialog" aria-modal="true" aria-labelledby="login-title" hidden>
+    <div class="login-card">
+      <div class="login-brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="14" rx="2"></rect>
+            <path d="M8 20h8"></path>
+            <path d="M12 18v2"></path>
+            <circle cx="9" cy="11" r="1.5"></circle>
+            <path d="M13 11h4"></path>
+          </svg>
+        </div>
+        <div>
+          <h1 id="login-title" class="login-title">PS5 Agent Command Center</h1>
+          <p class="login-subtitle">Local Multi-Agent Runtime &amp; PS5LM Control Plane</p>
+        </div>
+      </div>
+
+      <div id="login-error" class="alert alert-danger" role="alert" hidden></div>
+
+      <form id="login-form" class="stack-form" novalidate>
+        <div class="field">
+          <label for="login-username">Username</label>
+          <input id="login-username" name="username" type="text" class="input" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" value="admin" required placeholder="admin">
+        </div>
+        <div class="field">
+          <label for="login-password">Password</label>
+          <div class="password-row">
+            <input id="login-password" name="password" type="password" class="input" autocomplete="current-password" required placeholder="Enter password">
+            <button id="login-toggle-pw" type="button" class="btn btn-secondary btn-icon" aria-label="Show password" aria-pressed="false">Show</button>
+          </div>
+        </div>
+        <button id="login-submit" type="submit" class="btn btn-primary btn-block">Sign In</button>
+      </form>
+
+      <p class="login-footnote">Offline LAN interface &middot; Zero external CDNs &middot; CSRF &amp; session protected</p>
+    </div>
+  </div>
+
+  <!-- Main Dashboard Shell -->
+  <div id="app-shell" class="app-shell" hidden>
+    <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+
+    <aside id="sidebar" class="sidebar" aria-label="Primary Navigation">
+      <div class="sidebar-header">
+        <div class="sidebar-brand">
+          <div class="brand-mark brand-mark-sm" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+              <path d="M2 17l10 5 10-5"></path>
+              <path d="M2 12l10 5 10-5"></path>
+            </svg>
+          </div>
+          <div>
+            <div class="brand-name">PS5 Agent</div>
+            <div class="brand-tag">Command Center</div>
+          </div>
+        </div>
+        <button id="sidebar-collapse-btn" type="button" class="btn btn-icon sidebar-collapse-btn" title="Collapse sidebar" aria-label="Collapse sidebar" aria-expanded="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="15 18 9 12 15 6"></polyline>
+          </svg>
+        </button>
+        <button id="sidebar-close-btn" type="button" class="btn btn-ghost btn-icon mobile-only" aria-label="Close navigation menu">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M18 6L6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+
+      <nav class="sidebar-nav" aria-label="Dashboard Sections">
+        <button type="button" class="nav-item is-active" data-section="overview">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="3" width="7" height="9" rx="1"></rect>
+            <rect x="14" y="3" width="7" height="5" rx="1"></rect>
+            <rect x="14" y="12" width="7" height="9" rx="1"></rect>
+            <rect x="3" y="16" width="7" height="5" rx="1"></rect>
+          </svg>
+          <span class="nav-label">Overview</span>
+          <span id="nav-badge-approvals" class="nav-badge badge-warning" hidden>0</span>
+        </button>
+
+        <button type="button" class="nav-item" data-section="chat">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+          </svg>
+          <span class="nav-label">Main Chat</span>
+        </button>
+
+        <button id="nav-files" type="button" class="nav-item" data-section="files" aria-label="Files">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+          </svg>
+          <span class="nav-label">Files</span>
+        </button>
+
+        <button type="button" class="nav-item" data-section="agents">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+            <circle cx="9" cy="7" r="4"></circle>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+          </svg>
+          <span class="nav-label">Agents</span>
+        </button>
+
+        <button type="button" class="nav-item" data-section="a2a">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="17 1 21 5 17 9"></polyline>
+            <path d="M3 11V9a4 4 0 0 1 4-4h14"></path>
+            <polyline points="7 23 3 19 7 15"></polyline>
+            <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
+          </svg>
+          <span class="nav-label">Agent Communication</span>
+        </button>
+
+        <button type="button" class="nav-item" data-section="tasks">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 11l3 3L22 4"></path>
+            <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
+          </svg>
+          <span class="nav-label">Tasks</span>
+          <span id="nav-badge-tasks" class="nav-badge badge-info" hidden>0</span>
+        </button>
+
+        <button id="nav-schedules" type="button" class="nav-item" data-section="schedules" aria-label="Schedules">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+            <line x1="16" y1="2" x2="16" y2="6"></line>
+            <line x1="8" y1="2" x2="8" y2="6"></line>
+            <line x1="3" y1="10" x2="21" y2="10"></line>
+            <circle cx="12" cy="16" r="3"></circle>
+            <polyline points="12 14.5 12 16 13 17"></polyline>
+          </svg>
+          <span class="nav-label">Schedules</span>
+          <span id="nav-badge-schedules" class="nav-badge badge-info">0</span>
+        </button>
+
+        <button type="button" class="nav-item" data-section="memory">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
+            <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
+            <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
+          </svg>
+          <span class="nav-label">Memory</span>
+        </button>
+
+        <button type="button" class="nav-item" data-section="tools">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>
+          </svg>
+          <span class="nav-label">Tools</span>
+        </button>
+
+        <button id="nav-extensions" type="button" class="nav-item" data-section="extensions" aria-label="Extensions">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 2c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"></path>
+          </svg>
+          <span class="nav-label">Extensions</span>
+        </button>
+
+        <button id="nav-sandbox" type="button" class="nav-item" data-section="sandbox" aria-label="Sandbox &amp; Doctor">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            <path d="M9 12l2 2 4-4"></path>
+          </svg>
+          <span class="nav-label">Sandbox &amp; Doctor</span>
+          <span id="nav-badge-doctor" class="nav-badge badge-warning" hidden>0</span>
+        </button>
+
+        <button type="button" class="nav-item" data-section="logs">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <line x1="16" y1="13" x2="8" y2="13"></line>
+            <line x1="16" y1="17" x2="8" y2="17"></line>
+          </svg>
+          <span class="nav-label">Logs</span>
+        </button>
+
+        <button type="button" class="nav-item" data-section="settings">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+          <span class="nav-label">Settings</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="session-user">
+          <span class="session-dot" aria-hidden="true"></span>
+          <span id="session-username" class="session-name">admin</span>
+        </div>
+        <button id="logout-btn" type="button" class="btn btn-secondary btn-block">Logout</button>
+      </div>
+    </aside>
+
+    <div class="main-wrapper">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="mobile-menu-btn" type="button" class="btn btn-ghost btn-icon mobile-only" aria-label="Open navigation menu" aria-expanded="false" aria-controls="sidebar">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <line x1="3" y1="6" x2="21" y2="6"></line>
+              <line x1="3" y1="12" x2="21" y2="12"></line>
+              <line x1="3" y1="18" x2="21" y2="18"></line>
+            </svg>
+          </button>
+          <button id="sidebar-expand-btn" type="button" class="btn btn-icon sidebar-expand-btn" title="Expand sidebar" aria-label="Expand sidebar" aria-expanded="false" hidden>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="9 18 15 12 9 6"></polyline>
+            </svg>
+          </button>
+          <div class="topbar-titles">
+            <h1 id="page-title" class="page-title">Overview</h1>
+            <p id="page-subtitle" class="page-subtitle">PS5 telemetry, inference health, and active runtime summary</p>
+          </div>
+        </div>
+        <div class="topbar-right">
+          <button id="topbar-approvals-btn" type="button" class="pill pill-warning pill-btn" hidden>
+            <span id="topbar-approvals-count">0</span> Pending Approvals
+          </button>
+          <span id="sse-status-pill" class="pill pill-muted" title="Live event stream status">Connecting&hellip;</span>
+          <button id="refresh-btn" type="button" class="btn btn-secondary btn-sm" aria-label="Refresh current view">Refresh</button>
+        </div>
+      </header>
+
+      <main id="main-content" class="main-content" tabindex="-1">
+        <!-- 1. OVERVIEW -->
+        <section id="section-overview" class="view-section">
+          <div id="pending-approvals-banner" class="approvals-banner" hidden></div>
+
+          <div class="kpi-grid">
+            <article class="card kpi-card">
+              <div class="card-header">
+                <h2 class="card-title">PS5 Hardware &amp; Telemetry</h2>
+                <span id="ov-net-pill" class="pill pill-success">LAN OK</span>
+              </div>
+              <dl class="metric-list">
+                <div class="metric-row">
+                  <dt>Hardware Model</dt>
+                  <dd id="ov-ps5-model" class="mono">&mdash;</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Firmware</dt>
+                  <dd id="ov-ps5-fw" class="mono">&mdash;</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>CPU / SoC Temp</dt>
+                  <dd id="ov-ps5-temp" class="mono">&mdash;</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Process RSS / Uptime</dt>
+                  <dd id="ov-rss-uptime" class="mono">&mdash;</dd>
+                </div>
+              </dl>
+            </article>
+
+            <article class="card kpi-card">
+              <div class="card-header">
+                <h2 class="card-title">PS5LM Inference</h2>
+                <span id="ov-ps5lm-pill" class="pill pill-muted">Checking</span>
+              </div>
+              <dl class="metric-list">
+                <div class="metric-row">
+                  <dt>Loaded Model</dt>
+                  <dd id="ov-loaded-model" class="mono truncate">&mdash;</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Latency (p50 / p95 / last)</dt>
+                  <dd id="ov-latency" class="mono">&mdash;</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Tokens (Prompt / Comp)</dt>
+                  <dd id="ov-tokens" class="mono">&mdash;</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Inference Req / Errors</dt>
+                  <dd id="ov-inf-counts" class="mono">&mdash;</dd>
+                </div>
+              </dl>
+            </article>
+
+            <article class="card kpi-card">
+              <div class="card-header">
+                <h2 class="card-title">Tasks &amp; Storage</h2>
+                <span id="ov-storage-pill" class="pill pill-info">&mdash;</span>
+              </div>
+              <dl class="metric-list">
+                <div class="metric-row">
+                  <dt>Active / Queued</dt>
+                  <dd id="ov-tasks-active" class="mono">&mdash;</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Completed / Failed</dt>
+                  <dd id="ov-tasks-done" class="mono">&mdash;</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>DB Ops / Avg Time</dt>
+                  <dd id="ov-db-stats" class="mono">&mdash;</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>HTTP Req / Avg Time</dt>
+                  <dd id="ov-http-stats" class="mono">&mdash;</dd>
+                </div>
+              </dl>
+            </article>
+          </div>
+
+          <article class="card">
+            <div class="card-header">
+              <h2 class="card-title">Quick Actions</h2>
+              <span class="text-muted text-sm">Jump straight to common workflows</span>
+            </div>
+            <div class="quick-actions">
+              <button type="button" class="btn btn-primary" data-quick="chat">Open Main Chat</button>
+              <button type="button" class="btn btn-secondary" data-quick="create-agent">Create Agent</button>
+              <button type="button" class="btn btn-secondary" data-quick="tasks">Inspect Tasks</button>
+              <button type="button" class="btn btn-secondary" data-quick="tools">Test Tools</button>
+              <button type="button" class="btn btn-secondary" data-quick="checkpoint">Checkpoint DB</button>
+              <button type="button" class="btn btn-secondary" data-quick="logs">View Runtime Logs</button>
+            </div>
+          </article>
+        </section>
+
+        <!-- 2. MAIN CHAT -->
+        <section id="section-chat" class="view-section" hidden>
+          <div class="chat-layout">
+            <aside id="chat-sidebar" class="chat-sidebar card" aria-label="Conversations">
+              <div class="chat-sidebar-top">
+                <div class="chat-new-btns">
+                  <button id="new-direct-chat-btn" type="button" class="btn btn-primary btn-sm">+ New Direct Chat</button>
+                  <button id="new-group-chat-btn" type="button" class="btn btn-secondary btn-sm">+ New Group Chat</button>
+                </div>
+                <div class="field-inline">
+                  <label class="sr-only" for="chat-search-input">Search conversations</label>
+                  <input id="chat-search-input" type="search" class="input" placeholder="Search conversations&hellip;">
+                </div>
+              </div>
+              <div id="conversation-list" class="conversation-list" role="list"></div>
+            </aside>
+
+            <div class="chat-main card">
+              <div class="chat-header">
+                <div class="chat-header-left">
+                  <button id="chat-sidebar-toggle" type="button" class="btn btn-secondary btn-sm mobile-only" aria-expanded="false">Conversations</button>
+                  <div class="min-w-0">
+                    <h2 id="chat-conv-title" class="card-title truncate">Select or start a conversation</h2>
+                    <p id="chat-conv-meta" class="text-muted text-sm truncate">Choose Commander or any enabled agent</p>
+                  </div>
+                </div>
+                <div id="chat-header-actions" class="chat-header-actions">
+                  <label class="toggle-switch chat-raw-toggle" for="chat-raw-output-toggle" title="Show raw unformatted model output including &lt;think&gt; blocks">
+                    <input id="chat-raw-output-toggle" type="checkbox" aria-label="Show raw unformatted model output">
+                    <span class="toggle-slider" aria-hidden="true"></span>
+                    <span class="toggle-label">Show raw output</span>
+                  </label>
+                  <button id="chat-fork-conv-btn" type="button" class="btn btn-secondary btn-sm" title="Fork conversation">Fork Chat</button>
+                </div>
+              </div>
+
+              <div id="chat-active-task-bar" class="chat-task-bar" hidden>
+                <div class="chat-task-info">
+                  <span id="chat-task-status-pill" class="pill pill-info">RUNNING</span>
+                  <span id="chat-task-note" class="text-sm truncate">Processing&hellip;</span>
+                </div>
+                <div id="chat-task-agents" class="chat-task-agents"></div>
+                <div class="chat-task-controls">
+                  <progress id="chat-task-progress-fill" class="task-progress" max="100" value="0" aria-label="Task progress"></progress>
+                  <span id="chat-task-pct" class="mono text-sm">0%</span>
+                  <button id="chat-cancel-task-btn" type="button" class="btn btn-danger btn-sm">Cancel Task</button>
+                </div>
+              </div>
+
+              <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+
+              <div id="chat-ephemeral-card" class="chat-ephemeral-card card" role="region" aria-label="Ephemeral Side Response" hidden>
+                <div class="chat-ephemeral-head">
+                  <span id="chat-ephemeral-title" class="chat-ephemeral-title">Ephemeral Side Response</span>
+                  <button id="chat-ephemeral-close-btn" type="button" class="btn btn-ghost btn-sm" aria-label="Dismiss ephemeral response">Dismiss</button>
+                </div>
+                <div id="chat-ephemeral-body" class="chat-ephemeral-body"></div>
+              </div>
+
+              <div id="chat-composer-wrap" class="chat-composer-wrap">
+                <div id="chat-drop-hint" class="chat-drop-hint" hidden>Drop photos or workspace files here to attach</div>
+                <div id="slash-agent-menu" class="slash-menu" role="listbox" aria-label="Agent slash command autocomplete" hidden></div>
+
+                <div class="composer-toolbar">
+                  <div class="composer-toolbar-group">
+                    <label class="sr-only" for="chat-agent-select">Target Agent</label>
+                    <select id="chat-agent-select" class="select composer-select" aria-label="Target Agent">
+                      <option value="">Auto / Group Coordinator</option>
+                    </select>
+
+                    <label class="sr-only" for="thinking-level-select">Thinking Mode</label>
+                    <select id="thinking-level-select" class="select composer-select" aria-label="Thinking Mode">
+                      <option value="off">Thinking: Off</option>
+                      <option value="low">Thinking: Low</option>
+                      <option value="medium" selected>Thinking: Medium</option>
+                      <option value="high">Thinking: High</option>
+                      <option value="max">Thinking: Max</option>
+                    </select>
+                  </div>
+
+                  <div class="composer-toolbar-group">
+                    <button type="button" id="chat-slash-btn" class="btn btn-secondary btn-sm" aria-label="Toggle Slash Commands" aria-expanded="false" aria-controls="chat-slash-palette">/ Commands</button>
+                    <input id="chat-file-input" type="file" multiple accept="image/*,.txt,.md,.json,.html,.htm,.css,.js,.rs,.py,.toml,.yaml,.yml,.csv,.xml,.log" aria-label="Attach photo or workspace file" hidden>
+                    <button type="button" id="btn-chat-attach" class="btn btn-secondary btn-sm" aria-label="Attach Photo or File">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+                      </svg>
+                      <span>Attach Photo / File</span>
+                    </button>
+                    <span id="chat-active-streams" class="pill pill-muted subtle" aria-live="polite">0 active</span>
+                  </div>
+                </div>
+
+                <div id="chat-attachment-strip" class="attachment-strip" aria-live="polite" hidden></div>
+                <div id="chat-slash-palette" class="chat-slash-palette" role="listbox" aria-label="Slash Commands" hidden></div>
+
+                <form id="chat-composer-form" class="chat-composer">
+                  <label class="sr-only" for="chat-input">Message</label>
+                  <textarea id="chat-input" class="input chat-textarea" rows="2" placeholder="Message or /agent &lt;name&gt; &lt;prompt&gt; (Shift+Enter for newline, drag-drop or paste photos)&hellip;" disabled></textarea>
+                  <button id="chat-send-btn" type="submit" class="btn btn-primary" disabled>Send</button>
+                  <button id="chat-send-immediate-btn" type="button" class="btn btn-secondary" title="Send immediately and bypass queue" disabled>Send Now</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 3. AGENTS -->
+        <section id="section-agents" class="view-section" hidden>
+          <div class="toolbar card">
+            <div class="toolbar-info">
+              <h2 class="card-title">Agent Registry</h2>
+              <span id="agents-count-summary" class="text-muted text-sm">Loading agents&hellip;</span>
+            </div>
+            <div class="toolbar-actions">
+              <button id="enable-all-agents-btn" type="button" class="btn btn-success">Boot / Enable All Agents</button>
+              <button id="create-agent-btn" type="button" class="btn btn-primary">+ Create Agent</button>
+            </div>
+          </div>
+          <div id="agents-grid" class="agents-grid"></div>
+        </section>
+
+        <!-- 4. AGENT COMMUNICATION -->
+        <section id="section-a2a" class="view-section" hidden>
+          <div class="toolbar card">
+            <div class="filter-row">
+              <div class="field-compact">
+                <label for="a2a-filter-task">Task ID</label>
+                <input id="a2a-filter-task" type="text" class="input" placeholder="Filter by task ID">
+              </div>
+              <div class="field-compact">
+                <label for="a2a-filter-agent">Agent</label>
+                <select id="a2a-filter-agent" class="select">
+                  <option value="">All Agents</option>
+                </select>
+              </div>
+              <div class="field-compact">
+                <label for="a2a-filter-type">Message Type</label>
+                <select id="a2a-filter-type" class="select">
+                  <option value="">All Types</option>
+                  <option value="TASK_ASSIGNMENT">TASK_ASSIGNMENT</option>
+                  <option value="TASK_UPDATE">TASK_UPDATE</option>
+                  <option value="TASK_COMPLETED">TASK_COMPLETED</option>
+                  <option value="INFORMATION_REQUEST">INFORMATION_REQUEST</option>
+                  <option value="INFORMATION_RESPONSE">INFORMATION_RESPONSE</option>
+                  <option value="AGENT_MESSAGE">AGENT_MESSAGE</option>
+                  <option value="ERROR_REPORT">ERROR_REPORT</option>
+                  <option value="APPROVAL_REQUEST">APPROVAL_REQUEST</option>
+                  <option value="APPROVAL_RESPONSE">APPROVAL_RESPONSE</option>
+                </select>
+              </div>
+              <div class="field-compact field-end">
+                <button id="a2a-apply-btn" type="button" class="btn btn-primary">Apply Filters</button>
+              </div>
+            </div>
+          </div>
+          <div id="a2a-list" class="card table-card"></div>
+        </section>
+
+        <!-- 5. TASKS -->
+        <section id="section-tasks" class="view-section" hidden>
+          <div class="toolbar card">
+            <div id="tasks-filter-pills" class="pill-tabs" role="tablist" aria-label="Task status filter">
+              <button type="button" class="tab-btn is-active" data-task-filter="all" role="tab" aria-selected="true">All</button>
+              <button type="button" class="tab-btn" data-task-filter="active" role="tab" aria-selected="false">Active</button>
+              <button type="button" class="tab-btn" data-task-filter="PENDING" role="tab" aria-selected="false">Pending</button>
+              <button type="button" class="tab-btn" data-task-filter="COMPLETED" role="tab" aria-selected="false">Completed</button>
+              <button type="button" class="tab-btn" data-task-filter="FAILED" role="tab" aria-selected="false">Failed</button>
+              <button type="button" class="tab-btn" data-task-filter="CANCELLED" role="tab" aria-selected="false">Cancelled</button>
+            </div>
+            <div class="toolbar-actions">
+              <span id="tasks-count-summary" class="text-muted text-sm"></span>
+            </div>
+          </div>
+          <div id="tasks-container" class="card table-card"></div>
+        </section>
+
+        <!-- 5b. SCHEDULES -->
+        <section id="section-schedules" class="view-section" hidden>
+          <div class="toolbar card">
+            <div class="toolbar-info">
+              <h2 class="card-title">Schedules &amp; Autonomous Tasks</h2>
+              <span class="text-muted text-sm">Autonomous background &amp; offline agent execution — runs even when no browser dashboard is open.</span>
+            </div>
+            <div class="toolbar-actions">
+              <button id="btn-refresh-schedules" type="button" class="btn btn-secondary">Refresh</button>
+              <button id="btn-new-schedule" type="button" class="btn btn-primary">+ New Schedule</button>
+            </div>
+          </div>
+
+          <div class="card schedule-ai-card">
+            <div class="schedule-ai-header">
+              <div>
+                <h3 class="card-title">AI Schedule Builder</h3>
+                <p class="text-muted text-sm">Describe a one-off or recurring task in Polish or English. Preview or create an autonomous background job.</p>
+              </div>
+            </div>
+            <div class="field">
+              <label for="schedule-ai-prompt">Natural-Language Schedule Request</label>
+              <textarea id="schedule-ai-prompt" class="input" rows="2" placeholder="e.g. Every day at 08:30 inspect system health, or Codziennie o 09:00 sprawdź logi i zapisz podsumowanie&hellip;"></textarea>
+            </div>
+            <div class="schedule-ai-controls">
+              <div class="field-compact">
+                <label for="schedule-ai-agent">Target Agent</label>
+                <select id="schedule-ai-agent" class="select">
+                  <option value="">Auto (Commander)</option>
+                </select>
+              </div>
+              <label class="checkbox-row" for="schedule-ai-auto-create">
+                <input id="schedule-ai-auto-create" type="checkbox">
+                <span>Auto-create schedule immediately</span>
+              </label>
+              <button id="btn-schedule-ai-parse" type="button" class="btn btn-primary">Parse Schedule</button>
+            </div>
+            <div class="schedule-examples-row" role="group" aria-label="Example schedule prompts">
+              <button type="button" class="schedule-example-chip" data-prompt="Codziennie o 08:30 sprawdź status PS5LM i zapisz raport">Codziennie o 08:30 sprawdź status PS5LM i zapisz raport</button>
+              <button type="button" class="schedule-example-chip" data-prompt="Every 30 minutes check workspace files and log recent changes">Every 30 minutes check workspace files and log recent changes</button>
+              <button type="button" class="schedule-example-chip" data-prompt="Za 15 minut sprawdź logi systemu i przygotuj krótkie podsumowanie">Za 15 minut sprawdź logi systemu i przygotuj krótkie podsumowanie</button>
+              <button type="button" class="schedule-example-chip" data-prompt="Every Monday at 09:00 prepare a weekly diagnostic digest">Every Monday at 09:00 prepare a weekly diagnostic digest</button>
+            </div>
+            <div id="schedule-ai-preview" class="schedule-ai-preview" hidden></div>
+          </div>
+
+          <div class="toolbar card">
+            <div class="schedule-filter-pills pill-tabs" role="tablist" aria-label="Schedule status filter">
+              <button type="button" class="tab-btn is-active" data-sched-filter="all" role="tab" aria-selected="true">All</button>
+              <button type="button" class="tab-btn" data-sched-filter="enabled" role="tab" aria-selected="false">Enabled</button>
+              <button type="button" class="tab-btn" data-sched-filter="paused" role="tab" aria-selected="false">Paused</button>
+              <button type="button" class="tab-btn" data-sched-filter="failed" role="tab" aria-selected="false">Failed</button>
+            </div>
+            <div class="toolbar-actions">
+              <span id="schedules-stats" class="text-muted text-sm">0 schedules</span>
+            </div>
+          </div>
+
+          <div id="schedules-container" class="schedule-list"></div>
+        </section>
+
+        <!-- 6. MEMORY -->
+        <section id="section-memory" class="view-section" hidden>
+          <div class="toolbar card">
+            <div class="filter-row">
+              <div class="field-compact">
+                <label for="memory-filter-scope">Scope</label>
+                <select id="memory-filter-scope" class="select">
+                  <option value="">All Scopes</option>
+                  <option value="conversation">conversation</option>
+                  <option value="agent">agent</option>
+                  <option value="project">project</option>
+                  <option value="task">task</option>
+                  <option value="user_preference">user_preference</option>
+                </select>
+              </div>
+              <div class="field-compact">
+                <label for="memory-filter-namespace">Namespace</label>
+                <input id="memory-filter-namespace" type="text" class="input" placeholder="e.g. global">
+              </div>
+              <div class="field-compact">
+                <label for="memory-filter-agent">Owner Agent</label>
+                <select id="memory-filter-agent" class="select">
+                  <option value="">Any Agent</option>
+                </select>
+              </div>
+              <div class="field-compact field-end">
+                <button id="memory-apply-btn" type="button" class="btn btn-secondary">Filter</button>
+                <button id="import-memories-btn" type="button" class="btn btn-secondary">Import JSON</button>
+                <button id="export-memories-btn" type="button" class="btn btn-secondary">Export JSON</button>
+                <button id="add-memory-btn" type="button" class="btn btn-primary">+ Add Memory</button>
+              </div>
+            </div>
+          </div>
+          <div id="memory-list" class="memory-grid"></div>
+        </section>
+
+        <!-- 7. TOOLS -->
+        <section id="section-tools" class="view-section" hidden>
+          <div class="tools-layout">
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <h2 class="card-title">Registered Tools</h2>
+                  <span id="tools-count-summary" class="text-muted text-sm"></span>
+                </div>
+                <div class="card-actions">
+                  <button id="add-custom-tool-btn" type="button" class="btn btn-primary btn-sm">+ Add Tool</button>
+                  <button id="import-tools-btn" type="button" class="btn btn-secondary btn-sm">Import Tools</button>
+                </div>
+              </div>
+              <div id="tools-list" class="tools-grid"></div>
+            </div>
+
+            <div class="card" id="tool-tester-card">
+              <div class="card-header">
+                <h2 class="card-title">Interactive Tool Tester</h2>
+                <span class="text-muted text-sm">Execute a tool directly with JSON arguments</span>
+              </div>
+              <form id="tool-tester-form" class="stack-form" novalidate>
+                <div class="filter-row">
+                  <div class="field-compact">
+                    <label for="tool-tester-select">Tool</label>
+                    <select id="tool-tester-select" class="select"></select>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="tool-tester-args">Arguments (JSON)</label>
+                  <textarea id="tool-tester-args" class="input mono" rows="4" spellcheck="false">{}</textarea>
+                </div>
+                <div class="toolbar-actions">
+                  <button id="tool-tester-run-btn" type="submit" class="btn btn-primary">Execute Tool</button>
+                  <span id="tool-tester-status" class="text-sm text-muted"></span>
+                </div>
+              </form>
+              <pre id="tool-tester-output" class="code-box" hidden></pre>
+            </div>
+
+            <div class="card table-card">
+              <div class="card-header">
+                <h2 class="card-title">Recent Tool Executions</h2>
+              </div>
+              <div id="tool-executions-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 8. WORKSPACE FILES -->
+        <section id="section-files" class="view-section section" hidden>
+          <div class="toolbar card">
+            <div id="files-breadcrumbs" class="breadcrumbs" aria-label="Workspace path">
+              <button type="button" class="btn btn-ghost btn-sm" data-file-path="">workspace</button>
+            </div>
+            <div class="toolbar-actions">
+              <button id="btn-files-refresh" type="button" class="btn btn-secondary btn-sm">Refresh</button>
+              <button id="btn-files-mkdir" type="button" class="btn btn-secondary btn-sm">+ New Folder</button>
+              <button id="btn-files-upload" type="button" class="btn btn-primary btn-sm">Upload File</button>
+              <input id="files-upload-input" type="file" multiple aria-label="Upload workspace files" hidden>
+            </div>
+          </div>
+
+          <div class="files-layout">
+            <div class="card table-card">
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th class="num">Size</th>
+                      <th>Modified</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="files-table-body"></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="card file-preview-panel">
+              <div class="card-header">
+                <div id="files-preview-header" class="file-preview-meta">Select a file to preview</div>
+                <div class="toolbar-actions">
+                  <button id="btn-file-download" type="button" class="btn btn-secondary btn-sm" disabled>Download</button>
+                  <button id="btn-file-run-html" type="button" class="btn btn-primary btn-sm" hidden>Run / Preview HTML</button>
+                  <button id="btn-file-view-script" type="button" class="btn btn-secondary btn-sm" hidden>View Script</button>
+                  <button id="btn-file-edit" type="button" class="btn btn-primary btn-sm" hidden>Edit Script</button>
+                  <button id="btn-file-save" type="button" class="btn btn-success btn-sm" hidden>Save</button>
+                  <button id="btn-file-cancel-edit" type="button" class="btn btn-ghost btn-sm" hidden>Cancel</button>
+                  <button id="btn-file-copy-content" type="button" class="btn btn-secondary btn-sm" disabled>Copy</button>
+                  <button id="btn-file-delete" type="button" class="btn btn-danger btn-sm" disabled>Delete</button>
+                </div>
+              </div>
+              <div id="files-preview-body" class="file-preview-body">
+                <div class="empty-state">
+                  <strong>No file selected</strong>
+                  <span class="text-sm">Choose a file on the left to inspect code, images, or sandboxed HTML apps.</span>
+                </div>
+              </div>
+              <iframe id="files-preview-iframe" class="preview-sandbox-frame" sandbox="allow-scripts" title="Sandboxed HTML preview" hidden></iframe>
+            </div>
+          </div>
+        </section>
+
+        <!-- 9. EXTENSIONS (SKILLS, MCP SERVERS, PLUGINS) -->
+        <section id="section-extensions" class="view-section section" hidden>
+          <div class="toolbar card">
+            <div class="pill-tabs" role="tablist" aria-label="Extension categories">
+              <button id="ext-tab-skills" type="button" class="tab-btn pill-tab is-active active" data-ext-tab="skills" role="tab" aria-selected="true">Skills</button>
+              <button id="ext-tab-mcp" type="button" class="tab-btn pill-tab" data-ext-tab="mcp" role="tab" aria-selected="false">MCP Servers</button>
+              <button id="ext-tab-plugins" type="button" class="tab-btn pill-tab" data-ext-tab="plugins" role="tab" aria-selected="false">Plugins</button>
+            </div>
+            <div class="toolbar-actions">
+              <button id="btn-import-skill" type="button" class="btn btn-primary btn-sm">+ Import Skill</button>
+              <button id="btn-add-mcp" type="button" class="btn btn-secondary btn-sm">+ Add MCP Server</button>
+              <button id="btn-import-plugin" type="button" class="btn btn-secondary btn-sm">+ Import Plugin</button>
+              <button id="btn-refresh-extensions" type="button" class="btn btn-secondary btn-sm">Refresh</button>
+            </div>
+          </div>
+
+          <div id="extensions-skills-pane" class="ext-grid" role="tabpanel" aria-labelledby="ext-tab-skills"></div>
+          <div id="extensions-mcp-pane" class="ext-grid" role="tabpanel" aria-labelledby="ext-tab-mcp" hidden></div>
+          <div id="extensions-plugins-pane" class="ext-grid" role="tabpanel" aria-labelledby="ext-tab-plugins" hidden></div>
+        </section>
+
+        <!-- 9b. SANDBOX, BROWSER & SYSTEM DOCTOR -->
+        <section id="section-sandbox" class="view-section" hidden>
+          <div class="toolbar card">
+            <div class="toolbar-info">
+              <h2 class="card-title">Sandbox, Browser &amp; System Doctor</h2>
+              <span class="text-muted text-sm">Configure execution isolation, run live diagnostics, inspect the stateful browser, edit brain files, and manage inbound webhooks.</span>
+            </div>
+            <div class="toolbar-actions">
+              <span id="sandbox-overall-status" class="pill pill-info" aria-live="polite">Checking&hellip;</span>
+            </div>
+          </div>
+
+          <div class="sandbox-grid">
+            <!-- Card 1: Sandbox & Network Policy -->
+            <article class="card">
+              <div class="card-header">
+                <h3 class="card-title">Sandbox &amp; Network Policy</h3>
+              </div>
+              <form id="sandbox-policy-form" class="stack-form" novalidate>
+                <div class="form-grid">
+                  <div class="field">
+                    <label for="sandbox-mode-select">Sandbox Mode</label>
+                    <select id="sandbox-mode-select" class="select" aria-label="Sandbox Mode">
+                      <option value="read_only">read_only</option>
+                      <option value="workspace_write">workspace_write</option>
+                      <option value="full_sandbox" selected>full_sandbox</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="sandbox-approval-select">Approval Policy</label>
+                    <select id="sandbox-approval-select" class="select" aria-label="Approval Policy">
+                      <option value="full_auto" selected>full_auto</option>
+                      <option value="on_request">on_request</option>
+                      <option value="always_ask">always_ask</option>
+                      <option value="never">never</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="sandbox-search-provider">Web Search Provider</label>
+                    <select id="sandbox-search-provider" class="select" aria-label="Web Search Provider">
+                      <option value="duckduckgo" selected>duckduckgo</option>
+                      <option value="searxng">searxng</option>
+                      <option value="brave">brave</option>
+                      <option value="tavily">tavily</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="sandbox-searxng-url">SearXNG Base URL</label>
+                    <input id="sandbox-searxng-url" type="url" class="input mono" placeholder="http://127.0.0.1:8080" aria-label="SearXNG Base URL">
+                  </div>
+                  <div class="field">
+                    <label for="sandbox-remote-browser-url">Remote Browser URL</label>
+                    <input id="sandbox-remote-browser-url" type="url" class="input mono" placeholder="http://127.0.0.1:9222" aria-label="Remote Browser URL">
+                  </div>
+                  <div class="field">
+                    <label for="sandbox-max-brain-chars">Max Brain Prompt Chars (0 = unlimited)</label>
+                    <input id="sandbox-max-brain-chars" type="number" min="0" max="500000" step="100" class="input mono" value="16000" aria-label="Max Brain Prompt Chars">
+                  </div>
+                  <div class="field">
+                    <label for="sandbox-heartbeat-secs">Heartbeat Interval (secs, 0 = off)</label>
+                    <input id="sandbox-heartbeat-secs" type="number" min="0" max="86400" step="1" class="input mono" value="0" aria-label="Heartbeat Interval Seconds">
+                  </div>
+                  <div class="field">
+                    <label for="sandbox-exec-timeout-secs">Exec Timeout (secs, 0 = unlimited)</label>
+                    <input id="sandbox-exec-timeout-secs" type="number" min="0" max="86400" step="1" class="input mono" value="60" aria-label="Sandbox Exec Timeout Seconds">
+                  </div>
+                  <div class="field">
+                    <label for="sandbox-max-exec-bytes">Max Exec Output Bytes (0 = unlimited)</label>
+                    <input id="sandbox-max-exec-bytes" type="number" min="0" max="104857600" step="1024" class="input mono" value="131072" aria-label="Max Exec Output Bytes">
+                  </div>
+                </div>
+
+                <div class="checkbox-grid">
+                  <label class="checkbox-row" for="sandbox-network-access">
+                    <input id="sandbox-network-access" type="checkbox" aria-label="Allow sandbox network access">
+                    <span>Allow Network Access</span>
+                  </label>
+                  <label class="checkbox-row" for="sandbox-allow-local-net">
+                    <input id="sandbox-allow-local-net" type="checkbox" aria-label="Allow local LAN requests">
+                    <span>Allow Local Network (LAN)</span>
+                  </label>
+                  <label class="checkbox-row" for="sandbox-allow-host-shell">
+                    <input id="sandbox-allow-host-shell" type="checkbox" aria-label="Allow host shell execution">
+                    <span>Allow Host Shell</span>
+                  </label>
+                  <label class="checkbox-row" for="sandbox-inject-brain">
+                    <input id="sandbox-inject-brain" type="checkbox" checked aria-label="Inject workspace brain markdown into prompts">
+                    <span>Inject Brain Prompt Files</span>
+                  </label>
+                </div>
+
+                <div class="form-grid">
+                  <div class="field">
+                    <label for="sandbox-allowed-domains">Allowed Domains (one per line)</label>
+                    <textarea id="sandbox-allowed-domains" class="input mono" rows="2" spellcheck="false" placeholder="Leave blank for any public domain" aria-label="Allowed Domains"></textarea>
+                  </div>
+                  <div class="field">
+                    <label for="sandbox-blocked-domains">Blocked Domains (one per line)</label>
+                    <textarea id="sandbox-blocked-domains" class="input mono" rows="2" spellcheck="false" placeholder="One domain per line" aria-label="Blocked Domains"></textarea>
+                  </div>
+                </div>
+
+                <div class="toolbar-actions">
+                  <button id="sandbox-save-btn" type="submit" class="btn btn-primary">Save Sandbox Policy</button>
+                  <span id="sandbox-policy-status" class="text-sm text-muted" aria-live="polite"></span>
+                </div>
+              </form>
+            </article>
+
+            <!-- Card 2: System Doctor (12 Checks) -->
+            <article class="card">
+              <div class="card-header">
+                <div>
+                  <h3 class="card-title">System Doctor (12 Checks)</h3>
+                  <div class="toolbar-actions">
+                    <span id="doctor-summary-pill" class="pill pill-muted">Not Run</span>
+                    <span id="doctor-checked-at" class="text-xs text-muted mono">&mdash;</span>
+                  </div>
+                </div>
+                <div class="toolbar-actions">
+                  <button id="btn-run-doctor" type="button" class="btn btn-primary btn-sm">Run Doctor</button>
+                  <button id="btn-fix-doctor" type="button" class="btn btn-secondary btn-sm">Auto-Fix Issues</button>
+                </div>
+              </div>
+              <div id="doctor-checks-list" class="doctor-checks-grid"></div>
+            </article>
+
+            <!-- Card 3: Stateful Sandbox Browser Console -->
+            <article class="card">
+              <div class="card-header">
+                <h3 class="card-title">Stateful Sandbox Browser Console</h3>
+                <span id="browser-status-bar" class="text-sm text-muted" aria-live="polite">No active session</span>
+              </div>
+              <div class="stack-form">
+                <div class="browser-console-bar">
+                  <div class="field-compact">
+                    <label for="browser-url-input">Target URL</label>
+                    <input id="browser-url-input" type="url" class="input mono" placeholder="http://127.0.0.1:8080/" aria-label="Browser Target URL">
+                  </div>
+                  <div class="field-compact">
+                    <label for="browser-session-select">Session</label>
+                    <select id="browser-session-select" class="select" aria-label="Browser Session">
+                      <option value="">Active / New Session</option>
+                    </select>
+                  </div>
+                  <div class="field-compact field-end">
+                    <button id="btn-browser-open" type="button" class="btn btn-primary btn-sm">Open</button>
+                    <button id="btn-browser-snapshot" type="button" class="btn btn-secondary btn-sm">Snapshot</button>
+                    <button id="btn-browser-back" type="button" class="btn btn-secondary btn-sm">Back</button>
+                    <button id="btn-browser-links" type="button" class="btn btn-secondary btn-sm">Links</button>
+                    <button id="btn-browser-refresh-sessions" type="button" class="btn btn-secondary btn-sm">Refresh</button>
+                    <button id="btn-browser-close-session" type="button" class="btn btn-danger btn-sm">Close Session</button>
+                  </div>
+                </div>
+
+                <div class="browser-console-bar">
+                  <div class="field-compact">
+                    <label for="browser-ref-input">Element Ref</label>
+                    <input id="browser-ref-input" type="text" class="input mono" placeholder="e1" aria-label="Browser Element Reference">
+                  </div>
+                  <div class="field-compact">
+                    <label for="browser-fill-value">Fill Value</label>
+                    <input id="browser-fill-value" type="text" class="input" placeholder="Value to enter into input ref&hellip;" aria-label="Browser Fill Value">
+                  </div>
+                  <div class="field-compact field-end">
+                    <button id="btn-browser-click" type="button" class="btn btn-secondary btn-sm">Click Ref</button>
+                    <button id="btn-browser-fill" type="button" class="btn btn-secondary btn-sm">Fill Ref</button>
+                    <button id="btn-browser-submit" type="button" class="btn btn-primary btn-sm">Submit Ref</button>
+                  </div>
+                </div>
+
+                <div id="browser-snapshot-meta" class="text-xs text-muted mono"></div>
+                <div id="browser-elements-list" class="browser-elements-list"></div>
+                <pre id="browser-page-text" class="browser-page-text"></pre>
+              </div>
+            </article>
+
+            <!-- Card 4: Workspace Brain Files & Workflows -->
+            <article class="card">
+              <div class="card-header">
+                <h3 class="card-title">Workspace Brain Files &amp; Workflows</h3>
+                <span id="brain-save-status" class="text-sm text-muted" aria-live="polite"></span>
+              </div>
+              <div class="brain-split-grid">
+                <div id="brain-files-list" class="brain-files-list" role="listbox" aria-label="Workspace brain files"></div>
+                <div class="stack-form">
+                  <div class="card-header">
+                    <span id="brain-current-name" class="mono text-sm">Select a brain file</span>
+                    <div class="toolbar-actions">
+                      <button id="btn-brain-reload" type="button" class="btn btn-secondary btn-sm">Reload</button>
+                      <button id="btn-brain-save" type="button" class="btn btn-primary btn-sm">Save File</button>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label class="sr-only" for="brain-editor-textarea">Brain File Markdown Editor</label>
+                    <textarea id="brain-editor-textarea" class="input mono" rows="12" spellcheck="false" aria-label="Brain File Content" placeholder="Select a brain file or workflow to inspect or edit&hellip;"></textarea>
+                  </div>
+                </div>
+              </div>
+            </article>
+
+            <!-- Card 5: Inbound Webhooks -->
+            <article class="card">
+              <div class="card-header">
+                <h3 class="card-title">Inbound Webhooks</h3>
+              </div>
+              <div class="stack-form">
+                <form id="webhook-create-form" class="stack-form" novalidate>
+                  <div class="form-grid">
+                    <div class="field">
+                      <label for="webhook-name-input">Webhook Name</label>
+                      <input id="webhook-name-input" type="text" class="input" required placeholder="e.g. CI Build Trigger" aria-label="Webhook Name">
+                    </div>
+                    <div class="field">
+                      <label for="webhook-agent-select">Target Agent</label>
+                      <select id="webhook-agent-select" class="select" aria-label="Webhook Target Agent">
+                        <option value="">Default (Commander)</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label for="webhook-conv-select">Target Conversation</label>
+                      <select id="webhook-conv-select" class="select" aria-label="Webhook Target Conversation">
+                        <option value="">Create New Conversation</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label for="webhook-template-input">Prompt Template</label>
+                      <input id="webhook-template-input" type="text" class="input mono" placeholder="Handle webhook event: {{payload}}" aria-label="Webhook Prompt Template">
+                    </div>
+                  </div>
+                  <div class="toolbar-actions">
+                    <button id="btn-webhook-create" type="submit" class="btn btn-primary btn-sm">Create Webhook</button>
+                  </div>
+                </form>
+
+                <div id="webhook-created-banner" class="alert alert-info" role="status" hidden>
+                  <div>
+                    <strong>Webhook Created (copy secret now — shown once):</strong>
+                    <div class="text-sm">URL: <code id="webhook-created-url" class="mono"></code></div>
+                    <div class="text-sm">Secret: <code id="webhook-created-secret" class="mono"></code></div>
+                  </div>
+                  <button id="btn-webhook-banner-dismiss" type="button" class="btn btn-ghost btn-sm" aria-label="Dismiss webhook secret banner">Dismiss</button>
+                </div>
+
+                <div id="webhooks-list" class="webhooks-list"></div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <!-- 8. LOGS -->
+        <section id="section-logs" class="view-section" hidden>
+          <div class="toolbar card">
+            <div class="pill-tabs" role="tablist" aria-label="Log categories">
+              <button id="logs-tab-runtime" type="button" class="tab-btn is-active" data-log-tab="runtime" role="tab" aria-selected="true" aria-controls="logs-container">Runtime Logs</button>
+              <button id="logs-tab-audit" type="button" class="tab-btn" data-log-tab="audit" role="tab" aria-selected="false" aria-controls="audit-logs-container">Security Audit Logs</button>
+            </div>
+            <div class="filter-row">
+              <div id="logs-level-wrap" class="field-compact">
+                <label for="logs-level-filter">Level</label>
+                <select id="logs-level-filter" class="select">
+                  <option value="">All Levels</option>
+                  <option value="error">ERROR</option>
+                  <option value="warn">WARN</option>
+                  <option value="info">INFO</option>
+                  <option value="debug">DEBUG</option>
+                  <option value="trace">TRACE</option>
+                </select>
+              </div>
+              <div class="field-compact">
+                <label for="logs-search-input">Search</label>
+                <input id="logs-search-input" type="search" class="input" placeholder="Filter text&hellip;">
+              </div>
+            </div>
+          </div>
+          <div id="logs-container" class="card table-card"></div>
+          <div id="audit-logs-container" class="card table-card" hidden></div>
+        </section>
+
+        <!-- 11. SETTINGS -->
+        <section id="section-settings" class="view-section" hidden>
+          <article class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">PS5LM Live Capabilities &amp; Sync</h2>
+                <p class="text-muted text-sm">Probe the local PS5LM server for loaded model, context window, slots, vision, and thinking support.</p>
+              </div>
+              <button id="btn-sync-ps5lm" type="button" class="btn btn-primary btn-sm">Sync Settings from PS5LM Now</button>
+            </div>
+            <div id="ps5lm-capabilities-summary" class="ps5lm-capabilities-grid" aria-live="polite">
+              <div class="stat-cell">
+                <span class="stat-label">Loaded Model</span>
+                <span id="ps5lm-cap-model" class="stat-value mono truncate">&mdash;</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-label">Context Window (n_ctx)</span>
+                <span id="ps5lm-cap-ctx" class="stat-value mono">&mdash;</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-label">Total Slots</span>
+                <span id="ps5lm-cap-slots" class="stat-value mono">&mdash;</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-label">Vision Support</span>
+                <span id="ps5lm-cap-vision" class="stat-value">&mdash;</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-label">Thinking Support</span>
+                <span id="ps5lm-cap-thinking" class="stat-value">&mdash;</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-label">Last Synced</span>
+                <span id="ps5lm-cap-synced" class="stat-value mono">&mdash;</span>
+              </div>
+            </div>
+          </article>
+
+          <div class="settings-grid">
+            <article class="card">
+              <div class="card-header">
+                <h2 class="card-title">Runtime &amp; Inference Configuration</h2>
+                <span class="text-muted text-sm">Changes apply immediately and persist to config</span>
+              </div>
+              <form id="settings-form" class="stack-form" novalidate>
+                <div class="form-grid">
+                  <div class="field">
+                    <label for="cfg-base-url">PS5LM Base URL</label>
+                    <input id="cfg-base-url" type="url" class="input mono" required placeholder="http://127.0.0.1:8081/v1" aria-describedby="hint-cfg-base-url">
+                    <p id="hint-cfg-base-url" class="field-hint">HTTP endpoint of the PS5LM inference server. Default: <code>http://127.0.0.1:8081/v1</code>. Local loopback avoids LAN latency; remote URLs add network round-trip overhead.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-model">Model</label>
+                    <input id="cfg-model" type="text" class="input mono" required placeholder="qwen-loaded" aria-describedby="hint-cfg-model">
+                    <p id="hint-cfg-model" class="field-hint">Default model identifier used when an agent has no model override. Default: <code>qwen-loaded</code>. Auto-updated when PS5LM capability sync is enabled.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-api-mode">API Mode</label>
+                    <select id="cfg-api-mode" class="select" aria-describedby="hint-cfg-api-mode">
+                      <option value="chat_completions">chat_completions (POST /v1/chat/completions)</option>
+                      <option value="responses">responses (POST /v1/responses)</option>
+                      <option value="anthropic_messages">anthropic_messages (POST /v1/messages)</option>
+                      <option value="completions">completions (POST /v1/completions)</option>
+                      <option value="system_one">system_one (POST /v1/systemone)</option>
+                    </select>
+                    <p id="hint-cfg-api-mode" class="field-hint">Wire protocol for PS5LM inference calls. Default: <code>chat_completions</code>. Use <code>chat_completions</code> or <code>responses</code> for tool calling, vision, and streaming.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-thinking-level">Default Thinking Level</label>
+                    <select id="cfg-thinking-level" class="select" aria-describedby="hint-cfg-thinking-level">
+                      <option value="off">off (No reasoning budget)</option>
+                      <option value="low">low (Fast replies)</option>
+                      <option value="medium" selected>medium (Balanced)</option>
+                      <option value="high">high (Deep planning)</option>
+                      <option value="max">max (Maximum reasoning)</option>
+                    </select>
+                    <p id="hint-cfg-thinking-level" class="field-hint">Default reasoning depth for thinking-capable models. Default: <code>medium</code>. Higher levels improve complex coding/planning accuracy at the cost of extra tokens and latency.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-auto-sync-ps5lm">Auto-Sync from PS5LM</label>
+                    <select id="cfg-auto-sync-ps5lm" class="select" aria-describedby="hint-cfg-auto-sync-ps5lm">
+                      <option value="true">Enabled (Sync model, n_ctx &amp; slots)</option>
+                      <option value="false">Disabled (Manual config only)</option>
+                    </select>
+                    <p id="hint-cfg-auto-sync-ps5lm" class="field-hint">Automatically aligns loaded model, context window, and slot concurrency from PS5LM. Default: <code>true</code>. Prevents OOM/context mismatches with minimal background overhead.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-auto-sync-interval-secs">Auto-Sync Interval (secs)</label>
+                    <input id="cfg-auto-sync-interval-secs" type="number" min="0" max="86400" step="1" class="input mono" required aria-describedby="hint-cfg-auto-sync-interval-secs">
+                    <p id="hint-cfg-auto-sync-interval-secs" class="field-hint">Seconds between background PS5LM capability probes. Default: <code>30</code>; <code>0</code> = manual sync only. Very low values increase periodic localhost HTTP traffic.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-stream-enabled">Streaming Responses</label>
+                    <select id="cfg-stream-enabled" class="select" aria-describedby="hint-cfg-stream-enabled">
+                      <option value="true">Enabled (Live token &amp; thinking SSE)</option>
+                      <option value="false">Disabled (Wait for full response)</option>
+                    </select>
+                    <p id="hint-cfg-stream-enabled" class="field-hint">Stream tokens and thinking deltas live via SSE as PS5LM generates them. Default: <code>true</code>. Disabling increases perceived latency with negligible RAM savings.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-timeout-secs">Inference Timeout (secs)</label>
+                    <input id="cfg-timeout-secs" type="number" min="0" max="86400" step="1" class="input mono" required aria-describedby="hint-cfg-timeout-secs">
+                    <p id="hint-cfg-timeout-secs" class="field-hint">Maximum seconds to wait for a single inference HTTP response. Default: <code>120</code>; <code>0</code> = unlimited. Set <code>0</code> or higher for long code generation or high thinking levels.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-connect-timeout-secs">Connect Timeout (secs)</label>
+                    <input id="cfg-connect-timeout-secs" type="number" min="1" max="300" step="1" class="input mono" required aria-describedby="hint-cfg-connect-timeout-secs">
+                    <p id="hint-cfg-connect-timeout-secs" class="field-hint">TCP handshake timeout when connecting to PS5LM. Default: <code>5</code>; valid <code>1&ndash;300</code>. Prevents stalled sockets when PS5LM is restarting.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-retries">Max Inference Retries</label>
+                    <input id="cfg-max-retries" type="number" min="0" max="20" step="1" class="input mono" required aria-describedby="hint-cfg-max-retries">
+                    <p id="hint-cfg-max-retries" class="field-hint">Retries on transient PS5LM network or 503 errors. Default: <code>2</code>; <code>0</code> = no retries. Increases resilience during model swaps at the cost of retry delay.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-context-limit">Context Limit (tokens)</label>
+                    <input id="cfg-context-limit" type="number" min="0" max="1048576" step="1" class="input mono" required aria-describedby="hint-cfg-context-limit">
+                    <p id="hint-cfg-context-limit" class="field-hint">Prompt + completion token budget per turn. Default: <code>8192</code>; <code>0</code> = unlimited / PS5LM <code>n_ctx</code>, otherwise <code>512&ndash;1048576</code>. Larger contexts use more PS5 GDDR6 KV-cache RAM.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-output-tokens">Max Output Tokens</label>
+                    <input id="cfg-max-output-tokens" type="number" min="0" max="1048576" step="1" class="input mono" required aria-describedby="hint-cfg-max-output-tokens">
+                    <p id="hint-cfg-max-output-tokens" class="field-hint">Maximum tokens generated per model reply. Default: <code>1024</code>; <code>0</code> = unlimited up to context window. Use <code>0</code> to prevent truncation when writing full apps or games.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-upload-max-body-bytes">Max Upload / Attachment Body (bytes)</label>
+                    <input id="cfg-upload-max-body-bytes" type="number" min="0" max="268435456" step="1024" class="input mono" required aria-describedby="hint-cfg-upload-max-body-bytes">
+                    <p id="hint-cfg-upload-max-body-bytes" class="field-hint">Body limit for chat photo/file attachments, workspace uploads, and extension imports. Default: <code>67108864</code> (64 MiB); <code>0</code> = 256 MiB max. Large uploads briefly buffer in RAM.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-agents">Max Agents</label>
+                    <input id="cfg-max-agents" type="number" min="0" max="1024" step="1" class="input mono" required aria-describedby="hint-cfg-max-agents">
+                    <p id="hint-cfg-max-agents" class="field-hint">Maximum registered agents allowed at once. Default: <code>0</code>; <code>0</code> = unlimited. Each agent stores minimal SQLite metadata and memory stats.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-active-tasks">Max Active Tasks</label>
+                    <input id="cfg-max-active-tasks" type="number" min="0" max="1024" step="1" class="input mono" required aria-describedby="hint-cfg-max-active-tasks">
+                    <p id="hint-cfg-max-active-tasks" class="field-hint">Maximum concurrent tasks executing across agents. Default: <code>0</code>; <code>0</code> = unlimited. Higher concurrency allows parallel chats and sub-agents using slightly more heap.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-queued-tasks">Max Queued Tasks</label>
+                    <input id="cfg-max-queued-tasks" type="number" min="0" max="10000" step="1" class="input mono" required aria-describedby="hint-cfg-max-queued-tasks">
+                    <p id="hint-cfg-max-queued-tasks" class="field-hint">Maximum pending root tasks queued before rejecting new requests. Default: <code>0</code>; <code>0</code> = unlimited. Set a finite cap only to enforce backpressure under heavy bursts.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-concurrent-inference">Max Concurrent Inference</label>
+                    <input id="cfg-max-concurrent-inference" type="number" min="0" max="64" step="1" class="input mono" required aria-describedby="hint-cfg-max-concurrent-inference">
+                    <p id="hint-cfg-max-concurrent-inference" class="field-hint">Simultaneous PS5LM inference calls permitted. Default: <code>4</code>; <code>0</code> = unlimited. Match PS5LM <code>total_slots</code> (1&ndash;4) to minimize PS5 GDDR6 pressure.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-messages-per-task">Max Messages Per Task</label>
+                    <input id="cfg-max-messages-per-task" type="number" min="0" max="10000" step="1" class="input mono" required aria-describedby="hint-cfg-max-messages-per-task">
+                    <p id="hint-cfg-max-messages-per-task" class="field-hint">Maximum A2A messages per task tree before loop protection pauses delegation. Default: <code>0</code>; <code>0</code> = unlimited. Finite limits guard against circular agent chatter.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-reasoning-iterations">Max Reasoning Iterations</label>
+                    <input id="cfg-max-reasoning-iterations" type="number" min="0" max="1000" step="1" class="input mono" required aria-describedby="hint-cfg-max-reasoning-iterations">
+                    <p id="hint-cfg-max-reasoning-iterations" class="field-hint">Maximum tool-use turns per task before stopping. Default: <code>0</code>; <code>0</code> = unlimited. Set <code>0</code> so multi-step builds finish cleanly without hitting an artificial ceiling.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-default-task-timeout-secs">Default Task Timeout (secs)</label>
+                    <input id="cfg-default-task-timeout-secs" type="number" min="0" max="86400" step="1" class="input mono" required aria-describedby="hint-cfg-default-task-timeout-secs">
+                    <p id="hint-cfg-default-task-timeout-secs" class="field-hint">Wall-clock timeout applied to tasks without an agent override. Default: <code>0</code>; <code>0</code> = unlimited. Useful as a safety fuse for unattended overnight runs.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-allow-temp-specialists">Temporary Specialists</label>
+                    <select id="cfg-allow-temp-specialists" class="select" aria-describedby="hint-cfg-allow-temp-specialists">
+                      <option value="true">Allowed (Auto-spawn &amp; cleanup)</option>
+                      <option value="false">Disabled (Built-in/saved agents only)</option>
+                    </select>
+                    <p id="hint-cfg-allow-temp-specialists" class="field-hint">Allow Commander to spawn temporary specialists for one-off subtasks. Default: <code>true</code>. Temp agents are automatically cleaned up after completion to free RAM.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-on-disable-policy">On Agent Disable Policy</label>
+                    <select id="cfg-on-disable-policy" class="select" aria-describedby="hint-cfg-on-disable-policy">
+                      <option value="cancel">cancel (Cancel running tasks immediately)</option>
+                      <option value="finish_step">finish_step (Finish current step first)</option>
+                    </select>
+                    <p id="hint-cfg-on-disable-policy" class="field-hint">Action taken on active tasks when an agent is disabled mid-run. Default: <code>cancel</code>. Choose <code>finish_step</code> to avoid partial file writes.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-require-approval-mutating">Mutating Tool Approval</label>
+                    <select id="cfg-require-approval-mutating" class="select" aria-describedby="hint-cfg-require-approval-mutating">
+                      <option value="true">Required (Prompt in dashboard)</option>
+                      <option value="false">Auto-Approve (Autonomous execution)</option>
+                    </select>
+                    <p id="hint-cfg-require-approval-mutating" class="field-hint">Require manual dashboard approval before mutating tools like <code>delete_file</code> or <code>http_post</code> run. Default: <code>true</code>. Disabling speeds autonomous workflows.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-rate-limit-per-minute">API Rate Limit (req/min)</label>
+                    <input id="cfg-rate-limit-per-minute" type="number" min="0" max="100000" step="1" class="input mono" required aria-describedby="hint-cfg-rate-limit-per-minute">
+                    <p id="hint-cfg-rate-limit-per-minute" class="field-hint">Maximum authenticated HTTP requests per IP per minute. Default: <code>240</code>; <code>0</code> = unlimited. Protects PS5 CPU from accidental client loops; <code>0</code> disables throttling.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-session-ttl-hours">Session TTL (hours)</label>
+                    <input id="cfg-session-ttl-hours" type="number" min="1" max="8760" step="1" class="input mono" required aria-describedby="hint-cfg-session-ttl-hours">
+                    <p id="hint-cfg-session-ttl-hours" class="field-hint">Hours before dashboard login sessions expire. Default: <code>24</code>; valid <code>1&ndash;8760</code>. Longer TTLs reduce sign-in prompts on trusted LANs with minimal memory cost.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-memories-per-agent">Max Memories Per Agent</label>
+                    <input id="cfg-max-memories-per-agent" type="number" min="0" max="1000000" step="1" class="input mono" required aria-describedby="hint-cfg-max-memories-per-agent">
+                    <p id="hint-cfg-max-memories-per-agent" class="field-hint">Maximum long-term memory records retained per agent. Default: <code>0</code>; <code>0</code> = unlimited. Very large counts slightly increase SQLite lookup time and disk usage.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-archive-after-messages">Archive After Messages</label>
+                    <input id="cfg-archive-after-messages" type="number" min="0" max="100000" step="1" class="input mono" required aria-describedby="hint-cfg-archive-after-messages">
+                    <p id="hint-cfg-archive-after-messages" class="field-hint">Compact older chat messages into memory summaries after this count. Default: <code>40</code>; <code>0</code> = disabled. Compaction keeps prompt tokens lean and speeds up long chats.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-retention-days">Database Retention (days)</label>
+                    <input id="cfg-retention-days" type="number" min="0" max="36500" step="1" class="input mono" required aria-describedby="hint-cfg-retention-days">
+                    <p id="hint-cfg-retention-days" class="field-hint">Days before old finished tasks, logs, and audit entries are pruned. Default: <code>30</code>; <code>0</code> = keep forever. Lower values keep PS5 storage footprint small.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-max-rows-per-table">Max Rows Per Table</label>
+                    <input id="cfg-max-rows-per-table" type="number" min="0" max="10000000" step="1" class="input mono" required aria-describedby="hint-cfg-max-rows-per-table">
+                    <p id="hint-cfg-max-rows-per-table" class="field-hint">Row cap per prunable log/task table during maintenance. Default: <code>10000</code>; <code>0</code> = unlimited. Bounds query latency and disk growth on long-running daemons.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-logging-level">Logging Level</label>
+                    <select id="cfg-logging-level" class="select" aria-describedby="hint-cfg-logging-level">
+                      <option value="error">error</option>
+                      <option value="warn">warn</option>
+                      <option value="info">info</option>
+                      <option value="debug">debug</option>
+                      <option value="trace">trace</option>
+                    </select>
+                    <p id="hint-cfg-logging-level" class="field-hint">Minimum severity recorded to the runtime ring buffer and rotating log file. Default: <code>info</code>. <code>debug</code>/<code>trace</code> aid diagnostics but increase disk I/O.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-admin-username">Admin Username</label>
+                    <input id="cfg-admin-username" type="text" class="input mono" autocapitalize="none" autocorrect="off" spellcheck="false" required placeholder="admin" aria-describedby="hint-cfg-admin-username">
+                    <p id="hint-cfg-admin-username" class="field-hint">Username required for dashboard login. Default: <code>admin</code>. Takes effect on subsequent sign-ins; zero runtime RAM impact.</p>
+                  </div>
+
+                  <div class="field">
+                    <label for="cfg-auth-enabled">Authentication</label>
+                    <select id="cfg-auth-enabled" class="select" aria-describedby="hint-cfg-auth-enabled">
+                      <option value="true">Enabled (Require Sign-In)</option>
+                      <option value="false">Disabled (Open LAN Access)</option>
+                    </select>
+                    <p id="hint-cfg-auth-enabled" class="field-hint">Require login session and CSRF validation for dashboard APIs. Default: <code>true</code>. Disable only on trusted private LANs.</p>
+                  </div>
+                </div>
+
+                <fieldset class="settings-group">
+                  <legend>KV Cache &amp; llama.cpp / PS5LM Sampling</legend>
+                  <div class="form-grid">
+                    <div class="field">
+                      <label for="cfg-prefill-kv-cache">Pre-fill KV cache after response</label>
+                      <select id="cfg-prefill-kv-cache" class="select" aria-describedby="hint-cfg-prefill-kv-cache">
+                        <option value="true" selected>Enabled (Pre-fill next turn in background)</option>
+                        <option value="false">Disabled (Encode prompt on send)</option>
+                      </select>
+                      <small id="hint-cfg-prefill-kv-cache" class="field-hint">After each response, re-submit the conversation to pre-fill the server KV cache. Makes the next turn faster since the prompt is already encoded while you read the response.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-cache-prompt">Server Prefix Cache (<code>cache_prompt</code>)</label>
+                      <select id="cfg-cache-prompt" class="select" aria-describedby="hint-cfg-cache-prompt">
+                        <option value="true" selected>Enabled (Reuse matching prompt KV prefix)</option>
+                        <option value="false">Disabled (Re-evaluate full prompt)</option>
+                      </select>
+                      <small id="hint-cfg-cache-prompt" class="field-hint">Asks PS5LM / llama.cpp to retain and reuse KV cache tokens for shared system prompt and conversation prefixes. Default: <code>true</code>. Dramatically reduces prompt-eval latency and CPU/GPU work.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-temperature">Temperature</label>
+                      <input id="cfg-temperature" type="number" min="0" max="2" step="0.05" class="input mono" value="0.4" aria-describedby="hint-cfg-temperature">
+                      <small id="hint-cfg-temperature" class="field-hint">Controls randomness of token selection (<code>0</code> = deterministic greedy, higher = more creative). Default: <code>0.4</code>; valid <code>0.0&ndash;2.0</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-dynatemp-range">Dynamic Temp Range (<code>dynatemp_range</code>)</label>
+                      <input id="cfg-dynatemp-range" type="number" min="0" max="2" step="0.05" class="input mono" value="0" aria-describedby="hint-cfg-dynatemp-range">
+                      <small id="hint-cfg-dynatemp-range" class="field-hint">Entropy-based dynamic temperature spread around base temperature. Default: <code>0</code> (disabled); valid <code>0.0&ndash;2.0</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-dynatemp-exponent">Dynamic Temp Exponent (<code>dynatemp_exponent</code>)</label>
+                      <input id="cfg-dynatemp-exponent" type="number" min="0" max="10" step="0.05" class="input mono" value="1" aria-describedby="hint-cfg-dynatemp-exponent">
+                      <small id="hint-cfg-dynatemp-exponent" class="field-hint">Exponent shaping dynamic temperature mapping when <code>dynatemp_range &gt; 0</code>. Default: <code>1.0</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-top-k">Top-K (<code>top_k</code>)</label>
+                      <input id="cfg-top-k" type="number" min="-1" max="10000" step="1" class="input mono" value="40" aria-describedby="hint-cfg-top-k">
+                      <small id="hint-cfg-top-k" class="field-hint">Limits sampling candidates to the top K most likely tokens. Default: <code>40</code>; <code>0</code> disables Top-K filtering.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-top-p">Top-P Nucleus (<code>top_p</code>)</label>
+                      <input id="cfg-top-p" type="number" min="0" max="1" step="0.01" class="input mono" value="0.95" aria-describedby="hint-cfg-top-p">
+                      <small id="hint-cfg-top-p" class="field-hint">Retains smallest token set whose cumulative probability reaches P. Default: <code>0.95</code>; <code>1.0</code> disables nucleus cutoff.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-min-p">Min-P (<code>min_p</code>)</label>
+                      <input id="cfg-min-p" type="number" min="0" max="1" step="0.01" class="input mono" value="0.05" aria-describedby="hint-cfg-min-p">
+                      <small id="hint-cfg-min-p" class="field-hint">Drops tokens whose probability is below <code>min_p &times; max_prob</code>. Default: <code>0.05</code>; <code>0</code> disables Min-P filtering.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-typical-p">Locally Typical P (<code>typical_p</code>)</label>
+                      <input id="cfg-typical-p" type="number" min="0" max="1" step="0.01" class="input mono" value="1" aria-describedby="hint-cfg-typical-p">
+                      <small id="hint-cfg-typical-p" class="field-hint">Filters tokens by proximity to expected information entropy. Default: <code>1.0</code> (disabled); lower values (e.g. <code>0.9</code>) tighten coherence.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-xtc-probability">XTC Probability (<code>xtc_probability</code>)</label>
+                      <input id="cfg-xtc-probability" type="number" min="0" max="1" step="0.01" class="input mono" value="0" aria-describedby="hint-cfg-xtc-probability">
+                      <small id="hint-cfg-xtc-probability" class="field-hint">Chance of applying Exclude Top Choices (XTC) to avoid clich&eacute;d tokens. Default: <code>0</code> (disabled); valid <code>0.0&ndash;1.0</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-xtc-threshold">XTC Threshold (<code>xtc_threshold</code>)</label>
+                      <input id="cfg-xtc-threshold" type="number" min="0" max="0.5" step="0.01" class="input mono" value="0.1" aria-describedby="hint-cfg-xtc-threshold">
+                      <small id="hint-cfg-xtc-threshold" class="field-hint">Minimum token probability required for XTC removal when active. Default: <code>0.1</code>; valid <code>0.0&ndash;0.5</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-top-n-sigma">Top-N Sigma (<code>top_n_sigma</code>)</label>
+                      <input id="cfg-top-n-sigma" type="number" min="-1" max="100" step="0.1" class="input mono" value="-1" aria-describedby="hint-cfg-top-n-sigma">
+                      <small id="hint-cfg-top-n-sigma" class="field-hint">Prunes logits more than N standard deviations below the max logit. Default: <code>-1</code> (&le; 0 disabled); e.g. <code>1.0</code> for tight output.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-repeat-penalty">Repeat Penalty (<code>repeat_penalty</code>)</label>
+                      <input id="cfg-repeat-penalty" type="number" min="0" max="3" step="0.01" class="input mono" value="1.05" aria-describedby="hint-cfg-repeat-penalty">
+                      <small id="hint-cfg-repeat-penalty" class="field-hint">Penalizes recently repeated tokens to reduce looping. Default: <code>1.05</code>; <code>1.0</code> disables penalty.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-repeat-last-n">Repeat Last N (<code>repeat_last_n</code>)</label>
+                      <input id="cfg-repeat-last-n" type="number" min="-1" max="131072" step="1" class="input mono" value="64" aria-describedby="hint-cfg-repeat-last-n">
+                      <small id="hint-cfg-repeat-last-n" class="field-hint">Lookback window in tokens checked by <code>repeat_penalty</code>. Default: <code>64</code>; <code>0</code> disables, <code>-1</code> uses full context.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-presence-penalty">Presence Penalty (<code>presence_penalty</code>)</label>
+                      <input id="cfg-presence-penalty" type="number" min="-2" max="2" step="0.05" class="input mono" value="0" aria-describedby="hint-cfg-presence-penalty">
+                      <small id="hint-cfg-presence-penalty" class="field-hint">Flat penalty applied once to any token already present in context. Default: <code>0.0</code>; valid <code>-2.0&ndash;2.0</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-frequency-penalty">Frequency Penalty (<code>frequency_penalty</code>)</label>
+                      <input id="cfg-frequency-penalty" type="number" min="-2" max="2" step="0.05" class="input mono" value="0" aria-describedby="hint-cfg-frequency-penalty">
+                      <small id="hint-cfg-frequency-penalty" class="field-hint">Proportional penalty scaled by how often a token appeared in context. Default: <code>0.0</code>; valid <code>-2.0&ndash;2.0</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-dry-multiplier">DRY Multiplier (<code>dry_multiplier</code>)</label>
+                      <input id="cfg-dry-multiplier" type="number" min="0" max="10" step="0.05" class="input mono" value="0" aria-describedby="hint-cfg-dry-multiplier">
+                      <small id="hint-cfg-dry-multiplier" class="field-hint">Don&apos;t Repeat Yourself (DRY) n-gram repetition penalty multiplier. Default: <code>0</code> (disabled); typical active value <code>0.8</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-dry-base">DRY Base (<code>dry_base</code>)</label>
+                      <input id="cfg-dry-base" type="number" min="1" max="10" step="0.05" class="input mono" value="1.75" aria-describedby="hint-cfg-dry-base">
+                      <small id="hint-cfg-dry-base" class="field-hint">Exponential base controlling DRY penalty growth across repeated sequence lengths. Default: <code>1.75</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-dry-allowed-length">DRY Allowed Length (<code>dry_allowed_length</code>)</label>
+                      <input id="cfg-dry-allowed-length" type="number" min="0" max="100" step="1" class="input mono" value="2" aria-describedby="hint-cfg-dry-allowed-length">
+                      <small id="hint-cfg-dry-allowed-length" class="field-hint">Maximum repeated sequence length allowed before DRY penalty applies. Default: <code>2</code> tokens.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-dry-penalty-last-n">DRY Penalty Last N (<code>dry_penalty_last_n</code>)</label>
+                      <input id="cfg-dry-penalty-last-n" type="number" min="-1" max="131072" step="1" class="input mono" value="-1" aria-describedby="hint-cfg-dry-penalty-last-n">
+                      <small id="hint-cfg-dry-penalty-last-n" class="field-hint">Lookback tokens scanned for DRY sequence matches. Default: <code>-1</code> (full context window); <code>0</code> disables.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-mirostat">Mirostat Mode (<code>mirostat</code>)</label>
+                      <select id="cfg-mirostat" class="select" aria-describedby="hint-cfg-mirostat">
+                        <option value="0" selected>0 (Disabled &mdash; standard samplers)</option>
+                        <option value="1">1 (Mirostat v1)</option>
+                        <option value="2">2 (Mirostat v2)</option>
+                      </select>
+                      <small id="hint-cfg-mirostat" class="field-hint">Adaptive perplexity-targeting sampler mode. Default: <code>0</code> (disabled); <code>1</code> or <code>2</code> overrides top-k/top-p.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-mirostat-tau">Mirostat Tau (<code>mirostat_tau</code>)</label>
+                      <input id="cfg-mirostat-tau" type="number" min="0" max="20" step="0.1" class="input mono" value="5" aria-describedby="hint-cfg-mirostat-tau">
+                      <small id="hint-cfg-mirostat-tau" class="field-hint">Target cross-entropy (surprise) when Mirostat 1 or 2 is active. Default: <code>5.0</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-mirostat-eta">Mirostat Eta (<code>mirostat_eta</code>)</label>
+                      <input id="cfg-mirostat-eta" type="number" min="0" max="1" step="0.01" class="input mono" value="0.1" aria-describedby="hint-cfg-mirostat-eta">
+                      <small id="hint-cfg-mirostat-eta" class="field-hint">Learning rate for Mirostat feedback step size. Default: <code>0.1</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-seed">RNG Seed (<code>seed</code>)</label>
+                      <input id="cfg-seed" type="number" min="-1" step="1" class="input mono" value="-1" aria-describedby="hint-cfg-seed">
+                      <small id="hint-cfg-seed" class="field-hint">Deterministic random seed for reproducible sampling. Default: <code>-1</code> (random seed per request).</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-ignore-eos">Ignore EOS (<code>ignore_eos</code>)</label>
+                      <select id="cfg-ignore-eos" class="select" aria-describedby="hint-cfg-ignore-eos">
+                        <option value="false" selected>Disabled (Stop on EOS token)</option>
+                        <option value="true">Enabled (Continue past EOS)</option>
+                      </select>
+                      <small id="hint-cfg-ignore-eos" class="field-hint">Ignore End-of-Sequence token and keep generating until stop sequence or token limit. Default: <code>false</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-n-keep">Prompt Tokens to Keep (<code>n_keep</code>)</label>
+                      <input id="cfg-n-keep" type="number" min="-1" max="131072" step="1" class="input mono" value="0" aria-describedby="hint-cfg-n-keep">
+                      <small id="hint-cfg-n-keep" class="field-hint">Number of initial prompt tokens preserved when KV context shifts. Default: <code>0</code> (none forced); <code>-1</code> keeps entire initial prompt.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-id-slot">Pinned Server Slot (<code>id_slot</code>)</label>
+                      <input id="cfg-id-slot" type="number" min="-1" max="64" step="1" class="input mono" value="-1" aria-describedby="hint-cfg-id-slot">
+                      <small id="hint-cfg-id-slot" class="field-hint">Pin inference to a specific PS5LM KV slot index. Default: <code>-1</code> (auto-select slot); <code>0+</code> targets a fixed slot.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-samplers">Sampler Chain (<code>samplers</code>)</label>
+                      <input id="cfg-samplers" type="text" class="input mono" placeholder="dry,top_k,typ_p,top_p,min_p,xtc,temperature" aria-describedby="hint-cfg-samplers">
+                      <small id="hint-cfg-samplers" class="field-hint">Comma-separated or JSON array of llama.cpp sampler order. Leave empty for server default chain.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-reasoning-format">Reasoning Format (<code>reasoning_format</code>)</label>
+                      <input id="cfg-reasoning-format" type="text" class="input mono" list="reasoning-format-list" placeholder="deepseek" aria-describedby="hint-cfg-reasoning-format">
+                      <datalist id="reasoning-format-list">
+                        <option value="deepseek"></option>
+                        <option value="deepseek-legacy"></option>
+                        <option value="auto"></option>
+                        <option value="none"></option>
+                      </datalist>
+                      <small id="hint-cfg-reasoning-format" class="field-hint">How llama.cpp extracts thinking/reasoning tokens when thinking mode is not <code>off</code>. Default: <code>deepseek</code>; use <code>none</code> to omit.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-timings-per-token">Timings Per Token (<code>timings_per_token</code>)</label>
+                      <select id="cfg-timings-per-token" class="select" aria-describedby="hint-cfg-timings-per-token">
+                        <option value="false" selected>Disabled (Lower payload overhead)</option>
+                        <option value="true">Enabled (Include prompt/gen tok/s timings)</option>
+                      </select>
+                      <small id="hint-cfg-timings-per-token" class="field-hint">Request per-token timing statistics from llama.cpp in responses. Default: <code>false</code>.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-stop-sequences">Stop Sequences (<code>stop</code>)</label>
+                      <textarea id="cfg-stop-sequences" class="input mono" rows="2" spellcheck="false" placeholder="One stop sequence per line" aria-describedby="hint-cfg-stop-sequences"></textarea>
+                      <small id="hint-cfg-stop-sequences" class="field-hint">Custom stop strings (one per line) merged into <code>stop</code> on every inference call. Empty = none.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-grammar">GBNF Grammar (<code>grammar</code>)</label>
+                      <textarea id="cfg-grammar" class="input mono" rows="2" spellcheck="false" placeholder="Optional GBNF grammar" aria-describedby="hint-cfg-grammar"></textarea>
+                      <small id="hint-cfg-grammar" class="field-hint">Optional llama.cpp GBNF grammar constraining generated output syntax. Empty = unconstrained.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="cfg-custom-extra-body-json">Custom Extra Body JSON</label>
+                      <textarea id="cfg-custom-extra-body-json" class="input mono" rows="2" spellcheck="false" placeholder='{"min_keep": 1}' aria-describedby="hint-cfg-custom-extra-body-json"></textarea>
+                      <small id="hint-cfg-custom-extra-body-json" class="field-hint">Optional JSON object merged into top-level inference request body (never overwrites <code>messages</code> or <code>stream</code>). Empty = none.</small>
+                    </div>
+                  </div>
+                </fieldset>
+
+                <div class="toolbar-actions">
+                  <button id="save-settings-btn" type="submit" class="btn btn-primary">Save Configuration</button>
+                </div>
+              </form>
+            </article>
+
+            <div class="settings-side">
+              <article class="card">
+                <div class="card-header">
+                  <h2 class="card-title">Change Admin Password</h2>
+                </div>
+                <form id="change-password-form" class="stack-form" novalidate>
+                  <div class="field">
+                    <label for="pw-current">Current Password</label>
+                    <input id="pw-current" name="current-password" type="password" class="input" autocomplete="current-password" aria-label="Current Password" required>
+                  </div>
+                  <div class="field">
+                    <label for="pw-new">New Password</label>
+                    <input id="pw-new" name="new-password" type="password" class="input" autocomplete="new-password" minlength="8" aria-label="New Password" required>
+                  </div>
+                  <div class="field">
+                    <label for="pw-confirm">Confirm New Password</label>
+                    <input id="pw-confirm" name="confirm-password" type="password" class="input" autocomplete="new-password" minlength="8" aria-label="Confirm New Password" required>
+                  </div>
+                  <button type="submit" class="btn btn-secondary">Update Password</button>
+                </form>
+              </article>
+
+              <article class="card">
+                <div class="card-header">
+                  <h2 class="card-title">System Maintenance</h2>
+                </div>
+                <div class="stack-form">
+                  <p class="text-sm text-secondary">Flush SQLite WAL / JSONL buffers cleanly or gracefully stop the PS5 agent daemon.</p>
+                  <button id="checkpoint-db-btn" type="button" class="btn btn-secondary btn-block">Checkpoint Database</button>
+                  <button id="shutdown-btn" type="button" class="btn btn-danger btn-block">Graceful Shutdown</button>
+                </div>
+              </article>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Shared Modal Dialog -->
+  <div id="modal-overlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title" hidden>
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h2 id="modal-title" class="modal-title">Modal</h2>
+        <button id="modal-close-btn" type="button" class="btn btn-ghost btn-icon" aria-label="Close modal">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M18 6L6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+      <div id="modal-footer" class="modal-footer"></div>
+    </div>
+  </div>
+
+  <!-- Agent Modal -->
+  <div id="agent-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="agent-modal-title" hidden>
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h2 id="agent-modal-title" class="modal-title">Configure Agent</h2>
+        <button id="agent-modal-close" type="button" class="btn btn-ghost btn-icon" aria-label="Close agent modal">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M18 6L6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+      <div id="agent-modal-body" class="modal-body">
+        <div class="form-grid">
+          <div class="field">
+            <label for="agent-model-thinking">Thinking Level</label>
+            <select id="agent-model-thinking" class="select" aria-label="Agent Thinking Level">
+              <option value="off">off</option>
+              <option value="low">low</option>
+              <option value="medium" selected>medium</option>
+              <option value="high">high</option>
+              <option value="max">max</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="agent-max-duration">Max Task Duration (secs, 0 = unlimited)</label>
+            <input id="agent-max-duration" type="number" min="0" max="86400" step="1" class="input mono" value="0" placeholder="0 (0 = unlimited)" aria-label="Max Task Duration Seconds">
+          </div>
+          <div class="field">
+            <label for="agent-max-reasoning-iters">Max Reasoning Iterations (0 = unlimited)</label>
+            <input id="agent-max-reasoning-iters" type="number" min="0" max="1000" step="1" class="input mono" value="0" placeholder="0 (0 = unlimited)" aria-label="Max Reasoning Iterations">
+          </div>
+          <div class="field">
+            <label for="agent-sandbox-mode">Sandbox Mode Override</label>
+            <select id="agent-sandbox-mode" class="select" aria-label="Agent Sandbox Mode Override">
+              <option value="" selected>Inherit Global</option>
+              <option value="read_only">read_only</option>
+              <option value="workspace_write">workspace_write</option>
+              <option value="full_sandbox">full_sandbox</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="agent-denied-tools">Denied Tools / Groups (comma-separated)</label>
+            <input id="agent-denied-tools" type="text" class="input mono" placeholder="e.g. sandbox_exec, group:browser" aria-label="Denied Tools or Groups">
+          </div>
+        </div>
+      </div>
+      <div id="agent-modal-footer" class="modal-footer"></div>
+    </div>
+  </div>
+
+  <!-- Extension Modal -->
+  <div id="extension-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="extension-modal-title" hidden>
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h2 id="extension-modal-title" class="modal-title">Extension</h2>
+        <button id="extension-modal-close" type="button" class="btn btn-ghost btn-icon" aria-label="Close extension modal">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M18 6L6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+      <div id="extension-modal-body" class="modal-body"></div>
+      <div id="extension-modal-footer" class="modal-footer"></div>
+    </div>
+  </div>
+
+  <!-- Image Lightbox Modal -->
+  <div id="image-lightbox-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="lightbox-title" hidden>
+    <div class="modal-dialog modal-dialog-wide">
+      <div class="modal-header">
+        <h2 id="lightbox-title" class="modal-title truncate">Image Preview</h2>
+        <button id="lightbox-close" type="button" class="btn btn-ghost btn-icon" aria-label="Close image preview">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M18 6L6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <img id="lightbox-img" class="lightbox-img" alt="Attached image preview">
+        <p id="lightbox-caption" class="text-sm text-muted"></p>
+      </div>
+      <div class="modal-footer">
+        <a id="lightbox-download" class="btn btn-secondary btn-sm" download>Download Image</a>
+        <button id="lightbox-done-btn" type="button" class="btn btn-primary btn-sm">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create / Edit Schedule Modal -->
+  <div id="modal-schedule" class="modal modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-schedule-title" hidden>
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h2 id="modal-schedule-title" class="modal-title">Create Schedule</h2>
+        <button id="btn-modal-schedule-close" type="button" class="btn btn-ghost btn-icon" aria-label="Close schedule modal">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M18 6L6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="stack-form">
+          <input id="sched-edit-id" type="hidden" value="">
+          <div class="field">
+            <label for="sched-title">Title</label>
+            <input id="sched-title" type="text" class="input" placeholder="e.g. Daily PS5LM Status Report">
+          </div>
+          <div class="field">
+            <label for="sched-prompt">Task Prompt</label>
+            <textarea id="sched-prompt" class="input" rows="3" placeholder="Instruction executed autonomously by the agent when triggered&hellip;"></textarea>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label for="sched-agent">Target Agent</label>
+              <select id="sched-agent" class="select">
+                <option value="">Auto (Commander)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="sched-kind">Schedule Type</label>
+              <select id="sched-kind" class="select">
+                <option value="once">Once (Specific Date &amp; Time)</option>
+                <option value="interval">Interval (Every N Seconds)</option>
+                <option value="daily">Daily (Fixed Time)</option>
+                <option value="cron">Cron (5-Field Expression)</option>
+              </select>
+            </div>
+          </div>
+          <div class="schedule-kind-fields form-grid">
+            <div class="field" data-kind="once">
+              <label for="sched-run-at">Run At (Local Date &amp; Time)</label>
+              <input id="sched-run-at" type="datetime-local" class="input">
+            </div>
+            <div class="field" data-kind="interval">
+              <label for="sched-interval-secs">Interval (Seconds)</label>
+              <input id="sched-interval-secs" type="number" class="input mono" min="1" step="1" value="3600" placeholder="e.g. 3600">
+            </div>
+            <div class="field" data-kind="daily">
+              <label for="sched-daily-time">Daily Time (HH:MM)</label>
+              <input id="sched-daily-time" type="time" class="input" value="09:00">
+            </div>
+            <div class="field" data-kind="cron">
+              <label for="sched-cron-expr">Cron Expression (min hour dom mon dow)</label>
+              <input id="sched-cron-expr" type="text" class="input mono" placeholder="0 9 * * *">
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label for="sched-tz-offset">Timezone Offset (Minutes from UTC)</label>
+              <input id="sched-tz-offset" type="number" class="input mono" min="-720" max="840" step="1" value="0" placeholder="e.g. 60 for UTC+1">
+            </div>
+            <div class="field">
+              <span class="field-label text-sm text-secondary">Status</span>
+              <label class="checkbox-row" for="sched-enabled">
+                <input id="sched-enabled" type="checkbox" aria-label="Schedule enabled" checked>
+                <span>Enabled (active in background scheduler)</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-sched-cancel" type="button" class="btn btn-secondary">Cancel</button>
+        <button id="btn-sched-save" type="button" class="btn btn-primary">Save Schedule</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

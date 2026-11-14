@@ -1,0 +1,127 @@
+# PS5 Agent Known Limitations & Platform Constraints
+
+This document records the architectural, security, OS/ABI, extension, UI, and lifecycle limitations of `ps5-agent` when targeting a jailbroken PlayStation 5 Slim on Firmware `13.40` (`0x13400000`), along with the implemented mitigations and hardware verification boundary.
+
+---
+
+## 1. Shared 16 GB GDDR6 Memory Ceiling, `0 = Unlimited` & Safety Bounds
+
+- **Hardware Memory Ceiling:** The PlayStation 5 shares 16 GB of unified GDDR6 memory across the OS, GPU, `PS5LM`, and userland payloads. Payload processes executed via `ps5-payload-dev/elfldr` run under `sys_budget_set(0)` (0 Direct Memory, ~8 GiB shared Flexible Memory), while `PS5LM` (running as native app `PPSA99575` on Vulkan GPU with up to 11.4 GiB memory, or legacy payload `<= 1.6 GiB`) hosts the loaded GGUF model on `http://127.0.0.1:8081/v1`.
+- **Resource Budget & PS5 Defaults:**
+  - `ps5-agent` is engineered to maintain an ultra-lean `< 64 MiB` runtime RSS (SQLite `cache_size_kb = 4000` / ~4 MiB, standard API `max_body_bytes = 1048576` / 1 MiB, `argon2_memory_kib = 8192` on PS5, 2 MiB rotating logs, `ring_buffer_capacity = 500`, and `tokio_worker_threads = 2`).
+  - `config/config.ps5-slim-1340.toml` defaults to `max_concurrent_inference = 4` (auto-synced to `PS5LM` `total_slots` when `auto_sync_from_ps5lm = true`), `max_agents = 0`, `max_active_tasks = 0`, `max_queued_tasks = 0`, `max_messages_per_task = 0`, `max_reasoning_iterations = 0`, `default_task_timeout_secs = 0`, and `context_limit = 8192` so agents use PS5LM's configured slot budget without artificial count caps.
+  - Because `available_parallelism()` reports 16 logical CPUs while payloads are restricted to 5 CPUs (`0xea00`), Tokio worker threads are capped (`tokio_worker_threads = 2`, clamped `1..=8` in `normalize_and_clamp()`) to avoid starving Sony system services.
+- **Configurable `0 = Unlimited` Limits (No 20-Item / Fixed Agent-Task-Memory Caps):**
+  - Arbitrary 20-item or fixed low ceilings have been removed: `CustomToolManager` (`crates/ps5-agent-tools/src/custom.rs`, scanning `<workspace>/.agents/tools/*.json` and `<data_dir>/tools/*.json`) imposes no `max_custom_tools` cap (each JSON file is bounded by `MAX_CUSTOM_TOOL_FILE_BYTES = 2 MiB` and `MAX_CUSTOM_TOOL_ID_LEN = 96`), and `AppConfig` (`crates/ps5-agent-config/src/lib.rs`) supports `0 = unlimited` across `[agents]` (`max_agents`, `max_active_tasks`, `max_queued_tasks`, `max_messages_per_task`, `max_reasoning_iterations`, `default_task_timeout_secs`), `[inference]` (`context_limit`, `max_output_tokens`, `timeout_secs`, `auto_sync_interval_secs`), `[security]` (`rate_limit_per_minute`, `login_rate_limit_per_minute`, `session_ttl_hours`), `[memory]` (`max_memories_per_agent`), and `[database]` (`retention_days`, `max_rows_per_table`).
+- **Verified Internal Safety Bounds (Active When `0` Is Configured or Under Load):**
+  - **Runtime (`crates/ps5-agent-runtime/src/runtime.rs`, `brain.rs`):** `UNLIMITED_SEMAPHORE_PERMITS = 4096` (used when `max_active_tasks = 0` or `max_concurrent_inference = 0`), `UNLIMITED_REASONING_SAFETY_CAP = 256` iterations (when `max_reasoning_iterations = 0`), `MAX_PENDING_APPROVALS = 256` (oldest pending approval entry is evicted if the map reaches capacity), `MAX_AUTO_CONTINUATIONS = 4` (for `finish_reason == "length"` or unclosed code fences), Workspace Brain file size cap `MAX_BRAIN_FILE_BYTES = 512 KiB` (`524_288` B) on read/write, Brain system-prompt injection budget `sandbox.max_brain_context_chars` (`4_000` chars default; `0` disables) + `MAX_PER_FILE_PROMPT_CHARS = 4096` (floored at `32` chars/section when shared), and `.take(24)` caps on injected skill summaries and active plugin rules.
+  - **Task Manager (`crates/ps5-agent-runtime/src/task_manager.rs`):** `DEFAULT_TASK_SCAN_LIMIT = 256` for subtask scans (`cancel_conversation_tasks` scales fetch limit to `summary.total.min(256).max(non_terminal.min(512))`).
+  - **HTTP & Rate Limiter (`crates/ps5-agent-http/src/{routes.rs,security.rs,lib.rs}`):** `clamp_limit` maps `limit=0` to `10_000` and clamps all list query limits to `1..=10_000`; `MAX_SSE_CONNECTIONS = 32` concurrent SSE clients; `SlidingWindowRateLimiter` bounds tracked IPs at `MAX_TRACKED_IPS = 4096`; `server.max_body_bytes` and `server.upload_max_body_bytes` map `0` to the `256 MiB` (`268_435_456` bytes) route limit.
+  - **Stateful Browser Tool (`crates/ps5-agent-tools/src/browser.rs`):** `MAX_SESSIONS = 16` concurrent sessions, `SESSION_IDLE_TTL = 30m` (`1800s`) idle expiration + LRU eviction, `MAX_COOKIES_PER_SESSION = 64` (FIFO), `MAX_HISTORY_PER_SESSION = 10` (FIFO), `MAX_STORED_HTML_BYTES = 512 KiB` (`524_288` B UTF-8 boundary slice via `floor_char_boundary_lossy`), `MAX_SNAPSHOT_ELEMENTS = 128` `[ref=eN]` items, `MAX_PAGE_TEXT_CHARS = 16_000` normalized text chars, and `128 KiB` challenge-scan prefix (`check_html_challenge`).
+  - **Web Search Cache & HTTP Redirects (`crates/ps5-agent-tools/src/web.rs`):** `SEARCH_CACHE_MAX_ENTRIES = 128` entries and `SEARCH_CACHE_TTL = 15m` (`900s`) with LRU eviction (`VecDeque`); `MAX_REDIRECTS = 5` hops; connect timeout clamped `1..=30s`; body streaming bounded by `tools.max_web_bytes` (default `512 KiB` on PS5; fallback `DEFAULT_MAX_WEB_BYTES = 16 MiB` if `0`, HTML extract cap `MAX_EXTRACT_HTML_BYTES = 16 MiB`).
+  - **Virtual Shell (`crates/ps5-agent-tools/src/sandbox_exec.rs`):** Per-stream (`stdout`/`stderr`) output cap `max_exec_output_bytes` defaults to `262_144` B (`256 KiB`; `0` falls back to `DEFAULT_MAX_EXEC_OUTPUT_BYTES = 262_144`, non-zero values clamp to `MIN_EXEC_OUTPUT_BYTES = 1024` B), `exec_timeout_secs` defaults to `20s`, virtual file ops enforce `max_file_bytes` (default `2 MiB`; `DEFAULT_MAX_FILE_BYTES = 16 MiB` if `0`), and recursive walks skip `.git`, `target`, and `node_modules` (`SKIP_WALK_DIRS`).
+  - **Memory Retention & Retrieval (`crates/ps5-agent-memory/src/lib.rs`):** Default `MemoryConfig` sets `max_memories_per_agent = 0` (`> 0` runs `enforce_agent_memory_cap` under `write_lock` to archive lowest-`importance`/oldest items), `archive_after_messages = 40`, `keep_recent_messages = 16`, `max_context_memories = 8`, and `max_memory_context_chars = 3200`. Reads/context assembly enforce `read_agent_memory` `fetch_limit = (limit * 4).max(limit).min(2000)`, `retrieve_context_scored` `scan_limit = (limit * 8).clamp(32, 256).max(limit.min(500))`, active turn fetch cap `archive_after_messages + 1024` (`1024` if `0`), `1200`-char rolling summaries, `IMAGE_ATTACHMENT_TOKEN_ESTIMATE = 85`, and `DATA_URI_PLACEHOLDER_TOKENS = 16` for omitted inline base64 data URIs.
+
+---
+
+## 2. Virtual Shell Only on PS5, Web/Browser Challenge & SSRF Gates, and MCP / Plugin Scope
+
+- **PS5 Virtual Shell Only (`sandbox_exec` — Host Subprocesses Disabled at Compile Time):**
+  - `ps5-payload-dev/elfldr` payloads run inside an isolated `SceSpZeroConf` process environment where `fork`/`exec` child-process semantics are unsupported or destabilizing. On PS5 (`target_vendor = "sie"`), `sandbox_exec` (`crates/ps5-agent-tools/src/sandbox_exec.rs`) therefore runs exclusively via its built-in pure-Rust `"virtual"` shell interpreter (`VIRTUAL_BUILTINS` supporting 30 workspace file/text commands, pipelines, and mode-gated redirections within `max_exec_output_bytes` / `exec_timeout_secs`).
+  - Host OS subprocess spawning (`std::process::Command` in `engine = "host"`) is excluded at compile time via `#[cfg(not(target_vendor = "sie"))]`; invoking `engine = "host"` on PS5 returns `PermissionDenied("host shell execution is disabled on PS5; use engine='virtual'")`. Even on non-PS5 host builds, `engine = "host"` stays disabled unless both `allow_host_shell = true` and `sandbox.mode = "full_sandbox"` are explicitly configured.
+- **Anti-Bot CAPTCHA / Challenge Non-Bypass & Pure-Rust Browser Scope (`browser.rs`, `web.rs`):**
+  - The built-in stateful `browser` tool parses HTML forms, links, cookies, and `[ref=eN]` controls in pure Rust without an embedded headless Chromium or JavaScript engine unless an external `tools.remote_browser_url` bridge is configured on a companion host. Client-side JS execution (SPAs or JS-only challenges) cannot run natively inside the PS5 ELF.
+  - Both `browser` and `web_fetch`/`web_search` inspect responses with `detect_challenge_gate` (headers `cf-mitigated`, `x-captcha-required`, `x-ddg-bot` and HTML markers for Cloudflare Turnstile/challenges, Google reCAPTCHA, hCaptcha, Altcha PoW, DuckDuckGo anomaly prompts, and bot-verification gates). When detected, tools return `ok: false, blocked_by_challenge: true` (with `challenge_kind`) and **never** solve, click through, compute proof-of-work, or automatically bypass anti-bot challenges.
+- **Private LAN / Loopback Web Access vs. Unconditional Cloud Metadata Blocking (`web.rs`, `browser.rs`, `config/lib.rs`):**
+  - Outbound `web_*` and `browser` requests (re-validated on every redirect up to `MAX_REDIRECTS = 5` with DNS IP pinning) default to `allow_local_network = false` (synced with `block_private_lan_web_requests = true`), blocking `localhost`/`.localhost`/`.local`/`.internal` and all loopback, RFC1918, CGNAT, link-local, unspecified, broadcast, or multicast IPs.
+  - Accessing companion LAN/loopback services (such as local SearXNG or `remote_browser_url`) requires explicitly setting `allow_local_network = true` (or `block_private_lan_web_requests = false`) **and** permitting the host in `tools.allowed_domains` (without matching `tools.blocked_domains`, which always overrides even `["*"]`).
+  - Cloud metadata endpoints (`169.254.169.0/24`, `169.254.170.2`, `100.100.100.200`, `fd00:ec2::254`, IPv4-mapped/compatible/SIIT/NAT64/6to4/Teredo embedded metadata IPv6 forms, plus `metadata.google.internal`, `*.metadata.google.internal`, `metadata.goog`, and `instance-data`) remain **unconditionally blocked** even when `allow_local_network = true`.
+- **MCP Transport Scope (Streamable-HTTP Only):**
+  - `McpManager` (`crates/ps5-agent-tools/src/mcp.rs`) supports **Streamable-HTTP JSON-RPC 2.0** (`http://` and `https://`, supporting JSON and `text/event-stream` SSE responses plus `Mcp-Session-Id`) **only**.
+  - Local `stdio` MCP servers (`command` / `args` subprocesses) are **not supported** due to the PS5 zero-subprocess constraint; any `mcpServers` JSON entry missing `url` / `serverUrl` is rejected.
+  - When `block_private_lan_web_requests = true` (`allow_local_network = false`), the SSRF guard blocks loopback, `.localhost`/`.local`/`.internal`, RFC1918, and link-local MCP URLs unless `trust_local = true` is explicitly set on that MCP server configuration.
+- **Plugin & Custom Tool Scope:** Declarative `plugin.json` custom tools (`crates/ps5-agent-tools/src/plugins.rs`) and `CustomToolManager` tools (`crates/ps5-agent-tools/src/custom.rs`, max `MAX_CUSTOM_HTTP_REDIRECTS = 5`, default timeout `20s`) support `"template"` substitution and SSRF-guarded bounded `"http"` requests only — neither can execute local binaries or shell scripts.
+
+---
+
+## 3. Plain HTTP on Trusted LAN, Upload Caps & Sandboxed HTML Preview
+
+- **No Native TLS Termination:** The PS5 ELF serves plain HTTP (`0.0.0.0:8080` on PS5, `127.0.0.1:8080` on host). Modern browsers reject self-signed TLS certificates on raw LAN IPs without manual CA installation on every client, and direct public Internet exposure is unsupported.
+  - `server.allow_lan_only = true` fails closed (`403 Forbidden`) for any peer outside loopback (`127.0.0.0/8`, `::1`), IPv4 RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), or IPv6 ULA (`fc00::/7`).
+  - Cookie/Bearer auth (`Argon2id` + `HttpOnly; SameSite=Strict` cookies or SHA-256 Bearer tokens), CSRF (`X-CSRF-Token`), `Origin`/`Referer` checks, strict CSP/headers, and sliding-window rate limiting (`rate_limit_per_minute = 0` disables general/login throttling) are enforced in `crates/ps5-agent-http/src/security.rs`. Place a TLS-terminating reverse proxy on a trusted LAN host for remote access.
+- **Upload Body Size Cap & RAM Buffering:**
+  - `build_router` (`crates/ps5-agent-http/src/lib.rs`) separates standard API routes (`server.max_body_bytes`, default `1 MiB`) from upload routes (`server.upload_max_body_bytes`, default `64 MiB`; non-zero values clamp to `1024..=268_435_456`, `0` = `256 MiB`).
+  - Large uploads (chat photo/file attachments, workspace uploads, tool/memory imports, extension imports) briefly buffer in RAM during request parsing, which can pressure PS5 Flexible Memory under concurrent uploads. `POST /api/v1/conversations/{id}/messages` also bounds `content` to `64_000` bytes and `attachments` to `16` items (`crates/ps5-agent-http/src/routes.rs`).
+- **Sandboxed HTML Preview Constraints:**
+  - Agent-generated `.html`/`.htm` files served via `GET /api/v1/files/preview` are rendered in an `<iframe sandbox="allow-scripts">` **without** `allow-same-origin` (`crates/ps5-agent-dashboard/assets/index.html`, `app.js`).
+  - `apply_security_headers` (`crates/ps5-agent-http/src/security.rs`) serves `2xx` `/api/v1/files/preview` responses with `PREVIEW_CSP_VALUE` (`default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; font-src data:; frame-ancestors 'self'`) and `X-Frame-Options: SAMEORIGIN` (`DENY` everywhere else).
+  - `inject_sandbox_storage_shim` (`crates/ps5-agent-http/src/routes.rs`) injects a volatile in-memory `localStorage`/`sessionStorage` shim so generated HTML pages do not throw `SecurityError` in the opaque origin, while intentionally preventing access to Dashboard cookies, storage, CSRF tokens, or external network requests.
+- **Vision Model Requirement (`supports_vision`):**
+  - Multimodal image attachments (`image_urls`) require a vision-capable model (`mmproj`/vision modality) loaded in `PS5LM`, reported as `supports_vision = true` via `PS5LM` `/props` discovery (`crates/ps5-agent-inference/src/provider.rs`). Text-only GGUF models cannot process attached images.
+
+---
+
+## 4. PS5 Firmware `13.x` Rest-Mode Wake Behavior
+
+- **Constraint:** On PS5 Firmware `13.x`, entering and waking from Rest Mode disrupts active kernel network sockets.
+- **Observed Mechanism & Behavior:**
+  - **Suspend Safety:** Blocking inside raw `accept()` or `recv()` during suspend causes a console power-off crash. `ps5-agent` avoids this via `ps5-std-rt` + Tokio non-blocking `kevent` I/O.
+  - **Post-Wake Socket Invalidation (Error `163`):** Upon resume from Rest Mode on `13.x`, existing listening sockets can fail with Sony OS error `163`.
+  - **Recovery & Limitation:** `RecoveringTcpListener` and `serve()` in `crates/ps5-agent-http/src/server.rs` detect clock jumps and Sony OS error `163`, set the `network_degraded` flag (surfaced via `/api/v1/health` and `/api/v1/metrics`), emit a `StreamEvent::SystemAlert`, and attempt to rebind the listener with exponential backoff (`250ms` to `5s`). If the PS5 kernel drops the network interface across sleep and backoff rebinding cannot recover the interface automatically, the user may need to toggle the console's network connection or re-send `ps5-agent.elf` via `elfldr`.
+
+---
+
+## 5. Interactive Runtime Operations, Script Transport & Thinking Sync
+
+- **Per-Chat & Per-Agent Task Cancellation:**
+  - `POST /api/v1/conversations/{id}/cancel` (`cancel_conversation_tasks` in `crates/ps5-agent-runtime/src/task_manager.rs`) cancels non-terminal tasks matching `conversation_id` and an optional `agent_id`, cascades cancellation to child subtasks, and wakes pending `expedite` waiters (`TaskManager::cancel_task`), while `TaskManager::release_token` removes and shrinks `tokens` / `expedite_notifiers` maps on terminal completion.
+  - Note: cancellation scans up to `summary.total.min(256).max(non_terminal.min(512))` tasks, and in-flight HTTP inference calls abort cleanly at async cancellation points.
+- **`immediate` / `expedite` Queue Bypass (`Send Now` / `Run Immediately`):**
+  - Sending a message with `immediate: true` (`dispatch_chat_background_with_options`) or calling `POST /api/v1/tasks/{id}/expedite` (`expedite_task`) skips waiting for a `task_semaphore` slot (`await_task_slot_or_expedite` yields a `None` permit).
+  - Bypassed tasks still share `inference_semaphore` (`max_concurrent_inference`), so PS5LM GPU requests remain serialized when `max_concurrent_inference = 1`; however, running many bypassed turns concurrently still allocates per-task prompt/tool buffers in PS5 Flexible Memory.
+- **Automatic Script Transport to Workspace & Inline Editor:**
+  - When an agent turn completes without having called a file-write tool (`!opts.did_write_file`), `crates/ps5-agent-runtime/src/runtime.rs` extracts fenced code blocks of `>= 10` lines (`extract_all_fenced_script_blocks`) and writes them into the workspace with `approved_bypass: true` (requiring the agent to have an enabled write tool such as `write_file`/`file_write`), emits `StreamEvent::FilesChanged`, and replaces inline code with `[FILE_CREATED: <filename>]` cards (blocks `< 10` lines stay inline; repeated `>= 15`-line blocks after an explicit `write_file` are deduplicated).
+  - Unclosed code fences (`has_unclosed_code_fence`) or truncated outputs (`finish_reason == "length"`) trigger automatic continuation up to `MAX_AUTO_CONTINUATIONS = 4`.
+  - Editing files inline from the **Files** tab saves via `POST /api/v1/files/upload` (`write_workspace_file` in `src/adapters.rs`), which bypasses `tools.max_file_bytes` up to `server.upload_max_body_bytes` while strictly enforcing workspace path sandboxing (`crates/ps5-agent-tools/src/files.rs` rejects `..` traversal and escapes).
+- **Live Orphan `</think>` & `chat_completed.reasoning` Sync / KV Prefill:**
+  - Models that omit opening `<think>` or `<seed:think>` tags and emit an orphan `</think>` or `</seed:think>` have their pre-tag draft swept into the collapsible Thinking drawer both during SSE streaming (`sweepOrphanClosingThinkTag` in `crates/ps5-agent-dashboard/assets/app.js`) and on the backend (`ThinkStreamSplitter` in `crates/ps5-agent-inference/src/parser.rs`), with `StreamEvent::ChatCompleted.reasoning` synchronizing the persisted reasoning block upon completion.
+  - When `inference.prefill_kv_cache = true`, `spawn_kv_cache_prefill` issues a background `n_predict: 0` request after a turn finishes to warm `PS5LM`'s prefix cache; because it uses non-blocking `inference_semaphore.try_acquire_owned()`, an idle prefill never blocks behind busy inference, and if an active prefill holds a slot on a `1`-slot server, an immediately following prompt waits only for that short prefill call.
+
+---
+
+## 6. Process Lifecycle, Cold Reboot, Storage Modes & Retention Pruning
+
+- **Process Naming (`MAXCOMLEN` 19-Byte Limit):** `elfldr` payloads spawn under `SceSpZeroConf` without a meaningful binary name (`payload.elf` by default). To surface clear process identity in tools like `pldmgr`, `ps5::payload::set_process_name` (`crates/ps5/src/payload.rs`) invokes FreeBSD `SYS_thr_set_name` (`464`) at startup (`"ps5-agent.elf"` / `"m1-ps5-probe.elf"`), subject to FreeBSD's 19-byte `MAXCOMLEN` ceiling (`[u8; 20]` NUL-terminated buffer).
+- **Clean Stop/Restart vs. Cold Reboot:**
+  - **In-Session Stop/Restart (`SIGTERM`):** `ps5-agent` ignores `SIGPIPE`/`SIGHUP`, handles `SIGTERM`/`SIGINT` for graceful shutdown, removes `<data_dir>/ps5-agent.pid` on exit (and supports singleton PID cleanup on restart), binds `:8080` with `SO_REUSEADDR`/`SO_REUSEPORT` (`bind_reusable_listener()` in `crates/ps5-agent-http/src/server.rs`) for rapid rebinding across restarts, checkpoints storage, flushes logs, drops the Tokio runtime (`drop(rt)`), and exits via `ps5::payload::exit(i32::from(exit_code))` (wrapping `ps5_sys::payload_exit(code)`) on PS5 targets to avoid Sony `__cxa_atexit` heap-error traps.
+  - **Cold Reboot:** PS5 userland jailbreaks are non-persistent across full power-off or cold reboots. After a cold reboot, the jailbreak, `elfldr` (port `9021`), `PS5LM`, and `ps5-agent.elf` are no longer running and must be re-initialized (re-run the jailbreak entry point, start `elfldr` + `PS5LM`, and deploy `build/ps5-agent.elf` via `scripts/deploy-ps5.ps1` or `elfldr` `file:/data/ps5-agent/ps5-agent.elf`).
+- **Storage Mode on PS5 (`TRUNCATE` vs. `WAL` / `.db-shm` `mmap` Hazard):**
+  - On PS5 (`target_vendor = "sie"`), SQLite `WAL` mode requires `.db-shm` `mmap(MAP_SHARED)` which can fail or cause restart recovery hazards on `/data`. Consequently, `wal_mode = false` is set by default in `config/config.ps5-slim-1340.toml` and `AppConfig::with_data_dir`, and `SqliteStorage::configure_pragmas` (`crates/ps5-agent-database/src/sqlite.rs`) enforces `PRAGMA journal_mode = TRUNCATE` with `PRAGMA locking_mode = NORMAL` on `target_vendor = "sie"` (while preserving `wal_mode` configurability on host builds).
+  - `SqliteStorage::open` automatically cleans stale `-shm` files when WAL is inactive, and `open_storage` (`crates/ps5-agent-database/src/metrics.rs`) runs SQLite `integrity_check()`, backing up corrupted DBs to `<path>.corrupt.bak` and re-initializing cleanly (or falling back to `JsonlStorage` if needed).
+- **SQLite vs. JSONL Retention Pruning:**
+  - Both backends implement `prune_old_records(retention_days, max_rows_per_table)` (default `30` days / `10_000` rows per table; `0` = keep forever/unlimited), purging expired/revoked sessions and aged/excess terminal tasks, task events, agent messages, tool executions, audit logs, and archived chat messages while preserving active tasks and unarchived messages.
+  - **SQLite** performs transactional `DELETE`s followed by `PRAGMA incremental_vacuum(64)`. **JSONL** (`JsonlStorage`) must rewrite compacted `.jsonl` snapshots (`messages.jsonl`, `task_events.jsonl`, `agent_messages.jsonl`, `tool_executions.jsonl`, `audit_logs.jsonl`) plus `state.json` on disk whenever records are pruned, which incurs noticeably higher I/O latency on PS5 `/data` (~1–2 MB/s) than SQLite.
+- **Resilient `config.toml` Parsing:** Hand-edited or FTP-transferred `config.toml` files on PS5 can contain UTF-8 BOMs, non-standard booleans, partial sections, or syntax errors. `AppConfig::load_or_create_resilient()` (`crates/ps5-agent-config/src/lib.rs`) strips UTF-8 BOMs/NUL bytes, normalizes boolean strings, fills omitted fields via `#[serde(default)]`, clamps out-of-range values via `normalize_and_clamp()`, and backs up unparseable files to `config.toml.broken.bak` while booting with safe defaults instead of crashing.
+- **Data & Task Continuity:**
+  - Persistent state is preserved on disk in `/data/ps5-agent/database/agent.db` (and `checkpoint()` runs on clean shutdown in `src/shutdown.rs`).
+  - On startup (`src/startup.rs`), `runtime.recover_on_startup()` (`crates/ps5-agent-runtime/src/task_manager.rs`) preserves all conversations, memories, agents, and tasks: interrupted read-only tasks (`Running`/`Assigned` with `has_side_effects == false`) and `Pending` tasks are re-queued for automatic resumption, whereas interrupted side-effecting tasks (`has_side_effects == true`) are safely moved to `TaskStatus::Waiting` for manual review rather than blindly replayed.
+
+---
+
+## 7. Upstream Linker Script `.text` (`LOAD 0`) `RWE` Flags
+
+- **Constraint:** The upstream `ps5-payload-dev/sdk` linker script (`ldscripts/elf_x86_64.x`, invoked with `-z max-page-size=0x4000`) emits the `.text` program header (`LOAD 0`) with `RWE` flags.
+- **Mitigation & Verification:**
+  - While `LOAD 0` carries `RWE` flags due to the upstream SDK linker script layout, `targets/x86_64-sie-ps5-std.json` and the `0x4000` (16 KiB) page alignment keep `.text` (and `.eh_frame_hdr`) strictly page-disjoint from writable `RW` data segments so executable code pages and writable data pages do not share a 16 KiB MMU page.
+  - Every `ps5-agent.elf` build is checked by `elf-verify.exe` (via `scripts/build-ps5.ps1`) to verify ELF segment layout and the presence of the `Stat11` SQLite ABI shim symbols (`__ps5_stat11`, `__ps5_fstat11`, `__ps5_lstat11`).
+
+---
+
+## 8. Hardware Verification Status (**Hardware-Pending**)
+
+- **Verified Offline / On Host:**
+  - Firmware `13.40` (`0x13400000`) kernel offsets cross-checked against `ps5-payload-dev/sdk v0.45` (`crt/kernel.c`).
+  - Pre-Wave 5 cross-compilation for `x86_64-sie-ps5-std`, ELF segment/page-disjointness validation (`elf-verify.exe`), and `Stat11` SQLite ABI shim symbol verification (Wave 5B ELF rebuild pending).
+  - Pre-Wave 5 host unit, integration, security, multi-agent orchestration, scheduler, extensions (`SKILL.md`, Streamable-HTTP MCP, `plugin.json`), workspace file/HTML preview, script transport, cancellation/expedite, stress/recovery, and browser UI verification against `mock-ps5lm`, plus source verification of Wave 5 bounded `browser`, `web`, `sandbox_exec` (`target_vendor = "sie"` compile-time host guard), `brain`, and `ps5-agent-memory` limits (Wave 5B test re-run pending).
+- **Hardware-Pending:**
+  - Live on-console execution of this updated build on a physical **PS5 Slim (Firmware `13.40`)** is **Hardware-Pending**; end-to-end validation against real Sony kernel syscalls (`SYS_thr_set_name`, `SIGTERM` restarts, `/data` `TRUNCATE` mode without `.db-shm` `mmap`, `/data` Brain workspace files & virtual shell `sandbox_exec` I/O, stateful `browser` & SSRF egress on PS5, resilient `config.toml`/auth flows, Rest-Mode wake error `163` recovery, and live `PS5LM` inference/vision) requires the user's jailbroken PS5 console on LAN (see `scripts/verify-on-ps5.py`).

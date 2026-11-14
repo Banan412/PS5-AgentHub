@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "m1-ps5-probe"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Milestone 1 PS5 probe: std + panic hook + ps5 HW/Toast + filesystem + Tokio TCP server"
+
+[dependencies]
+ps5 = { path = "../../crates/ps5", features = ["notify", "hw"] }
+ps5-std-rt = { path = "../../crates/ps5-std-rt" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("sie"))', 'cfg(mio_unsupported_force_waker_pipe)'] }

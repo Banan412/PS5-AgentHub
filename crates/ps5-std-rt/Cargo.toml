@@ -1,0 +1,9 @@
+[package]
+name = "ps5-std-rt"
+description = "Glue that lets Rust's FreeBSD std link and run as a PS5 payload"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("sie"))', 'cfg(mio_unsupported_force_waker_pipe)'] }

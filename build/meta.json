@@ -1,0 +1,20 @@
+{
+  "schema": 2,
+  "kind": "repo",
+  "filename": "ps5-agent.elf",
+  "installed_at": "2026-11-14T00:53:23+0100",
+  "id": "ps5-agent",
+  "source_url": "",
+  "source_name": "Custom Build",
+  "name": "PS5 Agent",
+  "version": "v0.1.0",
+  "checksum": "572bbacd0b738226d6b36bfce163e4dd1f2cd33c73a785bcde1bb0d7ec5a19e8",
+  "last_update": "2026-11-14",
+  "url": "",
+  "source": "",
+  "source_direct": "",
+  "category": "Networking & Servers",
+  "description": "Autonomous multi-agent AI runtime and web dashboard for jailbroken PS5 (FW 13.40) powered by PS5LM",
+  "author": "",
+  "details_url": ""
+}

@@ -1,0 +1,26 @@
+[package]
+name = "ps5-sys"
+description = "Raw bindgen bindings to the PS5 payload SDK"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+build = "build.rs"
+links = "ps5"
+
+# Each feature links one Sony system library into the payload. All
+# bindings are always generated; a feature only adds the `-l` flag.
+[features]
+kernel-sys = []        # sceKernelGetHw*, CPU/SoC temperature
+notification = []      # sceNotificationSend
+random = []            # sceRandomGetRandomNumber
+user-service = []      # sceUserService*
+system-service = []    # sceSystemServiceLaunchWebBrowser
+app-inst-util = []     # sceAppInstUtil* (+ Ipmi)
+ssl = []               # sceSsl*
+http2 = []             # sceHttp2*
+
+[build-dependencies]
+bindgen = { version = "0.72", default-features = false, features = ["runtime"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("sie"))', 'cfg(mio_unsupported_force_waker_pipe)'] }

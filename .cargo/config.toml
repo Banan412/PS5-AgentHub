@@ -1,0 +1,10 @@
+# Note: Do NOT set a global `[build] target = ...` here so host `cargo test` works natively.
+# Use `scripts/build-ps5.ps1` / `scripts/build-ps5.sh` / `Makefile` to cross-compile for PS5.
+
+[target.x86_64-sie-ps5]
+rustflags = ["-Zunstable-options", "-Cpanic=immediate-abort"]
+
+[target.x86_64-sie-ps5-std]
+# Panics run our panic hook (file log + PS5 toast) before aborting.
+# mio wakes tokio through a pipe (proven on PS5 by neokuze/ps5-rust).
+rustflags = ["-Zunstable-options", "--cfg", "mio_unsupported_force_waker_pipe"]

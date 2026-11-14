@@ -1,0 +1,17 @@
+[package]
+name = "ps5-agent-logging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BrokenPipe-safe structured logging, ring buffer, rotating file sink, and PS5 klog/toast bridge"
+
+[dependencies]
+chrono.workspace = true
+ps5-agent-config.workspace = true
+serde.workspace = true
+
+[target.'cfg(target_vendor = "sie")'.dependencies]
+ps5 = { path = "../ps5", features = ["notify"] }
+
+[lints]
+workspace = true

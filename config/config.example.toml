@@ -1,0 +1,102 @@
+# PS5 Agent Example Configuration
+# Copy to /data/ps5-agent/config.toml on PS5 or ./data/ps5-agent/config.toml on host.
+data_dir = "/data/ps5-agent"
+
+[inference]
+base_url = "http://127.0.0.1:8081/v1"
+model = "qwen-loaded"
+# Supported PS5LM POST api_mode values:
+#   "chat_completions"   -> POST /v1/chat/completions
+#   "responses"          -> POST /v1/responses
+#   "anthropic_messages" -> POST /v1/messages
+#   "completions"        -> POST /v1/completions
+#   "system_one"         -> POST /v1/systemone
+# Health/discovery automatically use GET /health and GET /v1/models.
+api_mode = "chat_completions"
+timeout_secs = 120
+connect_timeout_secs = 5
+context_limit = 8192
+max_output_tokens = 1024
+stream_enabled = true
+max_retries = 2
+
+[server]
+bind_host = "0.0.0.0"
+port = 8080
+max_body_bytes = 1048576
+allow_lan_only = true
+
+[database]
+driver = "auto"
+path = "/data/ps5-agent/database/agent.db"
+busy_timeout_ms = 5000
+cache_size_kb = 4000
+wal_mode = false
+
+[security]
+auth_enabled = true
+admin_username = "admin"
+session_ttl_hours = 24
+rate_limit_per_minute = 240
+login_rate_limit_per_minute = 10
+require_approval_for_mutating = false
+argon2_memory_kib = 8192
+
+[agents]
+max_agents = 5
+max_active_tasks = 4
+max_queued_tasks = 64
+max_concurrent_inference = 1
+max_messages_per_task = 20
+max_reasoning_iterations = 8
+allow_temporary_specialists = true
+on_disable_policy = "cancel"
+
+[memory]
+max_memories_per_agent = 500
+archive_after_messages = 40
+keep_recent_messages = 16
+max_context_memories = 8
+max_memory_context_chars = 3200
+
+[tools]
+allowed_paths = ["/data/ps5-agent/workspace"]
+allowed_domains = ["*"]
+block_private_lan_web_requests = true
+default_timeout_secs = 20
+max_file_bytes = 2097152
+max_web_bytes = 524288
+
+[logging]
+level = "info"
+log_dir = "/data/ps5-agent/logs"
+max_file_bytes = 2097152
+ring_buffer_capacity = 500
+enable_klog = false
+enable_toast = false
+
+[runtime]
+tokio_worker_threads = 2
+health_poll_interval_secs = 15
+rest_mode_recovery = true
+
+[sandbox]
+# Sandbox filesystem/execution mode: "read_only", "workspace_write", or "full_sandbox"
+mode = "full_sandbox"
+# Mutating tool approval policy: "full_auto", "on_request", "always_ask", or "never"
+approval_policy = "full_auto"
+network_access = true
+allow_local_network = false
+# Web search provider: "duckduckgo", "searxng", "brave", or "tavily"
+web_search_provider = "duckduckgo"
+searxng_url = ""
+brave_api_key = ""
+tavily_api_key = ""
+remote_browser_url = ""
+allow_host_shell = false
+max_exec_output_bytes = 262144
+exec_timeout_secs = 20
+inject_brain_files = true
+max_brain_context_chars = 16000
+# Autonomous HEARTBEAT.md check interval in seconds (0 = disabled)
+heartbeat_interval_secs = 0

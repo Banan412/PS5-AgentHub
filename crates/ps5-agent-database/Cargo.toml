@@ -1,0 +1,18 @@
+[package]
+name = "ps5-agent-database"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+ps5-agent-config.workspace = true
+ps5-agent-core.workspace = true
+ps5-agent-logging.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

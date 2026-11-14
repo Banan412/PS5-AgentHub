@@ -1,0 +1,19 @@
+[package]
+name = "ps5-agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared domain models, traits, limits, and errors for ps5-agent"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

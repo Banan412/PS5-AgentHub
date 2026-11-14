@@ -1,0 +1,16 @@
+[package]
+name = "ps5-agent-messaging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ps5-agent-config.workspace = true
+ps5-agent-core.workspace = true
+ps5-agent-logging.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

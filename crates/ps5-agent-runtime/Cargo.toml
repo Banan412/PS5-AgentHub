@@ -1,0 +1,21 @@
+[package]
+name = "ps5-agent-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+ps5-agent-config.workspace = true
+ps5-agent-core.workspace = true
+ps5-agent-logging.workspace = true
+ps5-agent-manager.workspace = true
+ps5-agent-messaging.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true
