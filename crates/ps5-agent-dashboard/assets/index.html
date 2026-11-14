@@ -396,6 +396,21 @@
                 <div id="chat-ephemeral-body" class="chat-ephemeral-body"></div>
               </div>
 
+              <div id="chat-live-browser-dock" class="live-browser-dock card" role="region" aria-label="Live Agent Browser Viewport" hidden>
+                <div class="live-browser-head">
+                  <div id="chat-live-browser-tabs" class="live-tabs-strip" role="tablist" aria-label="Live agent browser tabs"></div>
+                  <div class="live-browser-meta">
+                    <span id="chat-live-browser-status" class="pill pill-info" aria-live="polite">Idle</span>
+                    <span id="chat-live-browser-url" class="live-browser-url mono text-xs truncate">about:blank</span>
+                    <button id="btn-chat-live-browser-close" type="button" class="btn btn-ghost btn-sm" aria-label="Hide live agent browser viewport">Hide</button>
+                  </div>
+                </div>
+                <div class="live-browser-stage">
+                  <iframe id="chat-live-browser-frame" class="live-browser-frame" sandbox="" referrerpolicy="no-referrer" title="Live Agent Browser Preview"></iframe>
+                  <svg id="chat-live-browser-overlay" class="live-browser-overlay" viewBox="0 0 640 280" preserveAspectRatio="xMidYMid meet" aria-hidden="true"></svg>
+                </div>
+              </div>
+
               <div id="chat-composer-wrap" class="chat-composer-wrap">
                 <div id="chat-drop-hint" class="chat-drop-hint" hidden>Drop photos or workspace files here to attach</div>
                 <div id="slash-agent-menu" class="slash-menu" role="listbox" aria-label="Agent slash command autocomplete" hidden></div>
@@ -414,6 +429,14 @@
                       <option value="medium" selected>Thinking: Medium</option>
                       <option value="high">Thinking: High</option>
                       <option value="max">Thinking: Max</option>
+                    </select>
+                  </div>
+
+                  <div class="composer-toolbar-group">
+                    <button type="button" id="btn-agentic-search-toggle" class="btn btn-secondary btn-sm" aria-pressed="false" aria-label="Toggle Agentic Search">Agentic Search</button>
+                    <label class="sr-only" for="chat-agentic-agent-select">Agentic Search Agent</label>
+                    <select id="chat-agentic-agent-select" class="select composer-select" aria-label="Agentic Search Agent">
+                      <option value="">Auto (Active Agent)</option>
                     </select>
                   </div>
 
@@ -531,12 +554,12 @@
             <div class="schedule-ai-header">
               <div>
                 <h3 class="card-title">AI Schedule Builder</h3>
-                <p class="text-muted text-sm">Describe a one-off or recurring task in Polish or English. Preview or create an autonomous background job.</p>
+                <p class="text-muted text-sm">Describe a one-off or recurring task in natural language. Preview or create an autonomous background job.</p>
               </div>
             </div>
             <div class="field">
               <label for="schedule-ai-prompt">Natural-Language Schedule Request</label>
-              <textarea id="schedule-ai-prompt" class="input" rows="2" placeholder="e.g. Every day at 08:30 inspect system health, or Codziennie o 09:00 sprawdź logi i zapisz podsumowanie&hellip;"></textarea>
+              <textarea id="schedule-ai-prompt" class="input" rows="2" placeholder="e.g. Every day at 08:30 inspect system health and write a short report&hellip;"></textarea>
             </div>
             <div class="schedule-ai-controls">
               <div class="field-compact">
@@ -552,9 +575,9 @@
               <button id="btn-schedule-ai-parse" type="button" class="btn btn-primary">Parse Schedule</button>
             </div>
             <div class="schedule-examples-row" role="group" aria-label="Example schedule prompts">
-              <button type="button" class="schedule-example-chip" data-prompt="Codziennie o 08:30 sprawdź status PS5LM i zapisz raport">Codziennie o 08:30 sprawdź status PS5LM i zapisz raport</button>
+              <button type="button" class="schedule-example-chip" data-prompt="Every day at 08:30 check PS5LM status and save a report">Every day at 08:30 check PS5LM status and save a report</button>
               <button type="button" class="schedule-example-chip" data-prompt="Every 30 minutes check workspace files and log recent changes">Every 30 minutes check workspace files and log recent changes</button>
-              <button type="button" class="schedule-example-chip" data-prompt="Za 15 minut sprawdź logi systemu i przygotuj krótkie podsumowanie">Za 15 minut sprawdź logi systemu i przygotuj krótkie podsumowanie</button>
+              <button type="button" class="schedule-example-chip" data-prompt="In 15 minutes inspect system logs and prepare a brief summary">In 15 minutes inspect system logs and prepare a brief summary</button>
               <button type="button" class="schedule-example-chip" data-prompt="Every Monday at 09:00 prepare a weekly diagnostic digest">Every Monday at 09:00 prepare a weekly diagnostic digest</button>
             </div>
             <div id="schedule-ai-preview" class="schedule-ai-preview" hidden></div>
@@ -875,6 +898,22 @@
               <div class="stack-form">
                 <div class="browser-console-bar">
                   <div class="field-compact">
+                    <label for="sandbox-browser-agent-select">Agentic Search Agent</label>
+                    <select id="sandbox-browser-agent-select" class="select" aria-label="Sandbox Agentic Search Agent">
+                      <option value="">Auto (Active Agent)</option>
+                    </select>
+                  </div>
+                  <div class="field-compact">
+                    <label for="sandbox-browser-agentic-input">Agentic Search Task</label>
+                    <input id="sandbox-browser-agentic-input" type="text" class="input" placeholder="Search or inspect a site with live pointer telemetry&hellip;" aria-label="Sandbox Agentic Search Prompt">
+                  </div>
+                  <div class="field-compact field-end">
+                    <button id="btn-sandbox-agentic-run" type="button" class="btn btn-primary btn-sm">Run Agentic Search</button>
+                  </div>
+                </div>
+
+                <div class="browser-console-bar">
+                  <div class="field-compact">
                     <label for="browser-url-input">Target URL</label>
                     <input id="browser-url-input" type="url" class="input mono" placeholder="http://127.0.0.1:8080/" aria-label="Browser Target URL">
                   </div>
@@ -908,6 +947,21 @@
                     <button id="btn-browser-fill" type="button" class="btn btn-secondary btn-sm">Fill Ref</button>
                     <button id="btn-browser-submit" type="button" class="btn btn-primary btn-sm">Submit Ref</button>
                   </div>
+                </div>
+
+                <div id="sandbox-live-browser-dock" class="live-browser-dock" role="region" aria-label="Sandbox Live Browser Viewport">
+                  <div class="live-browser-head">
+                    <div id="sandbox-live-browser-tabs" class="live-tabs-strip" role="tablist" aria-label="Sandbox live browser tabs"></div>
+                    <div class="live-browser-meta">
+                      <span id="sandbox-live-browser-status" class="pill pill-muted" aria-live="polite">Idle</span>
+                      <span id="sandbox-live-browser-url" class="live-browser-url mono text-xs truncate">about:blank</span>
+                    </div>
+                  </div>
+                  <div class="live-browser-stage">
+                    <iframe id="sandbox-live-browser-frame" class="live-browser-frame" sandbox="" referrerpolicy="no-referrer" title="Sandbox Browser Preview"></iframe>
+                    <svg id="sandbox-live-browser-overlay" class="live-browser-overlay" viewBox="0 0 640 280" preserveAspectRatio="xMidYMid meet" aria-hidden="true"></svg>
+                  </div>
+                  <div id="sandbox-live-browser-feed" class="live-browser-feed" aria-live="polite"></div>
                 </div>
 
                 <div id="browser-snapshot-meta" class="text-xs text-muted mono"></div>
@@ -1295,6 +1349,10 @@
 
                 <fieldset class="settings-group">
                   <legend>KV Cache &amp; llama.cpp / PS5LM Sampling</legend>
+                  <div class="toolbar-actions kv-import-bar">
+                    <button id="btn-import-llamacpp-kv" type="button" class="btn btn-secondary btn-sm">Import KV &amp; Sampling from llama.cpp / PS5LM</button>
+                    <span id="import-kv-status" class="pill pill-muted text-sm" aria-live="polite">Ready</span>
+                  </div>
                   <div class="form-grid">
                     <div class="field">
                       <label for="cfg-prefill-kv-cache">Pre-fill KV cache after response</label>
@@ -1312,6 +1370,58 @@
                         <option value="false">Disabled (Re-evaluate full prompt)</option>
                       </select>
                       <small id="hint-cfg-cache-prompt" class="field-hint">Asks PS5LM / llama.cpp to retain and reuse KV cache tokens for shared system prompt and conversation prefixes. Default: <code>true</code>. Dramatically reduces prompt-eval latency and CPU/GPU work.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="set-inf-cache-type-k">KV Cache Key Quantization (<code>cache_type_k</code>)</label>
+                      <select id="set-inf-cache-type-k" class="select mono" aria-label="KV Cache Key Quantization" aria-describedby="hint-set-inf-cache-type-k">
+                        <option value="" selected>Default (Server configured)</option>
+                        <option value="f16">f16</option>
+                        <option value="q8_0">q8_0</option>
+                        <option value="q4_0">q4_0</option>
+                        <option value="q5_0">q5_0</option>
+                        <option value="q5_1">q5_1</option>
+                        <option value="q4_1">q4_1</option>
+                        <option value="bf16">bf16</option>
+                        <option value="f32">f32</option>
+                        <option value="iq4_nl">iq4_nl</option>
+                      </select>
+                      <small id="hint-set-inf-cache-type-k" class="field-hint">Target llama.cpp K-cache quantization format imported or configured for PS5LM (<code>f16</code>, <code>q8_0</code>, <code>q4_0</code>, etc.). Empty uses server default.</small>
+                    </div>
+
+                    <div class="field">
+                      <label for="set-inf-cache-type-v">KV Cache Value Quantization (<code>cache_type_v</code>)</label>
+                      <select id="set-inf-cache-type-v" class="select mono" aria-label="KV Cache Value Quantization" aria-describedby="hint-set-inf-cache-type-v">
+                        <option value="" selected>Default (Server configured)</option>
+                        <option value="f16">f16</option>
+                        <option value="q8_0">q8_0</option>
+                        <option value="q4_0">q4_0</option>
+                        <option value="q5_0">q5_0</option>
+                        <option value="q5_1">q5_1</option>
+                        <option value="q4_1">q4_1</option>
+                        <option value="bf16">bf16</option>
+                        <option value="f32">f32</option>
+                        <option value="iq4_nl">iq4_nl</option>
+                      </select>
+                      <small id="hint-set-inf-cache-type-v" class="field-hint">Target llama.cpp V-cache quantization format imported or configured for PS5LM (<code>f16</code>, <code>q8_0</code>, <code>q4_0</code>, etc.). Empty uses server default.</small>
+                    </div>
+
+                    <div class="field">
+                      <span class="field-label text-sm text-secondary">Flash Attention (<code>flash_attn</code>)</span>
+                      <label class="checkbox-row" for="set-inf-flash-attn">
+                        <input id="set-inf-flash-attn" type="checkbox" aria-label="Enable Flash Attention" aria-describedby="hint-set-inf-flash-attn">
+                        <span>Enable Flash Attention acceleration</span>
+                      </label>
+                      <small id="hint-set-inf-flash-attn" class="field-hint">Records whether PS5LM/llama.cpp runs with Flash Attention enabled (<code>false</code> by default; updated via KV import).</small>
+                    </div>
+
+                    <div class="field">
+                      <span class="field-label text-sm text-secondary">Smart Tool Routing (<code>smart_tool_routing</code>)</span>
+                      <label class="checkbox-row" for="set-inf-smart-tool-routing">
+                        <input id="set-inf-smart-tool-routing" type="checkbox" checked aria-label="Enable Smart Tool Routing" aria-describedby="hint-set-inf-smart-tool-routing">
+                        <span>Omit unused tool schemas on conversational turns</span>
+                      </label>
+                      <small id="hint-set-inf-smart-tool-routing" class="field-hint">Trims irrelevant tool schemas when no file, browser, memory, or MCP action is requested, speeding up prompt eval and token/s. Default: <code>true</code>.</small>
                     </div>
 
                     <div class="field">
@@ -1382,8 +1492,8 @@
 
                     <div class="field">
                       <label for="cfg-repeat-last-n">Repeat Last N (<code>repeat_last_n</code>)</label>
-                      <input id="cfg-repeat-last-n" type="number" min="-1" max="131072" step="1" class="input mono" value="64" aria-describedby="hint-cfg-repeat-last-n">
-                      <small id="hint-cfg-repeat-last-n" class="field-hint">Lookback window in tokens checked by <code>repeat_penalty</code>. Default: <code>64</code>; <code>0</code> disables, <code>-1</code> uses full context.</small>
+                      <input id="cfg-repeat-last-n" type="number" min="-1" max="131072" step="1" class="input mono" value="256" aria-describedby="hint-cfg-repeat-last-n">
+                      <small id="hint-cfg-repeat-last-n" class="field-hint">Lookback window in tokens checked by <code>repeat_penalty</code>. Default: <code>256</code>; <code>0</code> disables, <code>-1</code> uses full context.</small>
                     </div>
 
                     <div class="field">
@@ -1400,8 +1510,8 @@
 
                     <div class="field">
                       <label for="cfg-dry-multiplier">DRY Multiplier (<code>dry_multiplier</code>)</label>
-                      <input id="cfg-dry-multiplier" type="number" min="0" max="10" step="0.05" class="input mono" value="0" aria-describedby="hint-cfg-dry-multiplier">
-                      <small id="hint-cfg-dry-multiplier" class="field-hint">Don&apos;t Repeat Yourself (DRY) n-gram repetition penalty multiplier. Default: <code>0</code> (disabled); typical active value <code>0.8</code>.</small>
+                      <input id="cfg-dry-multiplier" type="number" min="0" max="10" step="0.05" class="input mono" value="0.8" aria-describedby="hint-cfg-dry-multiplier">
+                      <small id="hint-cfg-dry-multiplier" class="field-hint">Don&apos;t Repeat Yourself (DRY) n-gram repetition penalty multiplier. Default: <code>0.8</code>; set <code>0</code> to disable.</small>
                     </div>
 
                     <div class="field">

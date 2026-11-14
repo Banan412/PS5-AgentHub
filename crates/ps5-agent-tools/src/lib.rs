@@ -11,7 +11,7 @@ pub mod specs;
 pub mod utility;
 pub mod web;
 
-pub use browser::SandboxBrowserManager;
+pub use browser::{BrowserActivityContext, SandboxBrowserManager};
 pub use custom::{CustomToolDefinition, CustomToolManager};
 pub use files::WorkspaceEntryInfo;
 pub use mcp::{McpManager, McpServerConfig, McpServerView, McpToolInfo};
@@ -36,6 +36,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -334,6 +335,7 @@ pub struct ToolRegistry {
     custom: Arc<custom::CustomToolManager>,
     browser: Arc<browser::SandboxBrowserManager>,
     cached_specs: RwLock<Vec<ToolSpec>>,
+    catalog_revision: AtomicU64,
 }
 
 impl ToolRegistry {
@@ -353,7 +355,10 @@ impl ToolRegistry {
             data_dir,
             workspace_dir.as_deref(),
         ));
-        let mcp = Arc::new(mcp::McpManager::new(data_dir));
+        let mcp = Arc::new(mcp::McpManager::with_workspace_dir(
+            data_dir,
+            workspace_dir.as_deref(),
+        ));
         let plugins = Arc::new(plugins::PluginManager::new(
             data_dir,
             workspace_dir.as_deref(),
@@ -374,9 +379,18 @@ impl ToolRegistry {
             custom,
             browser,
             cached_specs: RwLock::new(Vec::new()),
+            catalog_revision: AtomicU64::new(0),
         };
         registry.seed_tools()?;
         Ok(registry)
+    }
+
+    pub fn catalog_revision(&self) -> u64 {
+        self.catalog_revision.load(Ordering::Acquire)
+    }
+
+    pub fn bump_catalog_revision(&self) -> u64 {
+        self.catalog_revision.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub fn skills(&self) -> &Arc<skills::SkillManager> {
@@ -397,6 +411,94 @@ impl ToolRegistry {
 
     pub fn browser_manager(&self) -> &Arc<browser::SandboxBrowserManager> {
         &self.browser
+    }
+
+    pub fn discover_mcp_servers(&self) -> Result<Vec<mcp::McpServerView>> {
+        let views = self.mcp.discover_all()?;
+        self.bump_catalog_revision();
+        Ok(views)
+    }
+
+    pub fn add_or_import_mcp_servers(&self, raw_json: &str) -> Result<Vec<mcp::McpServerView>> {
+        let views = self.mcp.add_or_import(raw_json)?;
+        self.bump_catalog_revision();
+        Ok(views)
+    }
+
+    pub fn add_or_update_mcp_server(
+        &self,
+        id: &str,
+        cfg: mcp::McpServerConfig,
+    ) -> Result<mcp::McpServerView> {
+        let view = self.mcp.add_or_update_server(id, cfg)?;
+        self.bump_catalog_revision();
+        Ok(view)
+    }
+
+    pub async fn sync_mcp_server(&self, id: &str) -> Result<mcp::McpServerView> {
+        let client = self.http_client()?;
+        let cfg = self.config();
+        let view = self.mcp.sync_server(&client, id, &cfg).await?;
+        self.bump_catalog_revision();
+        Ok(view)
+    }
+
+    pub fn set_mcp_server_enabled(&self, id: &str, enabled: bool) -> Result<mcp::McpServerView> {
+        let view = self.mcp.set_enabled(id, enabled)?;
+        self.bump_catalog_revision();
+        Ok(view)
+    }
+
+    pub fn remove_mcp_server(&self, id: &str) -> Result<()> {
+        self.mcp.remove_server(id)?;
+        self.bump_catalog_revision();
+        Ok(())
+    }
+
+    pub fn reload_plugins(&self) -> Result<()> {
+        self.plugins.reload()?;
+        self.bump_catalog_revision();
+        Ok(())
+    }
+
+    pub fn import_plugin_json(&self, manifest_json: &str) -> Result<plugins::PluginView> {
+        let view = self.plugins.import_plugin_json(manifest_json)?;
+        self.bump_catalog_revision();
+        Ok(view)
+    }
+
+    pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<plugins::PluginView> {
+        let view = self.plugins.set_enabled(id, enabled)?;
+        self.bump_catalog_revision();
+        Ok(view)
+    }
+
+    pub fn delete_plugin(&self, id: &str) -> Result<()> {
+        self.plugins.delete_plugin(id)?;
+        self.bump_catalog_revision();
+        Ok(())
+    }
+
+    pub fn import_skill(
+        &self,
+        slug: Option<&str>,
+        markdown_content: &str,
+    ) -> Result<skills::SkillSummary> {
+        let summary = self.skills.import_skill(slug, markdown_content)?;
+        self.bump_catalog_revision();
+        Ok(summary)
+    }
+
+    pub fn set_skill_enabled(&self, id: &str, enabled: bool) -> Result<skills::SkillSummary> {
+        let summary = self.skills.set_enabled(id, enabled)?;
+        self.bump_catalog_revision();
+        Ok(summary)
+    }
+
+    pub fn delete_skill(&self, id: &str) -> Result<()> {
+        self.skills.delete_skill(id)?;
+        self.bump_catalog_revision();
+        Ok(())
     }
 
     pub fn http_client(&self) -> Result<reqwest::Client> {
@@ -460,6 +562,7 @@ impl ToolRegistry {
                 .map_err(|_| AgentError::Internal("tools spec cache lock poisoned".into()))?;
             *cache = seeded;
         }
+        self.bump_catalog_revision();
         log_info("tools", format!("seeded {builtin_count} built-in tool specs"));
         Ok(())
     }
@@ -490,11 +593,14 @@ impl ToolRegistry {
 
         let mut specs_list: Vec<ToolSpec> = existing.into_values().collect();
         specs_list.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut cache = self
-            .cached_specs
-            .write()
-            .map_err(|_| AgentError::Internal("tools spec cache lock poisoned".into()))?;
-        *cache = specs_list;
+        {
+            let mut cache = self
+                .cached_specs
+                .write()
+                .map_err(|_| AgentError::Internal("tools spec cache lock poisoned".into()))?;
+            *cache = specs_list;
+        }
+        self.bump_catalog_revision();
         Ok(())
     }
 
@@ -578,6 +684,7 @@ impl ToolRegistry {
             spec.clone()
         };
         self.storage.upsert_tool_spec(&updated)?;
+        self.bump_catalog_revision();
         Ok(updated)
     }
 
@@ -606,21 +713,28 @@ impl ToolRegistry {
             cache.len() != before
         };
 
-        Ok(deleted_file || deleted_storage || deleted_cache)
+        let changed = deleted_file || deleted_storage || deleted_cache;
+        if changed {
+            self.bump_catalog_revision();
+        }
+        Ok(changed)
     }
 
     /// Upserts a `ToolSpec` into `StorageBackend` and updates the in-memory spec cache.
     pub fn upsert_tool_spec(&self, spec: &ToolSpec) -> Result<()> {
         self.storage.upsert_tool_spec(spec)?;
-        let mut cache = self
-            .cached_specs
-            .write()
-            .map_err(|_| AgentError::Internal("tools spec cache lock poisoned".into()))?;
-        if let Some(existing) = cache.iter_mut().find(|s| s.id == spec.id) {
-            *existing = spec.clone();
-        } else {
-            cache.push(spec.clone());
+        {
+            let mut cache = self
+                .cached_specs
+                .write()
+                .map_err(|_| AgentError::Internal("tools spec cache lock poisoned".into()))?;
+            if let Some(existing) = cache.iter_mut().find(|s| s.id == spec.id) {
+                *existing = spec.clone();
+            } else {
+                cache.push(spec.clone());
+            }
         }
+        self.bump_catalog_revision();
         Ok(())
     }
 
@@ -883,13 +997,13 @@ impl ToolRegistry {
         );
 
         let result: Result<Value> = if spec.timeout_secs == 0 {
-            self.dispatch_tool(&spec.id, &args, &cfg, &client, ctx)
+            self.dispatch_tool(tool_id, &args, &cfg, &client, ctx)
                 .await
         } else {
             let timeout_secs = spec.timeout_secs;
             match tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
-                self.dispatch_tool(&spec.id, &args, &cfg, &client, ctx),
+                self.dispatch_tool(tool_id, &args, &cfg, &client, ctx),
             )
             .await
             {
@@ -950,7 +1064,20 @@ impl ToolRegistry {
             }
             "web_search" => web::exec_web_search(args, cfg, client).await,
             "web_fetch" => web::exec_web_fetch(args, cfg, client).await,
-            "browser" => self.browser.execute(args, cfg, client).await,
+            "browser" => {
+                self.browser
+                    .execute_with_meta(
+                        args,
+                        cfg,
+                        client,
+                        Some(browser::BrowserActivityContext {
+                            conversation_id: ctx.conversation_id.clone(),
+                            task_id: ctx.task_id.clone(),
+                            agent_id: Some(ctx.agent_id.clone()),
+                        }),
+                    )
+                    .await
+            }
             // File & Code Search / Patch (blocking fs wrapped in spawn_blocking)
             "list_files" => {
                 run_blocking_fs("list_files", args.clone(), cfg.clone(), files::exec_list_files).await
@@ -1009,30 +1136,50 @@ impl ToolRegistry {
             }
             // Memory
             "memory_read" => {
-                let bridge = require_bridge(ctx, canonical)?;
-                let scope = args
-                    .get("scope")
+                let bridge = require_bridge(ctx, tool_id)?;
+                let target_agent_id = args
+                    .get("target_agent_id")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                let namespace = args
-                    .get("namespace")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let query = args
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let limit = args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(20)
-                    .clamp(1, 100) as usize;
-                bridge
-                    .memory_read(&ctx.agent_id, scope, namespace, query, limit)
-                    .await
+                if tool_id.trim() == "read_agent_memory" || target_agent_id.is_some() {
+                    let target = target_agent_id.ok_or_else(|| {
+                        AgentError::InvalidInput("missing 'target_agent_id'".into())
+                    })?;
+                    let query = args.get("query").and_then(|v| v.as_str());
+                    let limit = args
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(10)
+                        .clamp(1, 100) as usize;
+                    bridge
+                        .read_agent_memory(&ctx.agent_id, target, query, limit)
+                        .await
+                } else {
+                    let scope = args
+                        .get("scope")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let namespace = args
+                        .get("namespace")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let query = args
+                        .get("query")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let limit = args
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(20)
+                        .clamp(1, 100) as usize;
+                    bridge
+                        .memory_read(&ctx.agent_id, scope, namespace, query, limit)
+                        .await
+                }
             }
             "memory_write" => {
                 let bridge = require_bridge(ctx, canonical)?;
@@ -1234,10 +1381,12 @@ impl ToolRegistry {
                 let recipient = args
                     .get("recipient_agent_id")
                     .or_else(|| args.get("to_agent_id"))
+                    .or_else(|| args.get("agent_id"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| AgentError::InvalidInput("missing 'recipient_agent_id'".into()))?;
                 let content = args
                     .get("content")
+                    .or_else(|| args.get("message"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| AgentError::InvalidInput("missing 'content'".into()))?;
                 bridge
@@ -1254,6 +1403,8 @@ impl ToolRegistry {
                 let user_request = args
                     .get("user_request")
                     .or_else(|| args.get("request"))
+                    .or_else(|| args.get("task"))
+                    .or_else(|| args.get("prompt"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| AgentError::InvalidInput("missing 'user_request'".into()))?;
                 bridge
@@ -1274,22 +1425,6 @@ impl ToolRegistry {
                     .query_agent_status(&ctx.agent_id, target, task_id)
                     .await
             }
-            "read_agent_memory" => {
-                let bridge = require_bridge(ctx, tool_id)?;
-                let target = args
-                    .get("target_agent_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| AgentError::InvalidInput("missing 'target_agent_id'".into()))?;
-                let query = args.get("query").and_then(|v| v.as_str());
-                let limit = args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10)
-                    .clamp(1, 100) as usize;
-                bridge
-                    .read_agent_memory(&ctx.agent_id, target, query, limit)
-                    .await
-            }
             "request_temporary_specialist" => {
                 let bridge = require_bridge(ctx, tool_id)?;
                 let name = args
@@ -1298,7 +1433,11 @@ impl ToolRegistry {
                     .ok_or_else(|| AgentError::InvalidInput("missing 'name'".into()))?;
                 let role_label = args
                     .get("role_label")
+                    .or_else(|| args.get("description"))
                     .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| (tool_id.trim() == "spawn_temp_agent").then_some("Temporary specialist"))
                     .ok_or_else(|| AgentError::InvalidInput("missing 'role_label'".into()))?;
                 let system_prompt = args
                     .get("system_prompt")
@@ -1313,7 +1452,10 @@ impl ToolRegistry {
                             .collect()
                     })
                     .unwrap_or_default();
-                let task_request = args.get("task_request").and_then(|v| v.as_str());
+                let task_request = args
+                    .get("task_request")
+                    .or_else(|| args.get("task"))
+                    .and_then(|v| v.as_str());
                 bridge
                     .request_temporary_specialist(
                         &ctx.agent_id,
@@ -1903,7 +2045,7 @@ mod tests {
         DeliveryStatus, MemoryItem, MemoryPermissions, MemoryScope, SessionRecord,
         TaskCountsSummary, TaskEvent, TaskRecord,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     #[derive(Default)]

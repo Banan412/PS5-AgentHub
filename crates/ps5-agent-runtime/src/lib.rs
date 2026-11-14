@@ -416,6 +416,8 @@ mod tests {
         recorded_agents: Mutex<Vec<String>>,
         recorded_requests: Mutex<Vec<InferenceRequest>>,
         prefill_calls: AtomicUsize,
+        prefill_requests: Mutex<Vec<InferenceRequest>>,
+        total_slots: Mutex<Option<u32>>,
     }
 
     impl ScriptedInferenceProvider {
@@ -425,7 +427,17 @@ mod tests {
                 recorded_agents: Mutex::new(Vec::new()),
                 recorded_requests: Mutex::new(Vec::new()),
                 prefill_calls: AtomicUsize::new(0),
+                prefill_requests: Mutex::new(Vec::new()),
+                total_slots: Mutex::new(None),
             }
+        }
+
+        fn set_total_slots(&self, slots: Option<u32>) {
+            *self.total_slots.lock().unwrap() = slots;
+        }
+
+        fn prefill_requests(&self) -> Vec<InferenceRequest> {
+            self.prefill_requests.lock().unwrap().clone()
         }
 
         fn push_fn<F>(&self, f: F)
@@ -445,6 +457,7 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 usage: TokenUsage::default(),
                 latency_ms: 5,
+                timings: None,
             });
         }
 
@@ -457,6 +470,7 @@ mod tests {
                 finish_reason: Some("tool_calls".into()),
                 usage: TokenUsage::default(),
                 latency_ms: 5,
+                timings: None,
             });
         }
 
@@ -512,6 +526,13 @@ mod tests {
             Ok(resp)
         }
 
+        async fn discover_capabilities(&self) -> Result<Option<Ps5LmCapabilities>> {
+            Ok(self.total_slots.lock().unwrap().map(|slots| Ps5LmCapabilities {
+                total_slots: Some(slots),
+                ..Default::default()
+            }))
+        }
+
         async fn prefill_kv_cache(
             &self,
             _messages: Vec<InferenceMessage>,
@@ -519,6 +540,16 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<()> {
             self.prefill_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn prefill_kv_cache_request(
+            &self,
+            req: InferenceRequest,
+            _cancel: CancellationToken,
+        ) -> Result<()> {
+            self.prefill_calls.fetch_add(1, Ordering::SeqCst);
+            self.prefill_requests.lock().unwrap().push(req);
             Ok(())
         }
 
@@ -540,6 +571,9 @@ mod tests {
         specs: Vec<ToolSpec>,
         executed_count: AtomicUsize,
         deleted_files: Mutex<Vec<String>>,
+        ext_skills: Mutex<Vec<(String, String)>>,
+        ext_plugins: Mutex<Vec<(String, String)>>,
+        executed_contexts: Mutex<Vec<(Option<String>, Option<String>, String, String)>>,
     }
 
     impl MockToolExecutor {
@@ -570,6 +604,9 @@ mod tests {
                 ],
                 executed_count: AtomicUsize::new(0),
                 deleted_files: Mutex::new(Vec::new()),
+                ext_skills: Mutex::new(Vec::new()),
+                ext_plugins: Mutex::new(Vec::new()),
+                executed_contexts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -582,6 +619,35 @@ mod tests {
 
         async fn get_tool(&self, tool_id: &str) -> Option<ToolSpec> {
             self.specs.iter().find(|s| s.id == tool_id).cloned()
+        }
+
+        async fn execute_tool_with_context(
+            &self,
+            agent: &AgentDefinition,
+            task_id: Option<&str>,
+            conversation_id: Option<&str>,
+            tool_id: &str,
+            arguments: serde_json::Value,
+            approved_bypass: bool,
+            _sandbox_mode: SandboxMode,
+            _approval_policy: SandboxApprovalPolicy,
+            cancel: CancellationToken,
+        ) -> Result<ToolExecutionOutput> {
+            self.executed_contexts.lock().unwrap().push((
+                conversation_id.map(str::to_string),
+                task_id.map(str::to_string),
+                agent.id.clone(),
+                tool_id.to_string(),
+            ));
+            self.execute_tool(agent, task_id, tool_id, arguments, approved_bypass, cancel)
+                .await
+        }
+
+        fn extension_prompt_context(&self) -> (Vec<(String, String)>, Vec<(String, String)>) {
+            (
+                self.ext_skills.lock().unwrap().clone(),
+                self.ext_plugins.lock().unwrap().clone(),
+            )
         }
 
         async fn execute_tool(
@@ -1277,6 +1343,7 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 usage: TokenUsage::default(),
                 latency_ms: 4,
+                timings: None,
             }
         });
 
@@ -1356,6 +1423,7 @@ mod tests {
                 finish_reason: Some("length".into()),
                 usage: TokenUsage::default(),
                 latency_ms: 4,
+                timings: None,
             }
         });
         let long_html = (0..22)
@@ -1535,6 +1603,7 @@ mod tests {
             finish_reason: Some("stop".into()),
             usage: TokenUsage::default(),
             latency_ms: 5,
+            timings: None,
         });
         inf.push_text("Off level answer.");
 
@@ -1762,6 +1831,7 @@ mod tests {
                         finish_reason: Some("stop".into()),
                         usage: TokenUsage::default(),
                         latency_ms: 5,
+                        timings: None,
                     });
                 }
                 Ok(InferenceResponse {
@@ -1772,6 +1842,7 @@ mod tests {
                     finish_reason: Some("stop".into()),
                     usage: TokenUsage::default(),
                     latency_ms: 2,
+                    timings: None,
                 })
             }
 
@@ -2160,6 +2231,7 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 usage: TokenUsage::default(),
                 latency_ms: 5,
+                timings: None,
             }
         });
 
@@ -3109,6 +3181,7 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 usage: TokenUsage::default(),
                 latency_ms: 5,
+                timings: None,
             }
         });
 
@@ -3159,5 +3232,515 @@ mod tests {
 
         let doctor = rt.run_doctor_checks(&[]).await.unwrap();
         assert_eq!(doctor.checks.len(), 12);
+    }
+
+    #[test]
+    fn kv_prompt_prefix_is_static_sorted_anti_loop_and_language_tail_skips_json() {
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        let tools = Arc::new(MockToolExecutor::default_suite());
+        *tools.ext_skills.lock().unwrap() = vec![
+            ("zeta-skill".into(), "Zeta skill desc".into()),
+            ("alpha-skill".into(), "Alpha skill desc".into()),
+        ];
+        *tools.ext_plugins.lock().unwrap() = vec![
+            ("plug-z".into(), "Rule Z".into()),
+            ("plug-a".into(), "Rule A".into()),
+        ];
+        let (_storage, rt) = setup_runtime(inf, tools, None);
+        let agent = rt.agent_manager().get_agent("commander").unwrap().unwrap();
+
+        let p_en = rt
+            .build_system_prompt(&agent, "Memory alpha", true, Some("Hello, how are you?"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let p_pl = rt
+            .build_system_prompt(
+                &agent,
+                "Memory beta",
+                true,
+                Some("Proszę sprawdzić logi systemu"),
+            )
+            .unwrap();
+        let p_json = rt
+            .build_system_prompt(
+                &agent,
+                "Memory gamma",
+                true,
+                Some("{\"selected_agents\": [\"researcher\"]}"),
+            )
+            .unwrap();
+
+        assert!(!p_en.contains("Current UTC time:"));
+        assert!(p_en.contains("Got it, Commander!"));
+        assert!(p_en.contains("NEVER repeat your own sentences or paragraphs verbatim"));
+
+        let idx_alpha = p_en.find("- alpha-skill:").unwrap();
+        let idx_zeta = p_en.find("- zeta-skill:").unwrap();
+        assert!(idx_alpha < idx_zeta, "skills must be sorted deterministically");
+
+        let idx_pa = p_en.find("- [plug-a] Rule A").unwrap();
+        let idx_pz = p_en.find("- [plug-z] Rule Z").unwrap();
+        assert!(
+            idx_pa < idx_pz,
+            "plugin rules must be sorted deterministically"
+        );
+
+        let static_end_en = p_en.find("\n\nMemory alpha").unwrap();
+        let static_end_pl = p_pl.find("\n\nMemory beta").unwrap();
+        assert_eq!(
+            &p_en[..static_end_en],
+            &p_pl[..static_end_pl],
+            "static prefix must remain byte-for-byte identical across turns"
+        );
+
+        let lang_pos_en = p_en.find("Language Requirement:").unwrap();
+        assert!(lang_pos_en > static_end_en);
+        assert!(p_en[lang_pos_en..].contains("Respond strictly in English."));
+
+        let lang_pos_pl = p_pl.find("Language Requirement:").unwrap();
+        assert!(lang_pos_pl > static_end_pl);
+        assert!(p_pl[lang_pos_pl..].contains("Respond strictly in Polish."));
+
+        assert!(
+            !p_json.contains("Language Requirement:"),
+            "JSON/coordinator structured prompts must skip prose language directives"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_agent_history_omits_name_while_group_peers_keep_attribution() {
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        inf.push_text("Direct reply without name");
+        inf.push_text("Group reply");
+
+        let tools = Arc::new(MockToolExecutor::default_suite());
+        let (storage, rt) = setup_runtime(inf.clone(), tools, None);
+
+        create_conv(
+            &storage,
+            "conv-direct-name",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+        storage
+            .append_chat_message(&ChatMessage {
+                id: new_id(),
+                conversation_id: "conv-direct-name".into(),
+                role: ChatRole::User,
+                agent_id: Some("commander".into()),
+                content: "First question".into(),
+                reasoning: None,
+                tool_calls_json: None,
+                task_id: None,
+                token_count: 2,
+                latency_ms: None,
+                timings: None,
+                archived: false,
+                created_at: now_iso(),
+                attachments: Vec::new(),
+            })
+            .unwrap();
+        storage
+            .append_chat_message(&ChatMessage {
+                id: new_id(),
+                conversation_id: "conv-direct-name".into(),
+                role: ChatRole::Assistant,
+                agent_id: Some("commander".into()),
+                content: "First reply".into(),
+                reasoning: None,
+                tool_calls_json: None,
+                task_id: None,
+                token_count: 2,
+                latency_ms: Some(1),
+                timings: None,
+                archived: false,
+                created_at: now_iso(),
+                attachments: Vec::new(),
+            })
+            .unwrap();
+
+        rt.chat_with_agent_with_options(
+            "conv-direct-name",
+            "commander",
+            "Follow up",
+            None,
+            vec![],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        create_conv(
+            &storage,
+            "conv-group-name",
+            ConversationMode::Group {
+                participant_agent_ids: vec!["commander".into(), "researcher".into()],
+            },
+        );
+        storage
+            .append_chat_message(&ChatMessage {
+                id: new_id(),
+                conversation_id: "conv-group-name".into(),
+                role: ChatRole::Assistant,
+                agent_id: Some("researcher".into()),
+                content: "Peer note".into(),
+                reasoning: None,
+                tool_calls_json: None,
+                task_id: None,
+                token_count: 2,
+                latency_ms: Some(1),
+                timings: None,
+                archived: false,
+                created_at: now_iso(),
+                attachments: Vec::new(),
+            })
+            .unwrap();
+
+        rt.chat_with_agent_with_options(
+            "conv-group-name",
+            "commander",
+            "Summarize",
+            None,
+            vec![],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let reqs = inf.recorded_requests();
+        assert_eq!(reqs.len(), 2);
+        for m in &reqs[0].messages {
+            if m.role == "user" || m.role == "assistant" {
+                assert_eq!(
+                    m.name, None,
+                    "single-agent user/assistant messages must omit name, got {:?}",
+                    m.name
+                );
+            }
+        }
+        assert!(reqs[1]
+            .messages
+            .iter()
+            .any(|m| m.role == "assistant" && m.name.as_deref() == Some("researcher")));
+        assert!(reqs[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .all(|m| m.name.is_none()));
+    }
+
+    #[tokio::test]
+    async fn schema_cache_deduplicates_canonical_orchestration_and_smart_routing_is_conservative() {
+        let mut suite = MockToolExecutor::default_suite();
+        let make = |id: &str, cat: &str| ToolSpec {
+            id: id.into(),
+            name: id.into(),
+            category: cat.into(),
+            description: format!("tool {id}"),
+            input_schema: serde_json::json!({ "type": "object" }),
+            output_schema: serde_json::json!({ "type": "object" }),
+            required_permissions: vec![],
+            requires_approval: false,
+            is_mutating: false,
+            enabled: true,
+            timeout_secs: 10,
+        };
+        for (id, cat) in [
+            ("assign_agent_task", "agent"),
+            ("send_agent_message", "agent"),
+            ("request_temporary_specialist", "agent"),
+            ("mcp:fs:stat", "mcp"),
+            ("plugin:ext:hello", "plugin"),
+            ("custom:my_helper", "custom"),
+            ("load_skill", "skill"),
+            ("memory_read", "memory"),
+            ("web_fetch", "web"),
+            ("browser", "web"),
+            ("read_file", "files"),
+            ("write_file", "files"),
+            ("sandbox_exec", "exec"),
+        ] {
+            suite.specs.push(make(id, cat));
+        }
+
+        let tools = Arc::new(suite);
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        inf.push_text("Hej!");
+        inf.push_text("I can assist with tasks.");
+        inf.push_text("Checking Cargo.toml and MCP.");
+
+        let (storage, rt) = setup_runtime(inf.clone(), tools, None);
+        let commander = rt.agent_manager().get_agent("commander").unwrap().unwrap();
+
+        let schemas = rt.allowed_tool_schemas(&commander).await;
+        let assign_count = schemas
+            .iter()
+            .filter(|s| s.name == "assign_agent_task")
+            .count();
+        let send_count = schemas
+            .iter()
+            .filter(|s| s.name == "send_agent_message")
+            .count();
+        let temp_count = schemas
+            .iter()
+            .filter(|s| s.name == "request_temporary_specialist")
+            .count();
+        assert_eq!(assign_count, 1);
+        assert_eq!(send_count, 1);
+        assert_eq!(temp_count, 1);
+        assert!(!schemas.iter().any(|s| s.name == "delegate_task"
+            || s.name == "agent_message"
+            || s.name == "spawn_temp_agent"));
+
+        // Second lookup hits cache seamlessly
+        let schemas_cached = rt.allowed_tool_schemas(&commander).await;
+        assert_eq!(schemas.len(), schemas_cached.len());
+
+        // Casual greeting negative guards
+        assert!(runtime::is_casual_greeting_or_ping("hallo"));
+        assert!(runtime::is_casual_greeting_or_ping("cześć"));
+        assert!(runtime::is_casual_greeting_or_ping("hej commander"));
+        for blocked in [
+            "hello mcp",
+            "cześć plugin",
+            "hej skill",
+            "open browser",
+            "click button",
+            "fetch url",
+            "memory check",
+            "bash test",
+            "shell ping",
+            "patch file",
+            "curl test",
+        ] {
+            assert!(
+                !runtime::is_casual_greeting_or_ping(blocked),
+                "'{blocked}' must NOT take casual greeting shortcut"
+            );
+        }
+
+        // Pure greeting -> slimmed to 0 tools on iter 0
+        create_conv(
+            &storage,
+            "conv-slim-greeting",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+        rt.chat_with_agent_with_options(
+            "conv-slim-greeting",
+            "commander",
+            "cześć",
+            None,
+            vec![],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // General casual QA -> preserves extensions & memory/datetime, drops heavy tools
+        create_conv(
+            &storage,
+            "conv-slim-qa",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+        rt.chat_with_agent_with_options(
+            "conv-slim-qa",
+            "commander",
+            "Who invented telescopes?",
+            None,
+            vec![],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // Action/file/MCP prompt -> retains ALL schemas
+        create_conv(
+            &storage,
+            "conv-full-tools",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+        rt.chat_with_agent_with_options(
+            "conv-full-tools",
+            "commander",
+            "Check status via mcp and read Cargo.toml",
+            None,
+            vec![],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let reqs = inf.recorded_requests();
+        assert_eq!(reqs.len(), 3);
+        assert!(
+            reqs[0].tools.is_empty(),
+            "pure greeting must slim to 0 schemas"
+        );
+        let qa_names: Vec<&str> = reqs[1].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(qa_names.contains(&"mcp:fs:stat"));
+        assert!(qa_names.contains(&"plugin:ext:hello"));
+        assert!(qa_names.contains(&"custom:my_helper"));
+        assert!(qa_names.contains(&"load_skill"));
+        assert!(qa_names.contains(&"memory_read"));
+        assert!(!qa_names.contains(&"write_file"));
+        assert_eq!(
+            reqs[2].tools.len(),
+            schemas.len(),
+            "tool-cued turn must preserve full schema set"
+        );
+    }
+
+    #[tokio::test]
+    async fn fnv1a_slot_id_prefill_with_tools_timings_and_web_browser_activity() {
+        let mut suite = MockToolExecutor::default_suite();
+        suite.specs.push(ToolSpec {
+            id: "web_fetch".into(),
+            name: "web_fetch".into(),
+            category: "web".into(),
+            description: "fetch".into(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            output_schema: serde_json::json!({ "type": "object" }),
+            required_permissions: vec![],
+            requires_approval: false,
+            is_mutating: false,
+            enabled: true,
+            timeout_secs: 10,
+        });
+        let tools = Arc::new(suite);
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        inf.set_total_slots(Some(4));
+
+        let expected_timings = InferenceTimings {
+            predicted_per_second: Some(125.5),
+            prompt_per_second: Some(820.0),
+            predicted_ms: Some(160.0),
+            prompt_ms: Some(30.0),
+            predicted_n: Some(20),
+            prompt_n: Some(40),
+            cache_n: Some(256),
+        };
+        let timings_copy = expected_timings.clone();
+        inf.push_tool_calls(vec![
+            ToolCallRequest {
+                id: "tc-ws".into(),
+                name: "web_search".into(),
+                arguments: serde_json::json!({ "query": "rust kv cache" }),
+            },
+            ToolCallRequest {
+                id: "tc-wf".into(),
+                name: "web_fetch".into(),
+                arguments: serde_json::json!({
+                    "url": "https://user:secret@example.com/docs?token=abc#frag"
+                }),
+            },
+        ]);
+        inf.push_fn(move |_| InferenceResponse {
+            content: "Web results summarized.".into(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model: "mock-ps5lm".into(),
+            finish_reason: Some("stop".into()),
+            usage: TokenUsage::default(),
+            latency_ms: 12,
+            timings: Some(timings_copy.clone()),
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.inference.id_slot = -1;
+        cfg.inference.prefill_kv_cache = true;
+        let (storage, rt) = setup_runtime(inf.clone(), tools.clone(), Some(cfg));
+        let mut rx = rt.events();
+
+        create_conv(
+            &storage,
+            "conv-fnv1a",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+        let res = rt
+            .chat_with_agent_with_options(
+                "conv-fnv1a",
+                "commander",
+                "Search and fetch example docs",
+                None,
+                vec![],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status, TaskStatus::Completed);
+
+        let expected_slot = runtime::resolve_conversation_slot_id(-1, 4, Some("conv-fnv1a"));
+        assert!(expected_slot.is_some_and(|s| (0..4).contains(&s)));
+        let reqs = inf.recorded_requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].slot_id, expected_slot);
+        assert_eq!(reqs[1].slot_id, expected_slot);
+
+        // Wait briefly for spawned KV prefill_kv_cache_request
+        for _ in 0..50 {
+            if !inf.prefill_requests().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let prefills = inf.prefill_requests();
+        assert_eq!(prefills.len(), 1);
+        assert_eq!(prefills[0].slot_id, expected_slot);
+        assert!(
+            !prefills[0].tools.is_empty(),
+            "prefill_kv_cache_request must carry real cached tool schemas"
+        );
+
+        let msgs = storage.list_chat_messages("conv-fnv1a", false, 10).unwrap();
+        let asst = msgs.iter().find(|m| m.role == ChatRole::Assistant).unwrap();
+        assert_eq!(asst.timings.as_ref(), Some(&expected_timings));
+
+        let ctxs = tools.executed_contexts.lock().unwrap();
+        assert_eq!(ctxs.len(), 2);
+        assert_eq!(ctxs[0].0.as_deref(), Some("conv-fnv1a"));
+        assert_eq!(ctxs[0].1.as_deref(), Some(res.task_id.as_str()));
+        assert_eq!(ctxs[0].2, "commander");
+
+        let mut saw_completed_timings = false;
+        let mut browser_activities = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::ChatCompleted { timings, .. } => {
+                    if timings.as_ref() == Some(&expected_timings) {
+                        saw_completed_timings = true;
+                    }
+                }
+                StreamEvent::BrowserActivity {
+                    conversation_id,
+                    task_id,
+                    agent_id,
+                    action,
+                    url,
+                    status,
+                    ..
+                } => {
+                    browser_activities.push((conversation_id, task_id, agent_id, action, url, status));
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_completed_timings, "ChatCompleted must carry InferenceTimings");
+        assert_eq!(browser_activities.len(), 4);
+        assert!(browser_activities.iter().any(|a| {
+            a.0.as_deref() == Some("conv-fnv1a")
+                && a.2.as_deref() == Some("commander")
+                && a.3 == "fetch"
+                && a.4.as_deref() == Some("https://example.com/docs")
+                && a.5 == "completed"
+        }));
     }
 }

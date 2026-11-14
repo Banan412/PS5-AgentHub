@@ -1,5 +1,5 @@
 use futures_util::future::join_all;
-use mock_ps5lm::{start_ephemeral, MockMode, ScriptedResponse, ScriptedToolCall};
+use mock_ps5lm::{start_ephemeral, MockMode, MockTimings, ScriptedResponse, ScriptedToolCall};
 use ps5_agent_config::InferenceConfig;
 use ps5_agent_core::{
     AgentError, ApiMode, InferenceMessage, InferenceProvider, InferenceRequest,
@@ -51,6 +51,7 @@ fn simple_request(mode: ApiMode, stream: bool) -> InferenceRequest {
         context_limit: 4096,
         stream,
         thinking_level: ThinkingLevel::Medium,
+        slot_id: None,
     }
 }
 
@@ -469,4 +470,96 @@ async fn semaphore_bounds_concurrent_inference_and_updates_dynamically() {
     });
     let results3 = join_all(futs3).await;
     assert!(results3.iter().all(|r| r.is_ok()));
+}
+
+#[tokio::test]
+async fn timings_and_kv_sampling_import_work_over_mock_ps5lm() {
+    let mock = start_ephemeral().await.unwrap();
+    mock.set_kv_cache(Some("q4_0".into()), Some("q8_0".into()), Some(true));
+    mock.set_mock_timings(MockTimings {
+        predicted_per_second: 121.5,
+        prompt_per_second: 510.0,
+        predicted_ms: 82.3,
+        prompt_ms: 19.6,
+        predicted_n: 10,
+        prompt_n: 10,
+        cache_n: Some(64),
+    });
+
+    let mut cfg = base_config(mock.base_url());
+    cfg.repeat_penalty = 1.0;
+    let provider = Ps5LmProvider::new(cfg).unwrap();
+
+    let imported = provider.import_kv_and_sampling().await.unwrap();
+    assert_eq!(imported.n_ctx, Some(16384));
+    assert_eq!(imported.total_slots, Some(4));
+    assert_eq!(imported.cache_type_k.as_deref(), Some("q4_0"));
+    assert_eq!(imported.cache_type_v.as_deref(), Some("q8_0"));
+    assert_eq!(imported.flash_attn, Some(true));
+    assert!(imported.samplers.as_ref().is_some_and(|s| !s.is_empty()));
+    let imported_json = serde_json::to_string(&imported).unwrap();
+    assert!(!imported_json.contains("test-key"));
+
+    let mut non_stream_req = simple_request(ApiMode::ChatCompletions, false);
+    non_stream_req.slot_id = Some(2);
+    let non_stream_resp = provider
+        .generate(non_stream_req, CancellationToken::new())
+        .await
+        .unwrap();
+    let t1 = non_stream_resp.timings.expect("non-stream timings");
+    assert_eq!(t1.predicted_per_second, Some(121.5));
+    assert_eq!(t1.cache_n, Some(64));
+
+    let mut stream_req = simple_request(ApiMode::ChatCompletions, true);
+    stream_req.slot_id = Some(2);
+    let (tx, mut rx) = mpsc::channel(32);
+    let stream_resp = provider
+        .generate_stream(stream_req, tx, CancellationToken::new())
+        .await
+        .unwrap();
+    while rx.recv().await.is_some() {}
+    let t2 = stream_resp.timings.expect("streaming timings");
+    assert_eq!(t2.predicted_per_second, Some(121.5));
+    assert_eq!(t2.cache_n, Some(64));
+
+    let recorded = mock.recorded_requests();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].body["id_slot"], 2);
+    assert!(recorded[0].body.get("stream_options").is_none());
+    assert!(recorded[0].body.get("repeat_penalty").is_none());
+    assert!(recorded[0].body.get("presence_penalty").is_none());
+    assert!(recorded[0].body.get("frequency_penalty").is_none());
+    assert_eq!(recorded[1].body["id_slot"], 2);
+    assert_eq!(recorded[1].body["stream_options"], json!({"include_usage": true}));
+}
+
+#[tokio::test]
+async fn prefill_kv_cache_request_forwards_tools_thinking_and_slot_id() {
+    let mock = start_ephemeral().await.unwrap();
+    let mut cfg = base_config(mock.base_url());
+    cfg.prefill_kv_cache = true;
+    let provider = Ps5LmProvider::new(cfg).unwrap();
+
+    let mut req = simple_request(ApiMode::ChatCompletions, true);
+    req.slot_id = Some(1);
+    req.thinking_level = ThinkingLevel::High;
+    req.messages.push(msg("assistant", "Prior partial assistant turn"));
+
+    provider
+        .prefill_kv_cache_request(req, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let prefills = mock.recorded_prefill_requests();
+    assert_eq!(prefills.len(), 1);
+    let body = &prefills[0].body;
+    assert_eq!(body["n_predict"], 0);
+    assert_eq!(body["stream"], false);
+    assert_eq!(body["id_slot"], 1);
+    assert!(body.get("stream_options").is_none());
+    assert!(body["tools"].as_array().is_some_and(|t| t.len() == 1));
+    assert_eq!(body["reasoning_effort"], "high");
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(msgs[2]["role"], "assistant");
 }

@@ -74,7 +74,7 @@ pub struct InferenceConfig {
     pub presence_penalty: f32,
     #[serde(default)]
     pub frequency_penalty: f32,
-    #[serde(default)]
+    #[serde(default = "default_dry_multiplier")]
     pub dry_multiplier: f32,
     #[serde(default = "default_dry_base")]
     pub dry_base: f32,
@@ -108,6 +108,14 @@ pub struct InferenceConfig {
     pub timings_per_token: bool,
     #[serde(default, alias = "extra_request_body_json")]
     pub custom_extra_body_json: String,
+    #[serde(default = "default_true")]
+    pub smart_tool_routing: bool,
+    #[serde(default)]
+    pub cache_type_k: String,
+    #[serde(default)]
+    pub cache_type_v: String,
+    #[serde(default)]
+    pub flash_attn: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,14 +392,61 @@ pub fn default_data_dir() -> PathBuf {
     }
 }
 
-/// Checks whether a candidate data directory can be written; on PS5 falls back
-/// from `/data/ps5-agent` to `/download0/ps5-agent` if `/data` is blocked by HEN.
+#[cfg(any(target_vendor = "sie", test))]
+const DATA_MOUNT_RETRY_ATTEMPTS: u32 = 12;
+
+#[cfg(any(target_vendor = "sie", test))]
+fn retry_writable_probe<F>(attempts: u32, delay: std::time::Duration, mut probe: F) -> Option<u32>
+where
+    F: FnMut() -> bool,
+{
+    for attempt in 2..=attempts {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        if probe() {
+            return Some(attempt);
+        }
+    }
+    None
+}
+
+/// Checks whether a candidate data directory can be written; on PS5 retries
+/// `/data/ps5-agent` for cold-boot `pldmgr` mount readiness before falling back
+/// from `/data/ps5-agent` to `/download0/ps5-agent` if `/data` is unavailable.
 pub fn resolve_writable_data_dir(preferred: &Path) -> PathBuf {
     if try_ensure_writable(preferred).is_ok() {
         return preferred.to_path_buf();
     }
     #[cfg(target_vendor = "sie")]
     {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        static DATA_RETRY_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+        const DATA_MOUNT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+        if preferred == Path::new("/data/ps5-agent")
+            && !DATA_RETRY_EXHAUSTED.load(Ordering::Relaxed)
+        {
+            if let Some(attempt) = retry_writable_probe(
+                DATA_MOUNT_RETRY_ATTEMPTS,
+                DATA_MOUNT_RETRY_DELAY,
+                || try_ensure_writable(preferred).is_ok(),
+            ) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[ps5-agent-config] /data/ps5-agent became writable on retry attempt {attempt}/{DATA_MOUNT_RETRY_ATTEMPTS}"
+                );
+                return preferred.to_path_buf();
+            }
+            DATA_RETRY_EXHAUSTED.store(true, Ordering::Relaxed);
+            let _ = writeln!(
+                std::io::stderr(),
+                "[ps5-agent-config] /data/ps5-agent remained unwritable after {DATA_MOUNT_RETRY_ATTEMPTS} attempts; falling back to /download0/ps5-agent"
+            );
+        }
         let fallback = PathBuf::from("/download0/ps5-agent");
         if try_ensure_writable(&fallback).is_ok() {
             return fallback;
@@ -453,7 +508,11 @@ fn default_repeat_penalty() -> f32 {
 }
 
 fn default_repeat_last_n() -> i32 {
-    64
+    256
+}
+
+fn default_dry_multiplier() -> f32 {
+    0.8
 }
 
 fn default_dry_base() -> f32 {
@@ -520,6 +579,13 @@ fn default_max_brain_context_chars() -> usize {
     4_000
 }
 
+fn is_valid_ggml_kv_cache_type(value: &str) -> bool {
+    matches!(
+        value,
+        "" | "f32" | "f16" | "bf16" | "q8_0" | "q4_0" | "q4_1" | "iq4_nl" | "q5_0" | "q5_1"
+    )
+}
+
 const KNOWN_BOOL_KEYS: &[&str] = &[
     "auth_enabled",
     "auth",
@@ -531,6 +597,8 @@ const KNOWN_BOOL_KEYS: &[&str] = &[
     "cache_prompt",
     "ignore_eos",
     "timings_per_token",
+    "smart_tool_routing",
+    "flash_attn",
     "require_approval_for_mutating",
     "allow_temporary_specialists",
     "block_private_lan_web_requests",
@@ -1098,7 +1166,7 @@ impl AppConfig {
                 repeat_last_n: default_repeat_last_n(),
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
-                dry_multiplier: 0.0,
+                dry_multiplier: default_dry_multiplier(),
                 dry_base: default_dry_base(),
                 dry_allowed_length: default_dry_allowed_length(),
                 dry_penalty_last_n: default_neg_one_i32(),
@@ -1115,6 +1183,10 @@ impl AppConfig {
                 reasoning_format: default_reasoning_format(),
                 timings_per_token: false,
                 custom_extra_body_json: String::new(),
+                smart_tool_routing: true,
+                cache_type_k: String::new(),
+                cache_type_v: String::new(),
+                flash_attn: false,
             },
             server: ServerConfig {
                 bind_host,
@@ -1362,7 +1434,7 @@ impl AppConfig {
             ("inference.repeat_penalty", &mut self.inference.repeat_penalty, default_repeat_penalty()),
             ("inference.presence_penalty", &mut self.inference.presence_penalty, 0.0),
             ("inference.frequency_penalty", &mut self.inference.frequency_penalty, 0.0),
-            ("inference.dry_multiplier", &mut self.inference.dry_multiplier, 0.0),
+            ("inference.dry_multiplier", &mut self.inference.dry_multiplier, default_dry_multiplier()),
             ("inference.dry_base", &mut self.inference.dry_base, default_dry_base()),
             ("inference.mirostat_tau", &mut self.inference.mirostat_tau, default_mirostat_tau()),
             ("inference.mirostat_eta", &mut self.inference.mirostat_eta, default_mirostat_eta()),
@@ -1381,12 +1453,51 @@ impl AppConfig {
             self.inference.temperature = 0.0;
         }
 
+        if self.inference.top_p < 0.0 || self.inference.top_p > 1.0 {
+            let clamped = self.inference.top_p.clamp(0.0, 1.0);
+            warnings.push(format!(
+                "clamped inference.top_p from {} to {clamped}",
+                self.inference.top_p
+            ));
+            self.inference.top_p = clamped;
+        }
+
+        if self.inference.min_p < 0.0 || self.inference.min_p > 1.0 {
+            let clamped = self.inference.min_p.clamp(0.0, 1.0);
+            warnings.push(format!(
+                "clamped inference.min_p from {} to {clamped}",
+                self.inference.min_p
+            ));
+            self.inference.min_p = clamped;
+        }
+
+        if self.inference.dry_multiplier < 0.0 {
+            warnings.push(format!(
+                "clamped inference.dry_multiplier from {} to 0.0",
+                self.inference.dry_multiplier
+            ));
+            self.inference.dry_multiplier = 0.0;
+        }
+
         if self.inference.mirostat > 2 {
             warnings.push(format!(
                 "clamped inference.mirostat from {} to 2",
                 self.inference.mirostat
             ));
             self.inference.mirostat = 2;
+        }
+
+        for (name, slot) in [
+            ("inference.cache_type_k", &mut self.inference.cache_type_k),
+            ("inference.cache_type_v", &mut self.inference.cache_type_v),
+        ] {
+            let normalized = slot.trim().to_ascii_lowercase();
+            if is_valid_ggml_kv_cache_type(&normalized) {
+                *slot = normalized;
+            } else {
+                warnings.push(format!("reset invalid {name} {slot:?} to \"\""));
+                *slot = String::new();
+            }
         }
 
         let thinking_lower = self.inference.thinking_level.trim().to_ascii_lowercase();
@@ -1569,6 +1680,15 @@ impl AppConfig {
             ) {
                 cfg.inference.thinking_level = thinking_lower;
             }
+            for slot in [
+                &mut cfg.inference.cache_type_k,
+                &mut cfg.inference.cache_type_v,
+            ] {
+                let normalized = slot.trim().to_ascii_lowercase();
+                if is_valid_ggml_kv_cache_type(&normalized) {
+                    *slot = normalized;
+                }
+            }
             let driver_lower = cfg.database.driver.trim().to_ascii_lowercase();
             if matches!(driver_lower.as_str(), "auto" | "sqlite" | "jsonl") {
                 cfg.database.driver = driver_lower;
@@ -1674,10 +1794,36 @@ impl AppConfig {
                 "inference.temperature must be >= 0.0".into(),
             ));
         }
+        if !(0.0..=1.0).contains(&self.inference.top_p) {
+            return Err(AgentError::InvalidInput(
+                "inference.top_p must be within 0.0..=1.0".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.inference.min_p) {
+            return Err(AgentError::InvalidInput(
+                "inference.min_p must be within 0.0..=1.0".into(),
+            ));
+        }
+        if self.inference.dry_multiplier < 0.0 {
+            return Err(AgentError::InvalidInput(
+                "inference.dry_multiplier must be >= 0.0".into(),
+            ));
+        }
         if self.inference.mirostat > 2 {
             return Err(AgentError::InvalidInput(
                 "inference.mirostat must be 0, 1, or 2".into(),
             ));
+        }
+        for (name, raw) in [
+            ("inference.cache_type_k", &self.inference.cache_type_k),
+            ("inference.cache_type_v", &self.inference.cache_type_v),
+        ] {
+            let normalized = raw.trim().to_ascii_lowercase();
+            if !is_valid_ggml_kv_cache_type(&normalized) {
+                return Err(AgentError::InvalidInput(format!(
+                    "{name} must be empty or a valid ggml KV cache type (f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1)"
+                )));
+            }
         }
         let extra_json = self.inference.custom_extra_body_json.trim();
         if !extra_json.is_empty() {
@@ -1830,6 +1976,12 @@ mod tests {
         assert_eq!(cfg.inference.thinking_level, "medium");
         assert!(cfg.inference.auto_sync_from_ps5lm);
         assert_eq!(cfg.inference.auto_sync_interval_secs, 30);
+        assert_eq!(cfg.inference.repeat_last_n, 256);
+        assert!((cfg.inference.dry_multiplier - 0.8).abs() < f32::EPSILON);
+        assert!(cfg.inference.smart_tool_routing);
+        assert!(cfg.inference.cache_type_k.is_empty());
+        assert!(cfg.inference.cache_type_v.is_empty());
+        assert!(!cfg.inference.flash_attn);
         assert_eq!(cfg.database.retention_days, 30);
         assert_eq!(cfg.database.max_rows_per_table, 10_000);
         assert!(cfg.security.admin_password.is_none());
@@ -1859,6 +2011,10 @@ mod tests {
         modified.inference.temperature = 0.25;
         modified.inference.mirostat = 2;
         modified.inference.custom_extra_body_json = "{\"mirostat_tau\": 3.0}".to_string();
+        modified.inference.smart_tool_routing = false;
+        modified.inference.cache_type_k = "q8_0".to_string();
+        modified.inference.cache_type_v = "q4_0".to_string();
+        modified.inference.flash_attn = true;
         modified.save(&path).expect("save modified config");
 
         let reloaded = AppConfig::load_or_create(&path).expect("reload config");
@@ -1872,6 +2028,10 @@ mod tests {
             reloaded.inference.custom_extra_body_json,
             "{\"mirostat_tau\": 3.0}"
         );
+        assert!(!reloaded.inference.smart_tool_routing);
+        assert_eq!(reloaded.inference.cache_type_k, "q8_0");
+        assert_eq!(reloaded.inference.cache_type_v, "q4_0");
+        assert!(reloaded.inference.flash_attn);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1894,7 +2054,7 @@ mod tests {
     #[test]
     fn sanitize_strips_bom_and_nul_and_normalizes_booleans_safely() {
         let _env = lock_env();
-        let raw = "\u{feff}[security]\r\nauth_enabled = \"false\" # disable on trusted LAN\r\nadmin_password = \"false\"\r\nrequire_approval_for_mutating = False\r\n[database]\r\nwal_mode = no\0\r\n[server]\r\nallow_lan_only = YES\r\n[inference]\r\nbase_url = \"http://127.0.0.1:8081/v1#keep\"\r\nstream_enabled = on\r\nauto_sync_from_ps5lm = \"false\"\r\n[sandbox]\r\nnetwork_access = \"false\"\r\nallow_local_network = YES\r\nallow_host_shell = \"true\"\r\ninject_brain_files = Off\r\n[logging]\r\nenable_klog = TRUE\r\nenable_toast = off\r\n";
+        let raw = "\u{feff}[security]\r\nauth_enabled = \"false\" # disable on trusted LAN\r\nadmin_password = \"false\"\r\nrequire_approval_for_mutating = False\r\n[database]\r\nwal_mode = no\0\r\n[server]\r\nallow_lan_only = YES\r\n[inference]\r\nbase_url = \"http://127.0.0.1:8081/v1#keep\"\r\nstream_enabled = on\r\nauto_sync_from_ps5lm = \"false\"\r\nsmart_tool_routing = \"false\"\r\nflash_attn = YES\r\n[sandbox]\r\nnetwork_access = \"false\"\r\nallow_local_network = YES\r\nallow_host_shell = \"true\"\r\ninject_brain_files = Off\r\n[logging]\r\nenable_klog = TRUE\r\nenable_toast = off\r\n";
         let sanitized = sanitize_user_toml(raw);
         assert!(!sanitized.starts_with('\u{feff}'));
         assert!(!sanitized.contains('\0'));
@@ -1906,6 +2066,8 @@ mod tests {
         assert!(sanitized.contains("base_url = \"http://127.0.0.1:8081/v1#keep\""));
         assert!(sanitized.contains("stream_enabled = true"));
         assert!(sanitized.contains("auto_sync_from_ps5lm = false"));
+        assert!(sanitized.contains("smart_tool_routing = false"));
+        assert!(sanitized.contains("flash_attn = true"));
         assert!(sanitized.contains("network_access = false"));
         assert!(sanitized.contains("allow_local_network = true"));
         assert!(sanitized.contains("allow_host_shell = true"));
@@ -1922,6 +2084,8 @@ mod tests {
         assert_eq!(cfg.inference.base_url, "http://127.0.0.1:8081/v1#keep");
         assert!(cfg.inference.stream_enabled);
         assert!(!cfg.inference.auto_sync_from_ps5lm);
+        assert!(!cfg.inference.smart_tool_routing);
+        assert!(cfg.inference.flash_attn);
         assert!(!cfg.sandbox.network_access);
         assert!(cfg.sandbox.allow_local_network);
         assert!(cfg.sandbox.allow_host_shell);
@@ -1949,6 +2113,12 @@ mod tests {
         assert_eq!(cfg.inference.thinking_level, "medium");
         assert!(cfg.inference.auto_sync_from_ps5lm);
         assert_eq!(cfg.inference.auto_sync_interval_secs, 30);
+        assert_eq!(cfg.inference.repeat_last_n, 256);
+        assert!((cfg.inference.dry_multiplier - 0.8).abs() < f32::EPSILON);
+        assert!(cfg.inference.smart_tool_routing);
+        assert!(cfg.inference.cache_type_k.is_empty());
+        assert!(cfg.inference.cache_type_v.is_empty());
+        assert!(!cfg.inference.flash_attn);
         assert_eq!(cfg.server.bind_host, "0.0.0.0");
         assert_eq!(cfg.server.port, 9090);
         assert!(!cfg.security.auth_enabled);
@@ -2306,5 +2476,140 @@ mod tests {
         assert_eq!(cfg.tools.remote_browser_url, "http://127.0.0.1:9222");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sampling_kv_clamping_validation_retry_and_repo_templates() {
+        let _env = lock_env();
+
+        // Retry helper handles cold-boot recovery within 12 attempts and bounded failure.
+        let mut tries = 0u32;
+        let recovered = retry_writable_probe(
+            DATA_MOUNT_RETRY_ATTEMPTS,
+            std::time::Duration::ZERO,
+            || {
+                tries += 1;
+                tries >= 3
+            },
+        );
+        assert_eq!(recovered, Some(4));
+
+        let mut never_tries = 0u32;
+        let exhausted = retry_writable_probe(
+            DATA_MOUNT_RETRY_ATTEMPTS,
+            std::time::Duration::ZERO,
+            || {
+                never_tries += 1;
+                false
+            },
+        );
+        assert_eq!(exhausted, None);
+        assert_eq!(never_tries, DATA_MOUNT_RETRY_ATTEMPTS - 1);
+
+        // Strict validation enforces sampling & KV cache type bounds.
+        let mut bad_top_p = AppConfig::default();
+        bad_top_p.inference.top_p = 1.2;
+        assert!(bad_top_p.validate().is_err());
+        bad_top_p.inference.top_p = -0.1;
+        assert!(bad_top_p.validate().is_err());
+
+        let mut bad_min_p = AppConfig::default();
+        bad_min_p.inference.min_p = -0.01;
+        assert!(bad_min_p.validate().is_err());
+        bad_min_p.inference.min_p = 1.05;
+        assert!(bad_min_p.validate().is_err());
+
+        let mut bad_dry = AppConfig::default();
+        bad_dry.inference.dry_multiplier = -0.5;
+        assert!(bad_dry.validate().is_err());
+
+        let mut bad_kv_k = AppConfig::default();
+        bad_kv_k.inference.cache_type_k = "fp8".to_string();
+        assert!(bad_kv_k.validate().is_err());
+
+        let mut bad_kv_v = AppConfig::default();
+        bad_kv_v.inference.cache_type_v = "int8".to_string();
+        assert!(bad_kv_v.validate().is_err());
+
+        for valid_kv in [
+            "", "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+        ] {
+            let mut valid_cfg = AppConfig::default();
+            valid_cfg.inference.cache_type_k = valid_kv.to_string();
+            valid_cfg.inference.cache_type_v = valid_kv.to_string();
+            valid_cfg
+                .validate()
+                .unwrap_or_else(|e| panic!("kv type {valid_kv:?} should validate: {e}"));
+        }
+
+        // Strict loader trims & lowercases valid KV cache types.
+        let dir = test_dir("kv-cache-strict");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let strict_path = dir.join("config.toml");
+        fs::write(
+            &strict_path,
+            "[inference]\ncache_type_k = \" Q8_0 \"\ncache_type_v = \" Q5_1 \"\n",
+        )
+        .unwrap();
+        let strict_cfg = AppConfig::load_or_create(&strict_path).expect("strict kv normalize");
+        assert_eq!(strict_cfg.inference.cache_type_k, "q8_0");
+        assert_eq!(strict_cfg.inference.cache_type_v, "q5_1");
+        let _ = fs::remove_dir_all(&dir);
+
+        // Resilient clamping resets NaN dry_multiplier to 0.8 and repairs out-of-range sampling/KV fields.
+        let mut clamp_cfg = AppConfig::default();
+        clamp_cfg.inference.dry_multiplier = f32::NAN;
+        clamp_cfg.inference.top_p = 1.5;
+        clamp_cfg.inference.min_p = -0.2;
+        clamp_cfg.inference.cache_type_k = " Q4_0 ".to_string();
+        clamp_cfg.inference.cache_type_v = "invalid_kv".to_string();
+        let warnings = clamp_cfg.normalize_and_clamp();
+        assert_eq!(warnings.len(), 4);
+        assert!((clamp_cfg.inference.dry_multiplier - 0.8).abs() < f32::EPSILON);
+        assert!((clamp_cfg.inference.top_p - 1.0).abs() < f32::EPSILON);
+        assert!((clamp_cfg.inference.min_p - 0.0).abs() < f32::EPSILON);
+        assert_eq!(clamp_cfg.inference.cache_type_k, "q4_0");
+        assert_eq!(clamp_cfg.inference.cache_type_v, "");
+        clamp_cfg.validate().expect("clamped sampling/KV config validates");
+
+        clamp_cfg.inference.dry_multiplier = -1.0;
+        let dry_warnings = clamp_cfg.normalize_and_clamp();
+        assert_eq!(dry_warnings.len(), 1);
+        assert!((clamp_cfg.inference.dry_multiplier - 0.0).abs() < f32::EPSILON);
+
+        // Checked-in TOML templates parse, normalize cleanly, and stay in sync on inference defaults.
+        for (label, raw_toml) in [
+            (
+                "config.ps5-slim-1340.toml",
+                include_str!("../../../config/config.ps5-slim-1340.toml"),
+            ),
+            (
+                "config.example.toml",
+                include_str!("../../../config/config.example.toml"),
+            ),
+        ] {
+            let mut tpl =
+                parse_app_config_with_subpaths(&sanitize_user_toml(raw_toml)).unwrap_or_else(|e| {
+                    panic!("{label} should parse: {e}");
+                });
+            tpl.sync_sandbox_and_tools();
+            let tpl_warnings = tpl.normalize_and_clamp();
+            assert!(
+                tpl_warnings.is_empty(),
+                "{label} emitted unexpected warnings: {tpl_warnings:?}"
+            );
+            tpl.validate()
+                .unwrap_or_else(|e| panic!("{label} failed validation: {e}"));
+            assert_eq!(tpl.inference.repeat_last_n, 256, "{label} repeat_last_n");
+            assert!(
+                (tpl.inference.dry_multiplier - 0.8).abs() < f32::EPSILON,
+                "{label} dry_multiplier"
+            );
+            assert!(tpl.inference.smart_tool_routing, "{label} smart_tool_routing");
+            assert!(tpl.inference.cache_type_k.is_empty(), "{label} cache_type_k");
+            assert!(tpl.inference.cache_type_v.is_empty(), "{label} cache_type_v");
+            assert!(!tpl.inference.flash_attn, "{label} flash_attn");
+        }
     }
 }

@@ -34,11 +34,11 @@ On first boot, `ps5-agent` automatically creates its runtime directory tree (`en
 ├── config.toml.broken.bak            # Created automatically if a broken config.toml is recovered
 ├── config.toml.v1.bak                # Backup created automatically when migrating legacy v1 config
 ├── bootstrap_credentials.txt         # Generated once on first boot (mode 0600 on Unix)
-├── ps5-agent.pid                     # Active payload PID file for clean singleton restarts
+├── ps5-agent.pid                     # Active payload PID file (<pid>:<boot_time_secs> on PS5 for reboot safety)
 ├── startup_error.log                 # Fatal pre-init startup diagnostics (if boot fails)
-├── meta.json                         # Optional release metadata (verified/synced if present)
+├── meta.json                         # Release/autostart metadata (schema 2; verified/synced if present)
 ├── database/
-│   └── agent.db                      # SQLite database (schema v3; TRUNCATE mode on PS5 or JSONL)
+│   └── agent.db                      # SQLite database (schema v6; TRUNCATE mode on PS5 or JSONL)
 ├── logs/
 │   └── ps5-agent.log                 # Rotating runtime log (default max 2 MiB)
 ├── mcp/                              # Streamable-HTTP MCP servers (`<id>.json` or `<id>/mcp.json`)
@@ -71,12 +71,13 @@ On first boot, `ps5-agent` automatically creates its runtime directory tree (`en
 - **Non-destructive Brain seeding (`seed_workspace_brain_files`):** Runs on every startup (`src/startup.rs`) against the primary workspace root (`tools.allowed_paths[0]`, defaulting to `<data_dir>/workspace/`). Existing files are **never overwritten**, symlinks/path traversal (`..`, backslashes, NUL bytes) are rejected, and Brain files are capped at `MAX_BRAIN_FILE_BYTES = 524288` (`512 KiB`).
 - **Prompt Injection & Heartbeat:** When `[sandbox].inject_brain_files = true` (default), non-empty Brain files and `.agents/rules/*.md` are injected into agent system prompts within `max_brain_context_chars` (`4000` default). When `[sandbox].heartbeat_interval_secs > 0` (default `0` = off), the background scheduler checks `HEARTBEAT.md` for non-comment (`#`) instructions.
 
-### Automatic `/download0/ps5-agent` Fallback
+### Automatic `/download0/ps5-agent` Fallback (with Cold-Boot `/data` Mount Retry)
 
-Some HEN/jailbreak environments restrict write access to `/data`. During startup (`load_effective_config`), `resolve_writable_data_dir()` probes the preferred `data_dir` by creating the directory and writing/removing a `.write_probe` file:
+Some HEN/jailbreak environments restrict write access to `/data`, and during cold-boot `pldmgr` autostart `/data` may still be finishing mount initialization. During startup (`load_effective_config_with_warnings`), `resolve_writable_data_dir()` probes the preferred `data_dir` by creating the directory and writing/removing a `.write_probe` file:
 
-- If `/data/ps5-agent` is writable, it is used as `data_dir`.
-- If `/data` is restricted on PS5 (`target_vendor = "sie"`), `resolve_writable_data_dir()` automatically falls back to `/download0/ps5-agent` and updates `database.path`, `logging.log_dir`, and `tools.allowed_paths` (`workspace/`) to point under `/download0/ps5-agent`.
+- If `/data/ps5-agent` is writable immediately, it is used as `data_dir`.
+- On PS5 (`target_vendor = "sie"`), if `/data/ps5-agent` is not yet writable on early boot, `resolve_writable_data_dir()` retries (`1` initial attempt + up to `11 × 250ms` retries = up to `2.75s` / `12` total attempts) before concluding `/data` is unavailable.
+- If `/data/ps5-agent` remains unwritable after retries on PS5 (`target_vendor = "sie"`), `resolve_writable_data_dir()` automatically falls back to `/download0/ps5-agent` and updates `database.path`, `logging.log_dir`, and `tools.allowed_paths` (`workspace/`) to point under `/download0/ps5-agent`.
 - You can also override the base directory at launch via `PS5_AGENT_DATA_DIR` or `--data-dir <PATH>` (and config location via `--config <PATH>`).
 
 ---
@@ -124,6 +125,14 @@ When startup succeeds on the PS5 (with `logging.enable_toast = true`):
 - On subsequent boots, it shows `PS5 Agent ready on 0.0.0.0:8080`.
 - In `pldmgr` (Processes tab), the payload identifies as **`ps5-agent.elf`** (via `SYS_thr_set_name`, rather than `payload.elf`).
 - Sending `SIGTERM` (from `pldmgr` or a new `ps5-agent.elf` launch reading `ps5-agent.pid`) triggers a graceful database checkpoint and clean shutdown. If startup hits a fatal configuration or initialization error, check `/data/ps5-agent/startup_error.log` (or the PS5 Startup Error toast).
+
+### PS5 `pldmgr` Cold-Boot Autostart & Non-Blocking Startup
+
+For hands-free startup whenever the PS5 jailbreak & `pldmgr` initialize:
+
+- **Stage Both `build/ps5-agent.elf` and `build/meta.json`:** `scripts/build-ps5.ps1` and `scripts/build-ps5.sh` generate `build/meta.json` with `"schema": 2`, `"kind": "repo"`, `"filename": "ps5-agent.elf"`, `"daemon": true`, `"autostart": true`, `"id": "ps5-agent"`, and the lowercase SHA-256 checksum (Wave 6 release: `9,621,568` bytes, SHA-256 `a321a25744fbf8c44a0fd2fd0ebe9b43afeb7d19d3b7d4061063977a193a1de7`). Placing both files together in your `pldmgr` payload folder lets `pldmgr` auto-launch `ps5-agent.elf` as a background daemon.
+- **Reboot-Safe PID & Process Guard (`ps5-agent.pid` + `KERN_BOOTTIME`):** On PS5 (`target_vendor = "sie"`), `manage_pid_file()` writes `<pid>:<boot_time_secs>` using FreeBSD `CTL_KERN / KERN_BOOTTIME` (`5s` jitter tolerance). After a cold reboot or power-off, any stale `ps5-agent.pid` from an earlier boot is treated as stale and cleared safely without signaling unrelated processes. On the same boot, `process_name_matches_ps5_agent()` strictly checks for `ps5-agent` or `ps5_agent` (case-insensitive, never generic `payload.elf`) before sending `SIGTERM` / `SIGKILL` (`600ms`).
+- **Early `/data` Mount Wait & Non-Blocking PS5LM Sync:** Startup retries `/data/ps5-agent` write probing (`1` initial + `11 × 250ms` = up to `2.75s`) while `/data` finishes mounting, and on `target_vendor = "sie"` defers initial `PS5LM` capability probing into the background polling task so the HTTP server (`0.0.0.0:8080`, `RecoveringTcpListener` with `TCP_NODELAY`) binds immediately even when `PS5LM` (`127.0.0.1:8081`) boots concurrently.
 
 ---
 
@@ -203,7 +212,7 @@ Key sections in `config/config.ps5-slim-1340.toml`:
 | `[inference].api_mode` | `"chat_completions"` | One of `chat_completions`, `responses`, `anthropic_messages`, `completions`, `system_one`. |
 | `[inference].thinking_level` | `"medium"` (code default) | Default reasoning depth (`off`, `low`, `medium`, `high`, `max`). |
 | `[inference].auto_sync_from_ps5lm` / `auto_sync_interval_secs` | `true` / `30` | Probes `PS5LM` on boot and every `30s` (`0` disables background sync) to align model, `context_limit`, and slots. |
-| `[inference].prefill_kv_cache` / `cache_prompt` | `true` / `true` | Enables background KV prefill (`n_predict: 0`) and prompt prefix KV reuse on `PS5LM` / `llama.cpp` (see [SETTINGS_REFERENCE.md](SETTINGS_REFERENCE.md) for all 33 KV/sampling keys). |
+| `[inference].prefill_kv_cache` / `cache_prompt` | `true` / `true` | Enables background KV prefill (`n_predict: 0`, `prefill_kv_cache_request`) and prompt prefix KV reuse (`id_slot = -1` auto FNV-1a slot affinity); `config.ps5-slim-1340.toml` also sets `smart_tool_routing = true`, `repeat_last_n = 256`, `dry_multiplier = 0.8`, `cache_type_k = ""`, `cache_type_v = ""`, and `flash_attn = false` (see [SETTINGS_REFERENCE.md](SETTINGS_REFERENCE.md) for all KV-cache, slot, and sampling keys). |
 | `[inference].context_limit` / `max_output_tokens` | `8192` / `1024` | Token budgets (`context_limit >= 512` or `0` for auto, `64 <= max_output_tokens < context_limit`). |
 | `[server].bind_host` / `port` | `"0.0.0.0"` / `8080` | HTTP bind address and port (override at launch with `--bind <HOST:PORT>`). |
 | `[server].upload_max_body_bytes` | `67108864` (64 MiB default) | Max payload size for file/image uploads (`0 = unlimited`). |
@@ -228,15 +237,15 @@ For the full list of `0 = unlimited` limits, `thinking_level` options, `[sandbox
 
 You do **not** need to wipe `/data/ps5-agent/` (or `/download0/ps5-agent/`) when upgrading `ps5-agent.elf` and `meta.json`. Replacing the old `.elf` + `meta.json` with a newer release triggers automatic detection and migration on startup (`src/startup.rs`):
 
-- **Live Process Takeover (`manage_pid_file`):** Detects any older running `ps5-agent` process via `ps5-agent.pid`, sends `SIGTERM` (and `SIGKILL` after `600ms` if needed), and rebinds the port cleanly via `SO_REUSEADDR`/`SO_REUSEPORT`.
+- **Live Process Takeover (`manage_pid_file`):** Tracks `<pid>:<boot_time_secs>` (via FreeBSD `CTL_KERN / KERN_BOOTTIME` on PS5) in `ps5-agent.pid` so stale PID files from prior boots are cleared without touching unrelated processes; on the same boot, strictly matches `ps5-agent`/`ps5_agent` (never generic `payload.elf`), sends `SIGTERM` (and `SIGKILL` after `600ms` if needed), and rebinds the port cleanly via `SO_REUSEADDR`/`SO_REUSEPORT`.
 - **Automatic Release Stamp Detection (`compute_release_stamp` & `installed_release_stamp`):** On every boot, `compute_release_stamp()` computes a SHA-256 stamp over `CARGO_PKG_VERSION`, `CURRENT_SCHEMA_VERSION`, `BUILTIN_AGENTS_SCHEMA_VERSION`, `builtin_agents_fingerprint()`, embedded dashboard assets (`INDEX_HTML`, `STYLES_CSS`, `APP_JS`), and—when `std::env::current_exe()` resolves to a regular file `<= 64 MiB`—the running executable's SHA-256 (raw TCP `elfldr` payloads with no disk path still compute a valid stamp from version/schema/agents/UI assets). Comparing against `settings["installed_release_stamp"]` detects in-place `.elf` upgrades (including pre-stamp legacy installs).
-- **Sibling `meta.json` Verification & Sync (`verify_or_sync_meta_json`):** Checks deduplicated `meta.json` candidates next to `ps5-agent.elf` (`<exe_dir>/meta.json`) and in `<data_dir>/meta.json` where `"id": "ps5-agent"` or `"filename": "ps5-agent.elf"`. Logs the detected `version` and `checksum`, and—when running `ps5-agent.elf` and either `checksum` or `version` (`v<CARGO_PKG_VERSION>`) differs—atomically rewrites `checksum`, `version`, and `last_update` (`YYYY-MM-DD`) via `meta.json.tmp` + `sync_all` + `rename` (logging a non-fatal warning if the path is read-only).
-- **SQLite Schema Migration:** Runs `run_migrations()` (`CURRENT_SCHEMA_VERSION = 3`, adding `sort_order` on `conversations` for persistent sidebar ordering) and integrity checks automatically while keeping all existing conversations, credentials, memories, and tasks intact.
-- **Built-in Agent Upgrades (`upgrade_builtin_agents`):** Uses `BUILTIN_AGENTS_SCHEMA_VERSION` (`"5"`) and `builtin_agents_hash` to upgrade unmodified built-in prompts, migrate legacy limits to `0`/`0` unlimited defaults, and merge new wildcards/tool groups while preserving user-edited prompts, enabled/disabled state, and custom agents (`POST /api/v1/agents/enable-all` / **Boot / Enable All Agents** in **Agents** can re-enable all agents at once).
+- **Sibling `meta.json` Verification & Sync (`verify_or_sync_meta_json`):** Checks deduplicated `meta.json` candidates next to `ps5-agent.elf` (`<exe_dir>/meta.json`) and in `<data_dir>/meta.json` where `"id": "ps5-agent"` or `"filename": "ps5-agent.elf"`. Logs the detected `version` and `checksum`, preserves `"schema": 2` / `"daemon": true` / `"autostart": true` fields in place, and—when running `ps5-agent.elf` and either `checksum` or `version` (`v<CARGO_PKG_VERSION>`) differs—atomically rewrites `checksum`, `version`, and `last_update` (`YYYY-MM-DD`) via `meta.json.tmp` + `sync_all` + `rename` (logging a non-fatal warning if the path is read-only).
+- **SQLite Schema Migration:** Runs `run_migrations()` (`CURRENT_SCHEMA_VERSION = 6`, preserving existing data while applying schema additions such as `sort_order`, webhooks, agent `denied_tools_json`/`sandbox_mode`/`tool_profile`, and `messages.timings_json`) and integrity checks automatically while keeping all existing conversations, credentials, memories, and tasks intact.
+- **Built-in Agent Upgrades (`upgrade_builtin_agents`):** Uses `BUILTIN_AGENTS_SCHEMA_VERSION` (`"6"`) and `builtin_agents_hash` to upgrade unmodified built-in prompts, migrate legacy limits to `0`/`0` unlimited defaults, and merge new wildcards/tool groups while preserving user-edited prompts, enabled/disabled state, and custom agents (`POST /api/v1/agents/enable-all` / **Boot / Enable All Agents** in **Agents** can re-enable all agents at once).
 - **Tool Specs & Extensions Refresh:** Upserts all `41` built-in tool specs (preserving runtime toggles), seeds any missing workspace Brain files via `seed_workspace_brain_files`, and loads extensions and custom tools from `<data_dir>/{mcp,skills,plugins,tools}` (auto-migrating any legacy `mcp_servers.json` entries into `<data_dir>/mcp/<id>.json`).
 - **Legacy `config.toml` Migration:** Detects legacy v1 `config.toml` files without schema v2+ keys (`thinking_level` / `auto_sync_from_ps5lm`), backs up the original to `config.toml.v1.bak`, backfills new keys and unlimited (`0`) defaults while preserving passwords/custom settings, and records `installed_config_schema_version = "3"` (`CONFIG_SCHEMA_VERSION`).
 - **Audit Record & Upgrade Toast:** Persists `installed_release_stamp`, `installed_version`, and `last_upgraded_at`, appends a `system.elf_upgrade` audit entry, and shows a PS5 toast (`PS5 Agent updated & ready on <host>:<port>`) when an upgrade is detected.
-- **PS5LM Capability Sync:** Immediately probes `PS5LM` (when `auto_sync_from_ps5lm = true`) to update loaded model, `context_limit`, and slot concurrency.
+- **PS5LM Capability Sync:** When `auto_sync_from_ps5lm = true`, updates loaded model, `context_limit`, and slot concurrency (deferred into the background polling task on PS5 `target_vendor = "sie"` so HTTP readiness never stalls).
 
 ---
 
@@ -244,9 +253,9 @@ You do **not** need to wipe `/data/ps5-agent/` (or `/download0/ps5-agent/`) when
 
 When `inference.auto_sync_from_ps5lm = true` (default), `ps5-agent` probes your `PS5LM` server (`inference.base_url` or `--ps5lm-url <URL>`):
 
-- **On Startup (`src/startup.rs`):** Calls `sync_ps5lm_capabilities()` immediately after runtime initialization, probing `/props`, `/slots`, `/v1/models`, and `/health`.
+- **On Startup (`src/startup.rs`):** On PS5 (`target_vendor = "sie"`), initial `sync_ps5lm_capabilities()` runs in the spawned background polling task so the HTTP listener and `pldmgr` autostart readiness never block while `PS5LM` starts concurrently; on non-PS5 hosts, startup runs a bounded `1500ms` initial probe before continuing in background. Probes check `/props`, `/slots`, `/v1/models`, and `/health`.
 - **Periodic Background Sync:** Runs every `inference.auto_sync_interval_secs` (default `30` seconds; set `0` to disable background polling while keeping startup sync).
-- **On-Demand Sync in the Dashboard:** Open **Settings** and click **Sync Settings from PS5LM Now** to probe `PS5LM` immediately and inspect the live capabilities summary (loaded model, `n_ctx`, total slots, vision support, thinking support, and last sync timestamp).
+- **On-Demand Sync & KV Import in the Dashboard:** Open **Settings** and click **Sync Settings from PS5LM Now** to probe `PS5LM` immediately and inspect the live capabilities summary (loaded model, `n_ctx`, total slots, vision support, thinking support, and last sync timestamp), or click **Import KV & Sampling from llama.cpp / PS5LM** (`#btn-import-llamacpp-kv` -> `POST /api/v1/inference/import-kv`) under **KV Cache & llama.cpp / PS5LM Sampling** to import matching KV-cache and sampling settings.
 - **Synced Fields:** When `PS5LM` reports capabilities, `ps5-agent` aligns `inference.model`, `inference.context_limit`, and `agents.max_concurrent_inference` (slot count) in memory so prompts and concurrency match the currently loaded GGUF model.
 
 ---

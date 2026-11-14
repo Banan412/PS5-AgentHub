@@ -1127,6 +1127,7 @@ async fn sse_split_utf8_and_prefilled_think_parsing() {
         context_limit: 4096,
         stream: true,
         thinking_level: ThinkingLevel::Medium,
+        slot_id: None,
     };
 
     let (text_a, reasoning_a, resp_a) = collect_stream_chunks(&provider_a, req_a).await;
@@ -1189,6 +1190,7 @@ async fn sse_split_utf8_and_prefilled_think_parsing() {
         context_limit: 4096,
         stream: true,
         thinking_level: ThinkingLevel::Medium,
+        slot_id: None,
     };
 
     let (text_b, reasoning_b, resp_b) = collect_stream_chunks(&provider_b, req_b).await;

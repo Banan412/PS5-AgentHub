@@ -14,7 +14,7 @@ use crate::backend::{
 use crate::error::{HttpError, HttpResult};
 use crate::HttpState;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -242,58 +242,260 @@ pub async fn events_sse_handler(
     ))
 }
 
+const SSE_LAG_ALERT_COOLDOWN: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+pub(crate) struct LagCoalescer {
+    cooldown: Duration,
+    last_alert_at: Option<std::time::Instant>,
+    pending_skipped: u64,
+}
+
+impl LagCoalescer {
+    pub(crate) fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            last_alert_at: None,
+            pending_skipped: 0,
+        }
+    }
+
+    pub(crate) fn record_lag(&mut self, skipped: u64, now: std::time::Instant) -> Option<u64> {
+        let total = self.pending_skipped.saturating_add(skipped);
+        let ready = match self.last_alert_at {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.cooldown,
+        };
+        if ready && total > 0 {
+            self.pending_skipped = 0;
+            self.last_alert_at = Some(now);
+            Some(total)
+        } else {
+            self.pending_skipped = total;
+            None
+        }
+    }
+
+    pub(crate) fn take_due(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.pending_skipped == 0 {
+            return None;
+        }
+        let ready = match self.last_alert_at {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.cooldown,
+        };
+        if ready {
+            let total = self.pending_skipped;
+            self.pending_skipped = 0;
+            self.last_alert_at = Some(now);
+            Some(total)
+        } else {
+            None
+        }
+    }
+}
+
 mod async_stream {
     use super::*;
     use futures_util::stream;
     use tokio::sync::broadcast::Receiver;
     use tokio_util::sync::CancellationToken;
 
+    struct SseUnfoldState<G, F> {
+        rx: Receiver<StreamEvent>,
+        shutdown: CancellationToken,
+        guard: G,
+        on_lag: F,
+        coalescer: LagCoalescer,
+        pending_event: Option<Event>,
+        closed: bool,
+    }
+
+    fn build_lag_alert_event(skipped: u64) -> Option<Event> {
+        let resync_payload = serde_json::json!({
+            "type": "system_alert",
+            "level": "warn",
+            "resync": true,
+            "resync_required": true,
+            "skipped": skipped,
+            "message": format!("SSE stream lagged; skipped {skipped} events; resync required"),
+        });
+        Event::default()
+            .event("system_alert")
+            .json_data(&resync_payload)
+            .ok()
+    }
+
     pub fn stream(
         rx: Receiver<StreamEvent>,
         shutdown: CancellationToken,
         guard: SseConnectionGuard,
     ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
-        stream::unfold((rx, shutdown, guard), |(mut rx, shutdown, guard)| async move {
+        stream_with_cooldown(
+            rx,
+            shutdown,
+            guard,
+            SSE_LAG_ALERT_COOLDOWN,
+            |guard, skipped| {
+                guard.state.logger.warn(
+                    "http.sse",
+                    format!("SSE subscriber lagged; skipped {skipped} events"),
+                );
+            },
+        )
+    }
+
+    pub(crate) fn stream_with_cooldown<G, F>(
+        rx: Receiver<StreamEvent>,
+        shutdown: CancellationToken,
+        guard: G,
+        cooldown: Duration,
+        on_lag: F,
+    ) -> impl Stream<Item = std::result::Result<Event, Infallible>>
+    where
+        F: FnMut(&G, u64),
+    {
+        let initial = SseUnfoldState {
+            rx,
+            shutdown,
+            guard,
+            on_lag,
+            coalescer: LagCoalescer::new(cooldown),
+            pending_event: None,
+            closed: false,
+        };
+        stream::unfold(initial, |mut state| async move {
+            if let Some(event) = state.pending_event.take() {
+                if state.shutdown.is_cancelled() {
+                    return None;
+                }
+                return Some((Ok(event), state));
+            }
+            if state.closed {
+                return None;
+            }
             loop {
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => {
+                    _ = state.shutdown.cancelled() => {
                         return None;
                     }
-                    res = rx.recv() => {
+                    res = state.rx.recv() => {
                         match res {
                             Ok(ev) => {
                                 let name = stream_event_name(&ev);
                                 if let Ok(event) = Event::default().event(name).json_data(&ev) {
-                                    return Some((Ok(event), (rx, shutdown, guard)));
+                                    if let Some(skipped) = state.coalescer.take_due(std::time::Instant::now()) {
+                                        (state.on_lag)(&state.guard, skipped);
+                                        if let Some(alert) = build_lag_alert_event(skipped) {
+                                            state.pending_event = Some(event);
+                                            return Some((Ok(alert), state));
+                                        }
+                                    }
+                                    return Some((Ok(event), state));
                                 }
                             }
                             Err(RecvError::Lagged(skipped)) => {
-                                guard.state.logger.warn(
-                                    "http.sse",
-                                    format!("SSE subscriber lagged; skipped {skipped} events"),
-                                );
-                                let resync_payload = serde_json::json!({
-                                    "type": "system_alert",
-                                    "level": "warn",
-                                    "resync": true,
-                                    "resync_required": true,
-                                    "skipped": skipped,
-                                    "message": format!("SSE stream lagged; skipped {skipped} events; resync required"),
-                                });
-                                if let Ok(event) = Event::default()
-                                    .event("system_alert")
-                                    .json_data(&resync_payload)
-                                {
-                                    return Some((Ok(event), (rx, shutdown, guard)));
+                                if let Some(total_skipped) = state.coalescer.record_lag(skipped, std::time::Instant::now()) {
+                                    (state.on_lag)(&state.guard, total_skipped);
+                                    if let Some(event) = build_lag_alert_event(total_skipped) {
+                                        return Some((Ok(event), state));
+                                    }
                                 }
                             }
-                            Err(RecvError::Closed) => return None,
+                            Err(RecvError::Closed) => {
+                                state.closed = true;
+                                if let Some(skipped) = state.coalescer.take_due(std::time::Instant::now()) {
+                                    (state.on_lag)(&state.guard, skipped);
+                                    if let Some(event) = build_lag_alert_event(skipped) {
+                                        return Some((Ok(event), state));
+                                    }
+                                }
+                                return None;
+                            }
                         }
                     }
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod sse_lag_coalesce_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
+
+    fn sample_stream_event(seq: usize) -> StreamEvent {
+        StreamEvent::AgentMessageSent {
+            envelope_id: format!("env-{seq}"),
+            sender_agent_id: "commander".to_string(),
+            recipient_agent_id: "worker".to_string(),
+            message_type: "AGENT_MESSAGE".to_string(),
+            status: "DELIVERED".to_string(),
+        }
+    }
+
+    #[test]
+    fn lag_coalescer_batches_bursts_within_cooldown() {
+        let cooldown = Duration::from_secs(5);
+        let t0 = std::time::Instant::now();
+        let mut c = LagCoalescer::new(cooldown);
+
+        assert_eq!(c.record_lag(3, t0), Some(3));
+        assert_eq!(c.record_lag(4, t0 + Duration::from_millis(500)), None);
+        assert_eq!(c.record_lag(5, t0 + Duration::from_secs(4)), None);
+        assert_eq!(c.take_due(t0 + Duration::from_secs(4)), None);
+
+        assert_eq!(c.take_due(t0 + Duration::from_secs(5)), Some(9));
+        assert_eq!(c.take_due(t0 + Duration::from_secs(5)), None);
+        assert_eq!(c.record_lag(2, t0 + Duration::from_secs(10)), Some(2));
+    }
+
+    #[tokio::test]
+    async fn sse_stream_coalesces_repeated_lag_and_flushes_after_cooldown() {
+        let (tx, rx) = broadcast::channel::<StreamEvent>(2);
+        let shutdown = CancellationToken::new();
+        let observed_skips = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let observed_ref = Arc::clone(&observed_skips);
+
+        let stream = async_stream::stream_with_cooldown(
+            rx,
+            shutdown,
+            (),
+            Duration::from_millis(60),
+            move |_, skipped| {
+                observed_ref.lock().unwrap().push(skipped);
+            },
+        );
+        let sse_resp = Sse::new(stream).into_response();
+        let body_task =
+            tokio::spawn(async move { to_bytes(sse_resp.into_body(), 1024 * 1024).await.unwrap() });
+
+        // First burst overflows capacity=2 (lags 4 events).
+        for i in 0..6 {
+            let _ = tx.send(sample_stream_event(i));
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // Second burst inside 60ms cooldown overflows again without immediately emitting a 2nd alert.
+        for i in 6..12 {
+            let _ = tx.send(sample_stream_event(i));
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        // Closing the channel after cooldown flushes pending skipped count cleanly.
+        drop(tx);
+        let bytes = body_task.await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let alert_count = text.matches("event: system_alert").count();
+        assert_eq!(alert_count, 2, "expected 1 initial + 1 flushed alert, got:\n{text}");
+        assert!(text.contains("env-11"), "expected latest live event preserved:\n{text}");
+        let skips = observed_skips.lock().unwrap();
+        assert_eq!(skips.len(), 2);
+        assert!(skips.iter().sum::<u64>() >= 8);
     }
 }
 
@@ -1892,6 +2094,134 @@ pub async fn sync_inference_capabilities(
         .to_string(),
     });
     Ok(Json(caps))
+}
+
+fn strip_sensitive_kv_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|k, _| {
+                let lower = k.to_ascii_lowercase();
+                lower != "api_key"
+                    && lower != "apikey"
+                    && lower != "ps5lm_api_key"
+                    && lower != "authorization"
+                    && !lower.ends_with("_api_key")
+                    && !lower.ends_with("_secret")
+                    && !lower.ends_with("_password")
+            });
+            for v in map.values_mut() {
+                strip_sensitive_kv_fields(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                strip_sensitive_kv_fields(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub async fn import_inference_kv(
+    State(state): State<Arc<HttpState>>,
+    Extension(auth): Extension<AuthContext>,
+) -> HttpResult<Json<serde_json::Value>> {
+    let mut payload = state.backend.import_ps5lm_kv_settings(&auth.username).await?;
+    strip_sensitive_kv_fields(&mut payload);
+
+    let endpoint = payload
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let imported_keys: Vec<&str> = payload
+        .get("imported")
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+    let applied_keys: Vec<&str> = payload
+        .get("applied")
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+
+    let _ = state.store.append_audit_log(&AuditLogEntry {
+        id: new_id(),
+        timestamp: now_iso(),
+        actor: auth.username,
+        action: "inference.import_kv".to_string(),
+        target: endpoint.clone().unwrap_or_else(|| "ps5lm".to_string()),
+        severity: "info".to_string(),
+        outcome: "success".to_string(),
+        details_json: serde_json::json!({
+            "endpoint": endpoint,
+            "imported_keys": imported_keys,
+            "applied_keys": applied_keys,
+        })
+        .to_string(),
+    });
+    Ok(Json(payload))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BrowserPreviewQuery {
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+fn sanitize_header_token(raw: &str, max_len: usize) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() && *c != '\r' && *c != '\n')
+        .take(max_len)
+        .collect()
+}
+
+pub async fn preview_browser_session(
+    State(state): State<Arc<HttpState>>,
+    Query(query): Query<BrowserPreviewQuery>,
+) -> HttpResult<Response> {
+    let requested_session_id = match query.session_id.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(id) => {
+            if id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+            {
+                return Err(HttpError::from_agent(AgentError::InvalidInput(
+                    "Invalid session_id".into(),
+                )));
+            }
+            Some(id)
+        }
+        None => None,
+    };
+
+    let (session_id, sanitized_url, sanitized_html) = state
+        .backend
+        .preview_browser_session(requested_session_id)
+        .await?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+
+    let safe_sid = sanitize_header_token(&session_id, 128);
+    if !safe_sid.is_empty() {
+        if let Ok(hv) = HeaderValue::from_str(&safe_sid) {
+            headers.insert(HeaderName::from_static("x-browser-session-id"), hv);
+        }
+    }
+
+    let safe_url = sanitize_header_token(&sanitized_url, 1024);
+    if !safe_url.is_empty() {
+        if let Ok(hv) = HeaderValue::from_str(&safe_url) {
+            headers.insert(HeaderName::from_static("x-browser-url"), hv);
+        }
+    }
+
+    Ok((StatusCode::OK, headers, sanitized_html).into_response())
 }
 
 pub async fn reorder_conversations(

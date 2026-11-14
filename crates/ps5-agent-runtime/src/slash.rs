@@ -418,6 +418,7 @@ async fn cmd_btw(
         temperature,
         max_output_tokens,
         context_limit,
+        slot_id: None,
         stream: false,
         thinking_level,
     };
@@ -944,6 +945,7 @@ async fn cmd_compact(
         temperature: 0.2,
         max_output_tokens: cfg.inference.max_output_tokens.min(1024).max(256),
         context_limit: cfg.inference.context_limit,
+        slot_id: None,
         stream: false,
         thinking_level: ThinkingLevel::Off,
     };
@@ -1884,6 +1886,7 @@ async fn execute_custom_workflow(
         temperature: cfg.inference.temperature,
         max_output_tokens: cfg.inference.max_output_tokens,
         context_limit: cfg.inference.context_limit,
+        slot_id: None,
         stream: false,
         thinking_level: parse_config_thinking_level(&cfg.inference.thinking_level),
     };
@@ -2377,6 +2380,7 @@ mod tests {
                     total_tokens: 36,
                 },
                 latency_ms: 9,
+                timings: None,
             })
         }
 
@@ -2490,6 +2494,7 @@ mod tests {
             task_id: None,
             token_count: 10,
             latency_ms: None,
+            timings: None,
             archived: false,
             created_at: now_iso(),
             attachments: Vec::new(),

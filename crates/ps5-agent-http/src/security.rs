@@ -16,6 +16,8 @@ pub const HEADER_X_CSRF_TOKEN: &str = "x-csrf-token";
 
 pub const CSP_VALUE: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
 pub const PREVIEW_CSP_VALUE: &str = "sandbox allow-scripts; default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none';";
+/// Strict script-free CSP applied to sandbox browser HTML previews.
+pub const BROWSER_PREVIEW_CSP_VALUE: &str = "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self';";
 
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED_IPS: usize = 4096;
@@ -299,10 +301,17 @@ fn is_files_preview_path(path: &str) -> bool {
     path == "/api/v1/files/preview" || path == "/api/v1/files/preview/"
 }
 
+fn is_browser_preview_path(path: &str) -> bool {
+    path == "/api/v1/sandbox/browser/preview" || path == "/api/v1/sandbox/browser/preview/"
+}
+
 pub fn apply_security_headers(headers: &mut HeaderMap, path: &str, status: StatusCode) {
     let is_api = path.starts_with("/api/");
-    let is_isolated_preview = is_files_preview_path(path) && status.is_success();
-    let (csp, frame_options) = if is_isolated_preview {
+    let is_files_preview = is_files_preview_path(path) && status.is_success();
+    let is_browser_preview = is_browser_preview_path(path) && status.is_success();
+    let (csp, frame_options) = if is_browser_preview {
+        (BROWSER_PREVIEW_CSP_VALUE, "SAMEORIGIN")
+    } else if is_files_preview {
         (PREVIEW_CSP_VALUE, "SAMEORIGIN")
     } else {
         (CSP_VALUE, "DENY")

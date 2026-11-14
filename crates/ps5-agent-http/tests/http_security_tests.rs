@@ -429,6 +429,7 @@ impl HttpBackend for MockBackend {
             task_id: Some(task_id.clone()),
             token_count: 4,
             latency_ms: None,
+            timings: None,
             archived: false,
             attachments: Vec::new(),
             created_at: now_iso(),
@@ -722,6 +723,48 @@ impl HttpBackend for MockBackend {
             task_id: Some("task-wh-1".to_string()),
             message: "Webhook triggered".to_string(),
         })
+    }
+
+    async fn import_ps5lm_kv_settings(&self, actor: &str) -> CoreResult<Value> {
+        Ok(json!({
+            "ok": true,
+            "actor": actor,
+            "endpoint": "http://127.0.0.1:18080",
+            "total_slots": 4,
+            "api_key": "top-level-secret-should-strip",
+            "imported": {
+                "ctx_size": 8192,
+                "cache_type_k": "q8_0",
+                "api_key": "nested-secret-should-strip"
+            },
+            "applied": {
+                "max_tokens": 2048,
+                "flash_attn": true
+            }
+        }))
+    }
+
+    async fn preview_browser_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> CoreResult<(String, String, String)> {
+        if session_id == Some("missing") {
+            return Err(AgentError::NotFound(
+                "Browser session missing not found".into(),
+            ));
+        }
+        if session_id == Some("crlf") {
+            return Ok((
+                "sess-crlf".to_string(),
+                "https://example.com/path\r\nX-Injected: evil".to_string(),
+                "<!doctype html><html><body><p>Sanitized</p></body></html>".to_string(),
+            ));
+        }
+        Ok((
+            session_id.unwrap_or("sess-default").to_string(),
+            "https://example.com/safe".to_string(),
+            "<!doctype html><html><body><h1>Sandbox</h1><img src=\"data:image/png;base64,AA==\"></body></html>".to_string(),
+        ))
     }
 }
 
@@ -2099,6 +2142,417 @@ async fn test_inbound_webhook_csrf_exemption_and_token_auth() {
         .await
         .unwrap();
     assert_eq!(ok_bearer_resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_import_inference_kv_auth_csrf_audit_and_no_secret_leak() {
+    struct MinimalDefaultBackend;
+    #[async_trait]
+    impl HttpBackend for MinimalDefaultBackend {
+        async fn metrics(&self) -> MetricsSnapshot {
+            MetricsSnapshot::default()
+        }
+        async fn send_conversation_message(&self, _: &str, _: SendMessageRequest) -> CoreResult<SendMessageResponse> { unimplemented!() }
+        async fn list_agent_cards(&self) -> CoreResult<Vec<AgentCardView>> { unimplemented!() }
+        async fn get_agent_card(&self, _: &str) -> CoreResult<AgentCardView> { unimplemented!() }
+        async fn create_agent(&self, _: CreateAgentRequest) -> CoreResult<AgentDefinition> { unimplemented!() }
+        async fn update_agent(&self, _: &str, _: UpdateAgentRequest) -> CoreResult<AgentDefinition> { unimplemented!() }
+        async fn delete_agent(&self, _: &str) -> CoreResult<bool> { unimplemented!() }
+        async fn set_agent_enabled(&self, _: &str, _: bool) -> CoreResult<AgentDefinition> { unimplemented!() }
+        async fn send_agent_message(&self, _: SendAgentMessageRequest) -> CoreResult<AgentEnvelope> { unimplemented!() }
+        async fn create_task(&self, _: CreateTaskRequest) -> CoreResult<TaskRecord> { unimplemented!() }
+        async fn cancel_task(&self, _: &str) -> CoreResult<TaskRecord> { unimplemented!() }
+        async fn resolve_approval(&self, _: &str, _: bool, _: &str) -> CoreResult<ApprovalRecord> { unimplemented!() }
+        async fn list_tools(&self) -> CoreResult<Vec<ToolSpec>> { unimplemented!() }
+        async fn toggle_tool(&self, _: &str, _: Option<bool>) -> CoreResult<ToolSpec> { unimplemented!() }
+        async fn execute_tool(&self, _: &str, _: ExecuteToolRequest) -> CoreResult<ToolExecutionRecord> { unimplemented!() }
+    }
+    let default_backend = MinimalDefaultBackend;
+    assert!(matches!(
+        default_backend.import_ps5lm_kv_settings("admin").await,
+        Err(AgentError::Inference(_))
+    ));
+    assert!(matches!(
+        default_backend.preview_browser_session(None).await,
+        Err(AgentError::NotFound(_))
+    ));
+
+    let h = setup_harness("import-kv", |_| {});
+    let router = build_router(h.state.clone());
+
+    // Unauthenticated POST -> 401 Unauthorized.
+    let unauth = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/inference/import-kv")
+                .header(header::HOST, "127.0.0.1:8080")
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let (cookie, csrf) = login_cookie_and_csrf(&h.state, "admin", &h.password).await;
+
+    // Cookie without CSRF header -> 403 Forbidden.
+    let missing_csrf = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/inference/import-kv")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::COOKIE, &cookie)
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+    // Cookie + wrong CSRF -> 403 Forbidden.
+    let wrong_csrf = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/inference/import-kv")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", "invalid-csrf-token")
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_csrf.status(), StatusCode::FORBIDDEN);
+
+    // Cookie + valid CSRF + mismatched Origin -> 403 Forbidden.
+    let bad_origin = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/inference/import-kv")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::ORIGIN, "https://evil.example")
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
+
+    // Valid auth + CSRF + Origin -> 200 OK, secret fields stripped, audit entry written.
+    let ok_resp = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/inference/import-kv")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::ORIGIN, "http://127.0.0.1:8080")
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+    assert_security_headers(ok_resp.headers(), true);
+
+    let body = body_json(ok_resp).await;
+    let body_text = body.to_string();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["actor"], "admin");
+    assert_eq!(body["endpoint"], "http://127.0.0.1:18080");
+    assert_eq!(body["total_slots"], 4);
+    assert_eq!(body["imported"]["ctx_size"], 8192);
+    assert_eq!(body["applied"]["max_tokens"], 2048);
+    assert!(body.get("api_key").is_none(), "top-level api_key leaked: {body_text}");
+    assert!(
+        body["imported"].get("api_key").is_none(),
+        "nested api_key leaked: {body_text}"
+    );
+    assert!(!body_text.contains("should-strip"));
+
+    let audits = h.store.list_audit_logs(20).unwrap();
+    let audit = audits
+        .iter()
+        .find(|entry| entry.action == "inference.import_kv")
+        .expect("inference.import_kv audit log entry missing");
+    assert_eq!(audit.actor, "admin");
+    assert!(!audit.details_json.contains("should-strip"));
+}
+
+#[tokio::test]
+async fn test_browser_preview_auth_csp_isolation_and_error_fallback() {
+    let h = setup_harness("browser-preview", |_| {});
+    let router = build_router(h.state.clone());
+
+    // Unauthenticated GET -> 401 with standard CSP + DENY.
+    let unauth = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/sandbox/browser/preview")
+                .header(header::HOST, "127.0.0.1:8080")
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    assert_security_headers(unauth.headers(), true);
+
+    let (cookie, _csrf) = login_cookie_and_csrf(&h.state, "admin", &h.password).await;
+
+    // Invalid session_id -> 400 Bad Request with standard CSP + DENY.
+    let bad_sid = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/sandbox/browser/preview?session_id=../bad")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::COOKIE, &cookie)
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_sid.status(), StatusCode::BAD_REQUEST);
+    assert_security_headers(bad_sid.headers(), true);
+
+    // Non-2xx (404) -> keeps strict standard CSP + X-Frame-Options: DENY.
+    let missing = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/sandbox/browser/preview?session_id=missing")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::COOKIE, &cookie)
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_security_headers(missing.headers(), true);
+
+    // 200 OK -> script-free BROWSER_PREVIEW_CSP_VALUE + SAMEORIGIN + no-store + text/html.
+    let ok = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/sandbox/browser/preview?session_id=sess-1")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::COOKIE, &cookie)
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let csp = ok
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert_eq!(csp, ps5_agent_http::BROWSER_PREVIEW_CSP_VALUE);
+    assert!(csp.contains("default-src 'none'"));
+    assert!(csp.contains("frame-ancestors 'self'"));
+    assert!(!csp.contains("script-src"));
+    assert!(!csp.contains("unsafe-eval"));
+    assert_eq!(
+        ok.headers()
+            .get(header::X_FRAME_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("SAMEORIGIN")
+    );
+    assert_eq!(
+        ok.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        ok.headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        ok.headers()
+            .get("referrer-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        ok.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(
+        ok.headers()
+            .get("x-browser-session-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("sess-1")
+    );
+    assert_eq!(
+        ok.headers()
+            .get("x-browser-url")
+            .and_then(|v| v.to_str().ok()),
+        Some("https://example.com/safe")
+    );
+    let html = String::from_utf8(
+        to_bytes(ok.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("<h1>Sandbox</h1>"));
+
+    // CRLF control characters in URL do not split headers.
+    let crlf_resp = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/sandbox/browser/preview?session_id=crlf")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::COOKIE, &cookie)
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(crlf_resp.status(), StatusCode::OK);
+    assert!(crlf_resp.headers().get("x-injected").is_none());
+    let sanitized_url_hdr = crlf_resp
+        .headers()
+        .get("x-browser-url")
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert!(!sanitized_url_hdr.contains('\r'));
+    assert!(!sanitized_url_hdr.contains('\n'));
+}
+
+#[tokio::test]
+async fn test_sse_lag_burst_coalescing_on_events_endpoint() {
+    let temp_dir = new_temp_dir("sse-lag");
+    let mut cfg = AppConfig::with_data_dir(temp_dir.clone());
+    cfg.security.argon2_memory_kib = 4096;
+    cfg.logging = LoggingConfig {
+        level: "info".to_string(),
+        log_dir: temp_dir.join("logs"),
+        max_file_bytes: 512 * 1024,
+        ring_buffer_capacity: 128,
+        enable_klog: false,
+        enable_toast: false,
+    };
+    let logger = AppLogger::init(&cfg.logging);
+    let store = Arc::new(MemoryStorage::default());
+    ensure_bootstrap_credentials(&cfg, store.as_ref(), &logger).unwrap();
+    let creds_raw =
+        std::fs::read_to_string(cfg.data_dir.join("bootstrap_credentials.txt")).unwrap();
+    let password = creds_raw
+        .lines()
+        .find_map(|l| l.strip_prefix("password="))
+        .unwrap()
+        .to_string();
+
+    let (events_tx, _) = broadcast::channel(4);
+    let backend: Arc<dyn HttpBackend> = Arc::new(MockBackend {
+        store: store.clone(),
+        events_tx: events_tx.clone(),
+    });
+    let shutdown = CancellationToken::new();
+    let state = HttpState::new(
+        cfg,
+        store,
+        backend,
+        logger,
+        events_tx.clone(),
+        shutdown.clone(),
+        DashboardAssets::default(),
+    );
+    let (cookie, _csrf) = login_cookie_and_csrf(&state, "admin", &password).await;
+    let router = build_router(state);
+
+    let sse_resp = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/events")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::COOKIE, &cookie)
+                .extension(lan_peer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(sse_resp.into_body(), 1024 * 1024).await.unwrap()
+    });
+
+    // Send two lag bursts within the 5s cooldown on a capacity=4 channel.
+    for idx in 0..20 {
+        let _ = events_tx.send(ps5_agent_core::StreamEvent::AgentMessageSent {
+            envelope_id: format!("env-{idx}"),
+            sender_agent_id: "commander".to_string(),
+            recipient_agent_id: "worker".to_string(),
+            message_type: "AGENT_MESSAGE".to_string(),
+            status: "DELIVERED".to_string(),
+        });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    for idx in 20..40 {
+        let _ = events_tx.send(ps5_agent_core::StreamEvent::AgentMessageSent {
+            envelope_id: format!("env-{idx}"),
+            sender_agent_id: "commander".to_string(),
+            recipient_agent_id: "worker".to_string(),
+            message_type: "AGENT_MESSAGE".to_string(),
+            status: "DELIVERED".to_string(),
+        });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+    shutdown.cancel();
+    let bytes = body_task.await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    assert_eq!(
+        text.matches("event: system_alert").count(),
+        1,
+        "repeated lag bursts within 5s must coalesce into 1 alert:\n{text}"
+    );
+    assert!(text.contains("\"resync\":true"), "missing resync flag:\n{text}");
+    assert!(text.contains("env-39"), "latest live event missing:\n{text}");
 }
 
 #[test]

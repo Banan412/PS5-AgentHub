@@ -1,7 +1,7 @@
 use ps5_agent_core::{now_iso, AgentError, Result};
 use rusqlite::{params, Connection};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 const MIGRATION_001_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS agents (
@@ -293,12 +293,18 @@ CREATE INDEX IF NOT EXISTS idx_webhooks_enabled
     ON webhooks(enabled);
 "#;
 
+const MIGRATION_006_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_messages_conv_created
+    ON messages(conversation_id, created_at DESC);
+"#;
+
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "001_initial_schema", MIGRATION_001_SQL),
     (2, "002_chat_attachments_and_retention", MIGRATION_002_SQL),
     (3, "003_conversation_sort_order", MIGRATION_003_SQL),
     (4, "004_schedules", MIGRATION_004_SQL),
     (5, "005_sandbox_webhooks_agent_policy", MIGRATION_005_SQL),
+    (6, "006_message_timings_and_conv_index", MIGRATION_006_SQL),
 ];
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -369,6 +375,9 @@ pub fn run_sqlite_migrations(conn: &Connection) -> Result<()> {
             ensure_column_exists(&tx, "agents", "denied_tools_json", "TEXT NOT NULL DEFAULT '[]'")?;
             ensure_column_exists(&tx, "agents", "sandbox_mode", "TEXT")?;
             ensure_column_exists(&tx, "agents", "tool_profile", "TEXT")?;
+        }
+        if version == 6 {
+            ensure_column_exists(&tx, "messages", "timings_json", "TEXT")?;
         }
         tx.execute_batch(sql)
             .map_err(|e| AgentError::Storage(format!("applying migration {version} ({name}): {e}")))?;

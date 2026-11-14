@@ -28,10 +28,10 @@ xtc_probability = 0.0
 xtc_threshold = 0.1
 top_n_sigma = -1.0
 repeat_penalty = 1.05
-repeat_last_n = 64
+repeat_last_n = 256
 presence_penalty = 0.0
 frequency_penalty = 0.0
-dry_multiplier = 0.0
+dry_multiplier = 0.8
 dry_base = 1.75
 dry_allowed_length = 2
 dry_penalty_last_n = -1
@@ -48,6 +48,10 @@ grammar = ""
 reasoning_format = "deepseek"
 timings_per_token = false
 custom_extra_body_json = ""
+smart_tool_routing = true
+cache_type_k = ""
+cache_type_v = ""
+flash_attn = false
 
 [server]
 bind_host = "0.0.0.0"
@@ -116,3 +120,20 @@ enable_toast = true
 tokio_worker_threads = 2
 health_poll_interval_secs = 15
 rest_mode_recovery = true
+
+[sandbox]
+mode = "full_sandbox"
+approval_policy = "full_auto"
+network_access = true
+allow_local_network = false
+web_search_provider = "duckduckgo"
+searxng_url = ""
+brave_api_key = ""
+tavily_api_key = ""
+remote_browser_url = ""
+allow_host_shell = false
+max_exec_output_bytes = 262144
+exec_timeout_secs = 20
+inject_brain_files = true
+max_brain_context_chars = 4000
+heartbeat_interval_secs = 0

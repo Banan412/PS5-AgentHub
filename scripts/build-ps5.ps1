@@ -137,6 +137,8 @@ if ($Package -eq "ps5-agent") {
   "schema": 2,
   "kind": "repo",
   "filename": "ps5-agent.elf",
+  "daemon": true,
+  "autostart": true,
   "installed_at": "$InstalledAt",
   "id": "ps5-agent",
   "source_url": "",

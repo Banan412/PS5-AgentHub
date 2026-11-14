@@ -144,6 +144,16 @@ fn assert_all_13_tables_crud_and_parity(backend: &dyn StorageBackend) {
         "Main Chat"
     );
 
+    let sample_timings = InferenceTimings {
+        predicted_per_second: Some(42.5),
+        prompt_per_second: Some(120.0),
+        predicted_ms: Some(250.0),
+        prompt_ms: Some(40.0),
+        predicted_n: Some(10),
+        prompt_n: Some(5),
+        cache_n: Some(3),
+    };
+
     for i in 1..=5 {
         let msg = ChatMessage {
             id: format!("msg-{i}"),
@@ -170,6 +180,11 @@ fn assert_all_13_tables_crud_and_parity(backend: &dyn StorageBackend) {
             latency_ms: Some(120),
             archived: false,
             attachments: Vec::new(),
+            timings: if i == 4 {
+                Some(sample_timings.clone())
+            } else {
+                None
+            },
             created_at: format!("2026-11-13T10:01:0{i}+00:00"),
         };
         backend.append_chat_message(&msg).expect("append msg");
@@ -179,6 +194,21 @@ fn assert_all_13_tables_crud_and_parity(backend: &dyn StorageBackend) {
     assert_eq!(recent2.len(), 2);
     assert_eq!(recent2[0].id, "msg-4");
     assert_eq!(recent2[1].id, "msg-5");
+    assert_eq!(recent2[0].timings, Some(sample_timings.clone()));
+    assert_eq!(recent2[1].timings, None);
+    let mut updated_m5 = recent2[1].clone();
+    updated_m5.timings = Some(sample_timings.clone());
+    assert!(backend.update_chat_message(&updated_m5).unwrap());
+    assert_eq!(
+        backend.get_chat_message("msg-5").unwrap().unwrap().timings,
+        Some(sample_timings.clone())
+    );
+    updated_m5.timings = None;
+    assert!(backend.update_chat_message(&updated_m5).unwrap());
+    assert_eq!(
+        backend.get_chat_message("msg-5").unwrap().unwrap().timings,
+        None
+    );
 
     // Search with SQL wildcard characters escaped properly
     let hits = backend.search_chat_messages("100% PS5_", 10).unwrap();
@@ -290,6 +320,19 @@ fn assert_all_13_tables_crud_and_parity(backend: &dyn StorageBackend) {
     let (cnt, bytes) = backend.memory_stats_for_agent("agent-1").unwrap();
     assert_eq!(cnt, 1);
     assert_eq!(bytes, mem.content.len() as u64);
+
+    let archived_mem = MemoryItem {
+        id: "mem-archived".to_string(),
+        key: "old_note".to_string(),
+        content: "should not be counted".to_string(),
+        archived: true,
+        ..mem.clone()
+    };
+    backend.upsert_memory(&archived_mem).expect("upsert archived_mem");
+    let (cnt_after_arch, bytes_after_arch) = backend.memory_stats_for_agent("agent-1").unwrap();
+    assert_eq!(cnt_after_arch, 1);
+    assert_eq!(bytes_after_arch, mem.content.len() as u64);
+    assert!(backend.delete_memory("mem-archived").unwrap());
 
     let mem2 = MemoryItem {
         id: "mem-2".to_string(),

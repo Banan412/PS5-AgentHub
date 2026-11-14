@@ -75,6 +75,8 @@ if [[ "${PACKAGE}" == "ps5-agent" ]]; then
   "schema": 2,
   "kind": "repo",
   "filename": "ps5-agent.elf",
+  "daemon": true,
+  "autostart": true,
   "installed_at": "${INSTALLED_AT}",
   "id": "ps5-agent",
   "source_url": "",

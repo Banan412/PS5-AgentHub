@@ -336,6 +336,8 @@ pub struct ChatMessage {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ChatAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<InferenceTimings>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -554,6 +556,76 @@ pub struct Ps5LmCapabilities {
     pub synced_at: Option<String>,
 }
 
+/// Per-response token timing telemetry reported by llama-server / PS5LM.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InferenceTimings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_n: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_n: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_n: Option<u32>,
+}
+
+/// Live KV-cache and sampling settings imported from a running PS5LM / llama-server instance.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Ps5LmKvSamplingImport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_slots: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_type_k: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_type_v: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flash_attn: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_keep: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_last_n: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_multiplier: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_base: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_allowed_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_penalty_last_n: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xtc_probability: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xtc_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub samplers: Option<Vec<String>>,
+    #[serde(default)]
+    pub raw_source: String,
+}
+
 fn default_true_bool() -> bool {
     true
 }
@@ -678,6 +750,14 @@ pub fn canonical_tool_id(id: &str) -> &str {
         "exec" | "shell" | "bash" => "sandbox_exec",
         "search_files" | "grep" => "grep_search",
         "find_files" | "glob" => "glob_files",
+        "write_agent_memory" => "memory_write",
+        "read_agent_memory" => "memory_read",
+        "delegate_task" => "assign_agent_task",
+        "agent_message" => "send_agent_message",
+        "spawn_temp_agent" => "request_temporary_specialist",
+        "json_parse_format" => "json_process",
+        "timestamp_time_helper" => "datetime",
+        "text_transform_summarize_prep" => "text_process",
         other => other,
     }
 }
@@ -695,6 +775,14 @@ fn canonical_tool_aliases(canonical_id: &str) -> &'static [&'static str] {
         "sandbox_exec" => &["sandbox_exec", "exec", "shell", "bash"],
         "grep_search" => &["grep_search", "search_files", "grep"],
         "glob_files" => &["glob_files", "find_files", "glob"],
+        "memory_write" => &["memory_write", "write_agent_memory"],
+        "memory_read" => &["memory_read", "read_agent_memory"],
+        "assign_agent_task" => &["assign_agent_task", "delegate_task"],
+        "send_agent_message" => &["send_agent_message", "agent_message"],
+        "request_temporary_specialist" => &["request_temporary_specialist", "spawn_temp_agent"],
+        "json_process" => &["json_process", "json_parse_format"],
+        "datetime" => &["datetime", "timestamp_time_helper"],
+        "text_process" => &["text_process", "text_transform_summarize_prep"],
         _ => &[],
     }
 }
@@ -728,8 +816,6 @@ pub fn expand_tool_group(group: &str) -> Option<&'static [&'static str]> {
             "memory_write",
             "memory_search",
             "memory_get",
-            "read_agent_memory",
-            "write_agent_memory",
         ]),
         "group:sessions" => Some(&[
             "sessions_list",
@@ -745,9 +831,9 @@ pub fn expand_tool_group(group: &str) -> Option<&'static [&'static str]> {
         ]),
         "group:utility" => Some(&[
             "calculator",
-            "json_parse_format",
-            "timestamp_time_helper",
-            "text_transform_summarize_prep",
+            "json_process",
+            "datetime",
+            "text_process",
             "system_info",
             "ps5_info",
             "doctor",
@@ -775,8 +861,6 @@ pub fn expand_tool_group(group: &str) -> Option<&'static [&'static str]> {
             "memory_write",
             "memory_search",
             "memory_get",
-            "read_agent_memory",
-            "write_agent_memory",
             "sessions_list",
             "sessions_spawn",
             "sessions_send",
@@ -786,9 +870,9 @@ pub fn expand_tool_group(group: &str) -> Option<&'static [&'static str]> {
             "schedule_update",
             "schedule_delete",
             "calculator",
-            "json_parse_format",
-            "timestamp_time_helper",
-            "text_transform_summarize_prep",
+            "json_process",
+            "datetime",
+            "text_process",
             "system_info",
             "ps5_info",
             "doctor",
@@ -1042,5 +1126,88 @@ mod tests {
             "bash",
             "runtime"
         ));
+    }
+
+    #[test]
+    fn inference_timings_and_kv_import_serde_defaults() {
+        let empty_timings: InferenceTimings = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty_timings, InferenceTimings::default());
+        assert_eq!(serde_json::to_string(&empty_timings).unwrap(), "{}");
+
+        let timings = InferenceTimings {
+            predicted_per_second: Some(42.5),
+            prompt_per_second: Some(120.0),
+            predicted_ms: Some(1000.0),
+            prompt_ms: Some(250.0),
+            predicted_n: Some(42),
+            prompt_n: Some(30),
+            cache_n: Some(15),
+        };
+        let encoded = serde_json::to_string(&timings).unwrap();
+        let decoded: InferenceTimings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, timings);
+
+        let empty_import: Ps5LmKvSamplingImport = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty_import, Ps5LmKvSamplingImport::default());
+        assert_eq!(empty_import.raw_source, "");
+        assert_eq!(
+            serde_json::to_value(&empty_import).unwrap(),
+            serde_json::json!({ "raw_source": "" })
+        );
+    }
+
+    #[test]
+    fn legacy_tool_aliases_and_canonical_groups() {
+        let pairs = [
+            ("write_agent_memory", "memory_write"),
+            ("read_agent_memory", "memory_read"),
+            ("delegate_task", "assign_agent_task"),
+            ("agent_message", "send_agent_message"),
+            ("spawn_temp_agent", "request_temporary_specialist"),
+            ("json_parse_format", "json_process"),
+            ("timestamp_time_helper", "datetime"),
+            ("text_transform_summarize_prep", "text_process"),
+        ];
+        for (legacy, canonical) in pairs {
+            assert_eq!(canonical_tool_id(legacy), canonical);
+            assert!(agent_allows_tool_with_policy(
+                &[canonical.to_string()],
+                &[],
+                legacy,
+                "utility"
+            ));
+            assert!(agent_allows_tool_with_policy(
+                &[legacy.to_string()],
+                &[],
+                canonical,
+                "utility"
+            ));
+            assert!(!agent_allows_tool_with_policy(
+                &["*".to_string()],
+                &[legacy.to_string()],
+                canonical,
+                "utility"
+            ));
+        }
+
+        let memory = expand_tool_group("group:memory").unwrap();
+        assert!(memory.contains(&"memory_read"));
+        assert!(memory.contains(&"memory_write"));
+        assert!(!memory.contains(&"read_agent_memory"));
+        assert!(!memory.contains(&"write_agent_memory"));
+
+        let utility = expand_tool_group("group:utility").unwrap();
+        assert!(utility.contains(&"json_process"));
+        assert!(utility.contains(&"datetime"));
+        assert!(utility.contains(&"text_process"));
+        assert!(!utility.contains(&"json_parse_format"));
+        assert!(!utility.contains(&"timestamp_time_helper"));
+        assert!(!utility.contains(&"text_transform_summarize_prep"));
+
+        let openclaw = expand_tool_group("group:openclaw").unwrap();
+        assert!(openclaw.contains(&"memory_read"));
+        assert!(openclaw.contains(&"json_process"));
+        assert!(!openclaw.contains(&"write_agent_memory"));
+        assert!(!openclaw.contains(&"json_parse_format"));
     }
 }

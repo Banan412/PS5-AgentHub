@@ -49,20 +49,43 @@ impl SqliteStorage {
             }
         }
 
-        let conn = match open_and_configure(path, cfg, is_memory) {
-            Ok(c) => c,
-            Err(err) if !is_memory && shm_path.exists() => {
-                ps5_agent_logging::log_warn(
-                    "database",
-                    format!(
-                        "SQLite open/pragma failed ({err}) while {} exists; removing stale SHM and retrying once",
-                        shm_path.display()
-                    ),
-                );
-                let _ = fs::remove_file(&shm_path);
-                open_and_configure(path, cfg, is_memory)?
+        const MAX_OPEN_ATTEMPTS: usize = 5;
+        const OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+
+        let mut shm_removed = false;
+        let mut attempt = 0usize;
+        let conn = loop {
+            attempt += 1;
+            match open_and_configure(path, cfg, is_memory) {
+                Ok(c) => break c,
+                Err(failure) if !is_memory && !shm_removed && shm_path.exists() => {
+                    ps5_agent_logging::log_warn(
+                        "database",
+                        format!(
+                            "SQLite open/pragma failed ({}) while {} exists; removing stale SHM and retrying",
+                            failure.err,
+                            shm_path.display()
+                        ),
+                    );
+                    let _ = fs::remove_file(&shm_path);
+                    shm_removed = true;
+                    if failure.transient && attempt < MAX_OPEN_ATTEMPTS {
+                        std::thread::sleep(OPEN_BACKOFF);
+                    }
+                }
+                Err(failure) if failure.transient && attempt < MAX_OPEN_ATTEMPTS => {
+                    ps5_agent_logging::log_warn(
+                        "database",
+                        format!(
+                            "SQLite open/pragma transient error on attempt {attempt}/{MAX_OPEN_ATTEMPTS} ({}); retrying in {}ms",
+                            failure.err,
+                            OPEN_BACKOFF.as_millis()
+                        ),
+                    );
+                    std::thread::sleep(OPEN_BACKOFF);
+                }
+                Err(failure) => return Err(failure.err),
             }
-            Err(err) => return Err(err),
         };
 
         Ok(Self {
@@ -77,15 +100,61 @@ impl SqliteStorage {
     }
 }
 
-fn open_and_configure(path: &Path, cfg: &DatabaseConfig, is_memory: bool) -> Result<Connection> {
+struct OpenFailure {
+    err: AgentError,
+    transient: bool,
+}
+
+fn is_transient_rusqlite_open_error(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(ffi_err, _)
+            if matches!(
+                ffi_err.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked | ErrorCode::CannotOpen
+            )
+    )
+}
+
+pub(crate) fn is_transient_busy_or_locked_error(err: &AgentError) -> bool {
+    match err {
+        AgentError::Storage(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("database is locked")
+                || lower.contains("database table is locked")
+                || lower.contains("database busy")
+                || lower.contains("database locked")
+                || lower.contains("sqlite_busy")
+                || lower.contains("sqlite_locked")
+        }
+        _ => false,
+    }
+}
+
+fn open_err(ctx: &str, err: rusqlite::Error) -> OpenFailure {
+    OpenFailure {
+        transient: is_transient_rusqlite_open_error(&err),
+        err: AgentError::Storage(format!("{ctx}: {err}")),
+    }
+}
+
+fn open_and_configure(
+    path: &Path,
+    cfg: &DatabaseConfig,
+    is_memory: bool,
+) -> std::result::Result<Connection, OpenFailure> {
     let conn = Connection::open(path)
-        .map_err(|e| AgentError::Storage(format!("opening sqlite {}: {e}", path.display())))?;
-    conn.set_prepared_statement_cache_capacity(64);
+        .map_err(|e| open_err(&format!("opening sqlite {}", path.display()), e))?;
+    conn.set_prepared_statement_cache_capacity(128);
     configure_pragmas(&conn, cfg, is_memory)?;
     Ok(conn)
 }
 
-fn configure_pragmas(conn: &Connection, cfg: &DatabaseConfig, is_memory: bool) -> Result<()> {
+fn configure_pragmas(
+    conn: &Connection,
+    cfg: &DatabaseConfig,
+    is_memory: bool,
+) -> std::result::Result<(), OpenFailure> {
     let cache_kib = -(cfg.cache_size_kb.abs().max(1));
     let effective_wal = cfg.wal_mode && !cfg!(target_vendor = "sie");
     let initial_locking = if !effective_wal && !is_memory {
@@ -101,14 +170,14 @@ fn configure_pragmas(conn: &Connection, cfg: &DatabaseConfig, is_memory: bool) -
          PRAGMA cache_size = {};",
         cfg.busy_timeout_ms, initial_locking, cache_kib
     ))
-    .map_err(|e| AgentError::Storage(format!("applying sqlite pragmas: {e}")))?;
+    .map_err(|e| open_err("applying sqlite pragmas", e))?;
 
     let page_count: i64 = conn
         .query_row("PRAGMA page_count", [], |r| r.get(0))
         .unwrap_or(1);
     if page_count == 0 {
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")
-            .map_err(|e| AgentError::Storage(format!("setting auto_vacuum=INCREMENTAL: {e}")))?;
+            .map_err(|e| open_err("setting auto_vacuum=INCREMENTAL", e))?;
     }
 
     if effective_wal {
@@ -122,7 +191,19 @@ fn configure_pragmas(conn: &Connection, cfg: &DatabaseConfig, is_memory: bool) -
                     format!("SQLite journal_mode=WAL returned '{mode}'; falling back to TRUNCATE"),
                 );
                 conn.execute_batch("PRAGMA journal_mode = TRUNCATE;")
-                    .map_err(|e| AgentError::Storage(format!("fallback TRUNCATE mode: {e}")))?;
+                    .map_err(|e| open_err("fallback TRUNCATE mode", e))?;
+            }
+            Err(err)
+                if matches!(
+                    err,
+                    rusqlite::Error::SqliteFailure(ffi_err, _)
+                        if matches!(
+                            ffi_err.code,
+                            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                        )
+                ) =>
+            {
+                return Err(open_err("setting WAL mode", err));
             }
             Err(err) => {
                 ps5_agent_logging::log_warn(
@@ -130,20 +211,69 @@ fn configure_pragmas(conn: &Connection, cfg: &DatabaseConfig, is_memory: bool) -
                     format!("SQLite journal_mode=WAL failed ({err}); falling back to TRUNCATE"),
                 );
                 conn.execute_batch("PRAGMA journal_mode = TRUNCATE;")
-                    .map_err(|e| AgentError::Storage(format!("fallback TRUNCATE mode: {e}")))?;
+                    .map_err(|e| open_err("fallback TRUNCATE mode", e))?;
             }
         }
     } else {
         conn.execute_batch("PRAGMA journal_mode = TRUNCATE;")
-            .map_err(|e| AgentError::Storage(format!("setting TRUNCATE mode: {e}")))?;
+            .map_err(|e| open_err("setting TRUNCATE mode", e))?;
         if !is_memory {
             conn.execute_batch("PRAGMA locking_mode = NORMAL;")
-                .map_err(|e| AgentError::Storage(format!("restoring locking_mode=NORMAL: {e}")))?;
+                .map_err(|e| open_err("restoring locking_mode=NORMAL", e))?;
             let _ = conn.query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_| Ok(()));
         }
     }
 
     Ok(())
+}
+
+fn exec_cached<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    op: &str,
+) -> Result<usize> {
+    let mut stmt = conn
+        .prepare_cached(sql)
+        .map_err(|e| map_sqlite_err(&format!("prepare {op}"), e))?;
+    stmt.execute(params).map_err(|e| map_sqlite_err(op, e))
+}
+
+fn query_row_cached<T, P, F>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    map_fn: F,
+    op: &str,
+) -> Result<T>
+where
+    P: rusqlite::Params,
+    F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+{
+    let mut stmt = conn
+        .prepare_cached(sql)
+        .map_err(|e| map_sqlite_err(&format!("prepare {op}"), e))?;
+    stmt.query_row(params, map_fn)
+        .map_err(|e| map_sqlite_err(op, e))
+}
+
+fn query_row_optional_cached<T, P, F>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    map_fn: F,
+    op: &str,
+) -> Result<Option<T>>
+where
+    P: rusqlite::Params,
+    F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+{
+    let mut stmt = conn
+        .prepare_cached(sql)
+        .map_err(|e| map_sqlite_err(&format!("prepare {op}"), e))?;
+    stmt.query_row(params, map_fn)
+        .optional()
+        .map_err(|e| map_sqlite_err(op, e))
 }
 
 fn map_sqlite_err(ctx: &str, err: rusqlite::Error) -> AgentError {
@@ -307,6 +437,30 @@ fn row_to_conversation(row: &Row<'_>) -> rusqlite::Result<Conversation> {
     })
 }
 
+const MESSAGE_COLUMNS: &str = "id, conversation_id, role, agent_id, content, reasoning,
+    tool_calls_json, task_id, token_count, latency_ms, archived, created_at,
+    attachments_json, timings_json";
+
+fn encode_message_json_fields(
+    msg: &ChatMessage,
+) -> Result<(Option<String>, Option<String>, Option<i64>)> {
+    let attachments_json = if msg.attachments.is_empty() {
+        None
+    } else {
+        Some(to_json(&msg.attachments, "message.attachments")?)
+    };
+    let timings_json = msg
+        .timings
+        .as_ref()
+        .map(|t| to_json(t, "message.timings"))
+        .transpose()?;
+    let latency_ms = msg
+        .latency_ms
+        .map(|v| to_i64_checked(v, "message.latency_ms"))
+        .transpose()?;
+    Ok((attachments_json, timings_json, latency_ms))
+}
+
 fn row_to_chat_message(row: &Row<'_>) -> rusqlite::Result<ChatMessage> {
     let role_raw: String = row.get(2)?;
     let role = decode_enum_str(&role_raw, "message.role")
@@ -316,6 +470,20 @@ fn row_to_chat_message(row: &Row<'_>) -> rusqlite::Result<ChatMessage> {
         Some(ref raw) if !raw.trim().is_empty() => from_json(raw, "message.attachments")
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e)))?,
         _ => Vec::new(),
+    };
+    let timings_raw: Option<String> = row.get(13)?;
+    let timings: Option<InferenceTimings> = match timings_raw {
+        Some(ref raw) if !raw.trim().is_empty() => match serde_json::from_str(raw) {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                ps5_agent_logging::log_warn(
+                    "database",
+                    format!("Ignoring malformed message.timings JSON: {err}"),
+                );
+                None
+            }
+        },
+        _ => None,
     };
     Ok(ChatMessage {
         id: row.get(0)?,
@@ -331,6 +499,7 @@ fn row_to_chat_message(row: &Row<'_>) -> rusqlite::Result<ChatMessage> {
         archived: row.get::<_, i64>(10)? != 0,
         created_at: row.get(11)?,
         attachments,
+        timings,
     })
 }
 
@@ -583,7 +752,7 @@ impl StorageBackend for SqliteStorage {
             conn.execute_batch("PRAGMA incremental_vacuum;")
                 .map_err(|e| map_sqlite_err("checkpoint incremental_vacuum", e))?;
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize; PRAGMA shrink_memory;")
             .map_err(|e| map_sqlite_err("checkpoint", e))?;
         Ok(())
     }
@@ -596,7 +765,8 @@ impl StorageBackend for SqliteStorage {
         let denied_tools = to_json(&agent.denied_tools, "agent.denied_tools")?;
         let max_duration = to_i64_checked(agent.max_task_duration_secs, "agent.max_task_duration_secs")?;
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO agents (
                 id, name, description, role, role_label, system_prompt,
                 model_config_json, enabled_tools_json, memory_permissions_json,
@@ -653,17 +823,15 @@ impl StorageBackend for SqliteStorage {
                 agent.sandbox_mode,
                 agent.tool_profile,
             ],
-        )
-        .map_err(|e| map_sqlite_err("upsert_agent", e))?;
+            "upsert_agent",
+        )?;
         Ok(())
     }
 
     fn get_agent(&self, agent_id: &str) -> Result<Option<AgentDefinition>> {
         let conn = self.lock_conn()?;
         let sql = format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1");
-        conn.query_row(&sql, params![agent_id], row_to_agent)
-            .optional()
-            .map_err(|e| map_sqlite_err("get_agent", e))
+        query_row_optional_cached(&conn, &sql, params![agent_id], row_to_agent, "get_agent")
     }
 
     fn list_agents(&self) -> Result<Vec<AgentDefinition>> {
@@ -683,16 +851,15 @@ impl StorageBackend for SqliteStorage {
 
     fn delete_agent(&self, agent_id: &str) -> Result<bool> {
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute("DELETE FROM agents WHERE id = ?1", params![agent_id])
-            .map_err(|e| map_sqlite_err("delete_agent", e))?;
+        let changed = exec_cached(&conn, "DELETE FROM agents WHERE id = ?1", params![agent_id], "delete_agent")?;
         Ok(changed > 0)
     }
 
     fn create_conversation(&self, conv: &Conversation) -> Result<()> {
         let mode_json = to_json(&conv.mode, "conversation.mode")?;
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO conversations (id, title, mode_json, created_at, updated_at, archived, sort_order)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -704,21 +871,21 @@ impl StorageBackend for SqliteStorage {
                 i64::from(conv.archived),
                 conv.sort_order,
             ],
-        )
-        .map_err(|e| map_sqlite_err("create_conversation", e))?;
+            "create_conversation",
+        )?;
         Ok(())
     }
 
     fn get_conversation(&self, conv_id: &str) -> Result<Option<Conversation>> {
         let conn = self.lock_conn()?;
-        conn.query_row(
+        query_row_optional_cached(
+            &conn,
             "SELECT id, title, mode_json, created_at, updated_at, archived, sort_order
              FROM conversations WHERE id = ?1",
             params![conv_id],
             row_to_conversation,
+            "get_conversation",
         )
-        .optional()
-        .map_err(|e| map_sqlite_err("get_conversation", e))
     }
 
     fn list_conversations(&self, include_archived: bool) -> Result<Vec<Conversation>> {
@@ -742,9 +909,12 @@ impl StorageBackend for SqliteStorage {
 
     fn delete_conversation(&self, conv_id: &str) -> Result<bool> {
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute("DELETE FROM conversations WHERE id = ?1", params![conv_id])
-            .map_err(|e| map_sqlite_err("delete_conversation", e))?;
+        let changed = exec_cached(
+            &conn,
+            "DELETE FROM conversations WHERE id = ?1",
+            params![conv_id],
+            "delete_conversation",
+        )?;
         Ok(changed > 0)
     }
 
@@ -770,22 +940,15 @@ impl StorageBackend for SqliteStorage {
 
     fn append_chat_message(&self, msg: &ChatMessage) -> Result<()> {
         let role = encode_enum_str(&msg.role, "message.role")?;
-        let attachments_json: Option<String> = if msg.attachments.is_empty() {
-            None
-        } else {
-            Some(to_json(&msg.attachments, "message.attachments")?)
-        };
-        let latency_ms = msg
-            .latency_ms
-            .map(|v| to_i64_checked(v, "message.latency_ms"))
-            .transpose()?;
+        let (attachments_json, timings_json, latency_ms) = encode_message_json_fields(msg)?;
         let conn = self.lock_conn()?;
-        conn.execute(
-            "INSERT INTO messages (
-                id, conversation_id, role, agent_id, content, reasoning,
-                tool_calls_json, task_id, token_count, latency_ms, archived, created_at,
-                attachments_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        let sql = format!(
+            "INSERT INTO messages ({MESSAGE_COLUMNS})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+        );
+        exec_cached(
+            &conn,
+            &sql,
             params![
                 msg.id,
                 msg.conversation_id,
@@ -800,9 +963,10 @@ impl StorageBackend for SqliteStorage {
                 i64::from(msg.archived),
                 msg.created_at,
                 attachments_json,
+                timings_json,
             ],
-        )
-        .map_err(|e| map_sqlite_err("append_chat_message", e))?;
+            "append_chat_message",
+        )?;
         Ok(())
     }
 
@@ -817,36 +981,32 @@ impl StorageBackend for SqliteStorage {
         }
         let conn = self.lock_conn()?;
         let sql = if include_archived {
-            "SELECT id, conversation_id, role, agent_id, content, reasoning,
-                    tool_calls_json, task_id, token_count, latency_ms, archived, created_at,
-                    attachments_json
-             FROM (
-                SELECT id, conversation_id, role, agent_id, content, reasoning,
-                       tool_calls_json, task_id, token_count, latency_ms, archived, created_at,
-                       attachments_json, rowid AS _seq
-                FROM messages
-                WHERE conversation_id = ?1
-                ORDER BY created_at DESC, rowid DESC
-                LIMIT ?2
-             )
-             ORDER BY created_at ASC, _seq ASC"
+            format!(
+                "SELECT {MESSAGE_COLUMNS}
+                 FROM (
+                    SELECT {MESSAGE_COLUMNS}, rowid AS _seq
+                    FROM messages
+                    WHERE conversation_id = ?1
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?2
+                 )
+                 ORDER BY created_at ASC, _seq ASC"
+            )
         } else {
-            "SELECT id, conversation_id, role, agent_id, content, reasoning,
-                    tool_calls_json, task_id, token_count, latency_ms, archived, created_at,
-                    attachments_json
-             FROM (
-                SELECT id, conversation_id, role, agent_id, content, reasoning,
-                       tool_calls_json, task_id, token_count, latency_ms, archived, created_at,
-                       attachments_json, rowid AS _seq
-                FROM messages
-                WHERE conversation_id = ?1 AND archived = 0
-                ORDER BY created_at DESC, rowid DESC
-                LIMIT ?2
-             )
-             ORDER BY created_at ASC, _seq ASC"
+            format!(
+                "SELECT {MESSAGE_COLUMNS}
+                 FROM (
+                    SELECT {MESSAGE_COLUMNS}, rowid AS _seq
+                    FROM messages
+                    WHERE conversation_id = ?1 AND archived = 0
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?2
+                 )
+                 ORDER BY created_at ASC, _seq ASC"
+            )
         };
         let mut stmt = conn
-            .prepare_cached(sql)
+            .prepare_cached(&sql)
             .map_err(|e| map_sqlite_err("prepare list_chat_messages", e))?;
         let rows = stmt
             .query_map(params![conv_id, clamp_limit(limit)], row_to_chat_message)
@@ -862,16 +1022,15 @@ impl StorageBackend for SqliteStorage {
         }
         let pattern = format!("%{}%", escape_like_pattern(&trimmed.to_lowercase()));
         let conn = self.lock_conn()?;
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS}
+             FROM messages
+             WHERE LOWER(content) LIKE ?1 ESCAPE '\\'
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT ?2"
+        );
         let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, conversation_id, role, agent_id, content, reasoning,
-                        tool_calls_json, task_id, token_count, latency_ms, archived, created_at,
-                        attachments_json
-                 FROM messages
-                 WHERE LOWER(content) LIKE ?1 ESCAPE '\\'
-                 ORDER BY created_at DESC, rowid DESC
-                 LIMIT ?2",
-            )
+            .prepare_cached(&sql)
             .map_err(|e| map_sqlite_err("prepare search_chat_messages", e))?;
         let rows = stmt
             .query_map(params![pattern, clamp_limit(limit)], row_to_chat_message)
@@ -882,82 +1041,65 @@ impl StorageBackend for SqliteStorage {
 
     fn archive_old_chat_messages(&self, conv_id: &str, keep_recent: usize) -> Result<usize> {
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute(
-                "UPDATE messages
-                 SET archived = 1
-                 WHERE conversation_id = ?1
-                   AND archived = 0
-                   AND id NOT IN (
-                       SELECT id FROM messages
-                       WHERE conversation_id = ?1 AND archived = 0
-                       ORDER BY created_at DESC, rowid DESC
-                       LIMIT ?2
-                   )",
-                params![conv_id, clamp_limit(keep_recent)],
-            )
-            .map_err(|e| map_sqlite_err("archive_old_chat_messages", e))?;
-        Ok(changed)
+        exec_cached(
+            &conn,
+            "UPDATE messages
+             SET archived = 1
+             WHERE conversation_id = ?1
+               AND archived = 0
+               AND id NOT IN (
+                   SELECT id FROM messages
+                   WHERE conversation_id = ?1 AND archived = 0
+                   ORDER BY created_at DESC, rowid DESC
+                   LIMIT ?2
+               )",
+            params![conv_id, clamp_limit(keep_recent)],
+            "archive_old_chat_messages",
+        )
     }
 
     fn get_chat_message(&self, msg_id: &str) -> Result<Option<ChatMessage>> {
         let conn = self.lock_conn()?;
-        conn.query_row(
-            "SELECT id, conversation_id, role, agent_id, content, reasoning,
-                    tool_calls_json, task_id, token_count, latency_ms, archived, created_at,
-                    attachments_json
-             FROM messages WHERE id = ?1",
-            params![msg_id],
-            row_to_chat_message,
-        )
-        .optional()
-        .map_err(|e| map_sqlite_err("get_chat_message", e))
+        let sql = format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE id = ?1");
+        query_row_optional_cached(&conn, &sql, params![msg_id], row_to_chat_message, "get_chat_message")
     }
 
     fn update_chat_message(&self, msg: &ChatMessage) -> Result<bool> {
-        let attachments_json: Option<String> = if msg.attachments.is_empty() {
-            None
-        } else {
-            Some(to_json(&msg.attachments, "message.attachments")?)
-        };
-        let latency_ms = msg
-            .latency_ms
-            .map(|v| to_i64_checked(v, "message.latency_ms"))
-            .transpose()?;
+        let (attachments_json, timings_json, latency_ms) = encode_message_json_fields(msg)?;
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute(
-                "UPDATE messages
-                 SET content = ?2,
-                     reasoning = ?3,
-                     tool_calls_json = ?4,
-                     task_id = ?5,
-                     token_count = ?6,
-                     latency_ms = ?7,
-                     archived = ?8,
-                     attachments_json = ?9
-                 WHERE id = ?1",
-                params![
-                    msg.id,
-                    msg.content,
-                    msg.reasoning,
-                    msg.tool_calls_json,
-                    msg.task_id,
-                    i64::from(msg.token_count),
-                    latency_ms,
-                    i64::from(msg.archived),
-                    attachments_json,
-                ],
-            )
-            .map_err(|e| map_sqlite_err("update_chat_message", e))?;
+        let changed = exec_cached(
+            &conn,
+            "UPDATE messages
+             SET content = ?2,
+                 reasoning = ?3,
+                 tool_calls_json = ?4,
+                 task_id = ?5,
+                 token_count = ?6,
+                 latency_ms = ?7,
+                 archived = ?8,
+                 attachments_json = ?9,
+                 timings_json = ?10
+             WHERE id = ?1",
+            params![
+                msg.id,
+                msg.content,
+                msg.reasoning,
+                msg.tool_calls_json,
+                msg.task_id,
+                i64::from(msg.token_count),
+                latency_ms,
+                i64::from(msg.archived),
+                attachments_json,
+                timings_json,
+            ],
+            "update_chat_message",
+        )?;
         Ok(changed > 0)
     }
 
     fn delete_chat_message(&self, msg_id: &str) -> Result<bool> {
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute("DELETE FROM messages WHERE id = ?1", params![msg_id])
-            .map_err(|e| map_sqlite_err("delete_chat_message", e))?;
+        let changed = exec_cached(&conn, "DELETE FROM messages WHERE id = ?1", params![msg_id], "delete_chat_message")?;
         Ok(changed > 0)
     }
 
@@ -968,14 +1110,13 @@ impl StorageBackend for SqliteStorage {
         inclusive: bool,
     ) -> Result<usize> {
         let conn = self.lock_conn()?;
-        let anchor_row: Option<(String, i64)> = conn
-            .query_row(
-                "SELECT created_at, rowid FROM messages WHERE id = ?1 AND conversation_id = ?2",
-                params![anchor_msg_id, conversation_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| map_sqlite_err("find anchor message for delete_chat_messages_after", e))?;
+        let anchor_row: Option<(String, i64)> = query_row_optional_cached(
+            &conn,
+            "SELECT created_at, rowid FROM messages WHERE id = ?1 AND conversation_id = ?2",
+            params![anchor_msg_id, conversation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+            "find anchor message for delete_chat_messages_after",
+        )?;
         let Some((anchor_ts, anchor_rowid)) = anchor_row else {
             return Ok(0);
         };
@@ -988,16 +1129,19 @@ impl StorageBackend for SqliteStorage {
              WHERE conversation_id = ?1
                AND (created_at > ?2 OR (created_at = ?2 AND rowid > ?3))"
         };
-        let changed = conn
-            .execute(sql, params![conversation_id, anchor_ts, anchor_rowid])
-            .map_err(|e| map_sqlite_err("delete_chat_messages_after", e))?;
-        Ok(changed)
+        exec_cached(
+            &conn,
+            sql,
+            params![conversation_id, anchor_ts, anchor_rowid],
+            "delete_chat_messages_after",
+        )
     }
 
     fn upsert_task(&self, task: &TaskRecord) -> Result<()> {
         let status = encode_enum_str(&task.status, "task.status")?;
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO tasks (
                 id, conversation_id, user_request, assigned_agent_id, parent_task_id,
                 priority, created_at, started_at, completed_at, status, result, error_info,
@@ -1035,23 +1179,23 @@ impl StorageBackend for SqliteStorage {
                 i64::from(task.progress_pct),
                 task.progress_note,
             ],
-        )
-        .map_err(|e| map_sqlite_err("upsert_task", e))?;
+            "upsert_task",
+        )?;
         Ok(())
     }
 
     fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>> {
         let conn = self.lock_conn()?;
-        conn.query_row(
+        query_row_optional_cached(
+            &conn,
             "SELECT id, conversation_id, user_request, assigned_agent_id, parent_task_id,
                     priority, created_at, started_at, completed_at, status, result, error_info,
                     has_side_effects, progress_pct, progress_note
              FROM tasks WHERE id = ?1",
             params![task_id],
             row_to_task,
+            "get_task",
         )
-        .optional()
-        .map_err(|e| map_sqlite_err("get_task", e))
     }
 
     fn list_tasks(&self, limit: usize) -> Result<Vec<TaskRecord>> {
@@ -1194,7 +1338,8 @@ impl StorageBackend for SqliteStorage {
 
     fn append_task_event(&self, event: &TaskEvent) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO task_events (id, task_id, timestamp, event_type, details)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1204,8 +1349,8 @@ impl StorageBackend for SqliteStorage {
                 event.event_type,
                 event.details,
             ],
-        )
-        .map_err(|e| map_sqlite_err("append_task_event", e))?;
+            "append_task_event",
+        )?;
         Ok(())
     }
 
@@ -1238,7 +1383,8 @@ impl StorageBackend for SqliteStorage {
         let msg_type = encode_enum_str(&msg.message_type, "agent_message.message_type")?;
         let status = encode_enum_str(&msg.status, "agent_message.status")?;
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO agent_messages (
                 id, sender_agent_id, recipient_agent_id, task_id, timestamp,
                 message_type, content, status, hop_count
@@ -1254,20 +1400,20 @@ impl StorageBackend for SqliteStorage {
                 status,
                 i64::from(msg.hop_count),
             ],
-        )
-        .map_err(|e| map_sqlite_err("append_agent_message", e))?;
+            "append_agent_message",
+        )?;
         Ok(())
     }
 
     fn update_agent_message_status(&self, msg_id: &str, status: DeliveryStatus) -> Result<()> {
         let status_str = encode_enum_str(&status, "agent_message.status")?;
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute(
-                "UPDATE agent_messages SET status = ?2 WHERE id = ?1",
-                params![msg_id, status_str],
-            )
-            .map_err(|e| map_sqlite_err("update_agent_message_status", e))?;
+        let changed = exec_cached(
+            &conn,
+            "UPDATE agent_messages SET status = ?2 WHERE id = ?1",
+            params![msg_id, status_str],
+            "update_agent_message_status",
+        )?;
         if changed == 0 {
             return Err(AgentError::NotFound(format!(
                 "agent message '{msg_id}' not found"
@@ -1306,13 +1452,13 @@ impl StorageBackend for SqliteStorage {
 
     fn count_task_agent_messages(&self, task_id: &str) -> Result<u32> {
         let conn = self.lock_conn()?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM agent_messages WHERE task_id = ?1",
-                params![task_id],
-                |r| r.get(0),
-            )
-            .map_err(|e| map_sqlite_err("count_task_agent_messages", e))?;
+        let count: i64 = query_row_cached(
+            &conn,
+            "SELECT COUNT(*) FROM agent_messages WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+            "count_task_agent_messages",
+        )?;
         Ok(clamp_u32(count))
     }
 
@@ -1320,7 +1466,8 @@ impl StorageBackend for SqliteStorage {
         let scope = encode_enum_str(&item.scope, "memory.scope")?;
         let tags = to_json(&item.tags, "memory.tags")?;
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO memories (
                 id, scope, namespace, owner_agent_id, conversation_id, task_id,
                 key, content, summary, importance, tags_json, archived, created_at, updated_at
@@ -1355,8 +1502,8 @@ impl StorageBackend for SqliteStorage {
                 item.created_at,
                 item.updated_at,
             ],
-        )
-        .map_err(|e| map_sqlite_err("upsert_memory", e))?;
+            "upsert_memory",
+        )?;
         Ok(())
     }
 
@@ -1407,34 +1554,31 @@ impl StorageBackend for SqliteStorage {
 
     fn delete_memory(&self, memory_id: &str) -> Result<bool> {
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute("DELETE FROM memories WHERE id = ?1", params![memory_id])
-            .map_err(|e| map_sqlite_err("delete_memory", e))?;
+        let changed = exec_cached(&conn, "DELETE FROM memories WHERE id = ?1", params![memory_id], "delete_memory")?;
         Ok(changed > 0)
     }
 
     fn delete_agent_memories(&self, agent_id: &str) -> Result<usize> {
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute(
-                "DELETE FROM memories WHERE owner_agent_id = ?1",
-                params![agent_id],
-            )
-            .map_err(|e| map_sqlite_err("delete_agent_memories", e))?;
-        Ok(changed)
+        exec_cached(
+            &conn,
+            "DELETE FROM memories WHERE owner_agent_id = ?1",
+            params![agent_id],
+            "delete_agent_memories",
+        )
     }
 
     fn memory_stats_for_agent(&self, agent_id: &str) -> Result<(u64, u64)> {
         let conn = self.lock_conn()?;
-        let (count, bytes): (i64, i64) = conn
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
-                 FROM memories
-                 WHERE owner_agent_id = ?1",
-                params![agent_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map_err(|e| map_sqlite_err("memory_stats_for_agent", e))?;
+        let (count, bytes): (i64, i64) = query_row_cached(
+            &conn,
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
+             FROM memories
+             WHERE owner_agent_id = ?1 AND archived = 0",
+            params![agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+            "memory_stats_for_agent",
+        )?;
         Ok((clamp_u64(count), clamp_u64(bytes)))
     }
 
@@ -1444,7 +1588,8 @@ impl StorageBackend for SqliteStorage {
         let perms_json = to_json(&spec.required_permissions, "tool.required_permissions")?;
         let timeout_secs = to_i64_checked(spec.timeout_secs, "tool.timeout_secs")?;
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO tool_registry (
                 id, name, category, description, input_schema_json, output_schema_json,
                 required_permissions_json, requires_approval, is_mutating, enabled, timeout_secs
@@ -1473,8 +1618,8 @@ impl StorageBackend for SqliteStorage {
                 i64::from(spec.enabled),
                 timeout_secs,
             ],
-        )
-        .map_err(|e| map_sqlite_err("upsert_tool_spec", e))?;
+            "upsert_tool_spec",
+        )?;
         Ok(())
     }
 
@@ -1497,16 +1642,15 @@ impl StorageBackend for SqliteStorage {
 
     fn delete_tool_spec(&self, tool_id: &str) -> Result<bool> {
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute("DELETE FROM tool_registry WHERE id = ?1", params![tool_id])
-            .map_err(|e| map_sqlite_err("delete_tool_spec", e))?;
+        let changed = exec_cached(&conn, "DELETE FROM tool_registry WHERE id = ?1", params![tool_id], "delete_tool_spec")?;
         Ok(changed > 0)
     }
 
     fn record_tool_execution(&self, rec: &ToolExecutionRecord) -> Result<()> {
         let duration_ms = to_i64_checked(rec.duration_ms, "tool_execution.duration_ms")?;
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO tool_executions (
                 id, tool_id, agent_id, task_id, input_json, output_json,
                 success, error, duration_ms, created_at
@@ -1523,8 +1667,8 @@ impl StorageBackend for SqliteStorage {
                 duration_ms,
                 rec.created_at,
             ],
-        )
-        .map_err(|e| map_sqlite_err("record_tool_execution", e))?;
+            "record_tool_execution",
+        )?;
         Ok(())
     }
 
@@ -1556,26 +1700,27 @@ impl StorageBackend for SqliteStorage {
 
     fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let conn = self.lock_conn()?;
-        conn.query_row(
+        query_row_optional_cached(
+            &conn,
             "SELECT value FROM settings WHERE key = ?1",
             params![key],
             |r| r.get(0),
+            "get_setting",
         )
-        .optional()
-        .map_err(|e| map_sqlite_err("get_setting", e))
     }
 
     fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO settings (key, value, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value,
                 updated_at = excluded.updated_at",
             params![key, value, now_iso()],
-        )
-        .map_err(|e| map_sqlite_err("set_setting", e))?;
+            "set_setting",
+        )?;
         Ok(())
     }
 
@@ -1593,7 +1738,8 @@ impl StorageBackend for SqliteStorage {
 
     fn create_session(&self, sess: &SessionRecord) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO sessions (
                 id, token_sha256, csrf_token, username, client_ip,
                 created_at, expires_at, revoked
@@ -1608,31 +1754,32 @@ impl StorageBackend for SqliteStorage {
                 sess.expires_at,
                 i64::from(sess.revoked),
             ],
-        )
-        .map_err(|e| map_sqlite_err("create_session", e))?;
+            "create_session",
+        )?;
         Ok(())
     }
 
     fn get_session_by_hash(&self, token_sha256: &str) -> Result<Option<SessionRecord>> {
         let conn = self.lock_conn()?;
-        conn.query_row(
+        query_row_optional_cached(
+            &conn,
             "SELECT id, token_sha256, csrf_token, username, client_ip,
                     created_at, expires_at, revoked
              FROM sessions WHERE token_sha256 = ?1",
             params![token_sha256],
             row_to_session,
+            "get_session_by_hash",
         )
-        .optional()
-        .map_err(|e| map_sqlite_err("get_session_by_hash", e))
     }
 
     fn revoke_session(&self, session_id: &str) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "UPDATE sessions SET revoked = 1 WHERE id = ?1",
             params![session_id],
-        )
-        .map_err(|e| map_sqlite_err("revoke_session", e))?;
+            "revoke_session",
+        )?;
         Ok(())
     }
 
@@ -1689,7 +1836,8 @@ impl StorageBackend for SqliteStorage {
     fn upsert_approval(&self, approval: &ApprovalRecord) -> Result<()> {
         let status = encode_enum_str(&approval.status, "approval.status")?;
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO approvals (
                 id, task_id, agent_id, operation, tool_id, arguments_json,
                 reason, status, created_at, resolved_at, resolved_by
@@ -1718,22 +1866,22 @@ impl StorageBackend for SqliteStorage {
                 approval.resolved_at,
                 approval.resolved_by,
             ],
-        )
-        .map_err(|e| map_sqlite_err("upsert_approval", e))?;
+            "upsert_approval",
+        )?;
         Ok(())
     }
 
     fn get_approval(&self, approval_id: &str) -> Result<Option<ApprovalRecord>> {
         let conn = self.lock_conn()?;
-        conn.query_row(
+        query_row_optional_cached(
+            &conn,
             "SELECT id, task_id, agent_id, operation, tool_id, arguments_json,
                     reason, status, created_at, resolved_at, resolved_by
              FROM approvals WHERE id = ?1",
             params![approval_id],
             row_to_approval,
+            "get_approval",
         )
-        .optional()
-        .map_err(|e| map_sqlite_err("get_approval", e))
     }
 
     fn list_approvals(&self, pending_only: bool, limit: usize) -> Result<Vec<ApprovalRecord>> {
@@ -1767,7 +1915,8 @@ impl StorageBackend for SqliteStorage {
 
     fn append_audit_log(&self, entry: &AuditLogEntry) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO audit_logs (
                 id, timestamp, actor, action, target, severity, outcome, details_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1781,8 +1930,8 @@ impl StorageBackend for SqliteStorage {
                 entry.outcome,
                 entry.details_json,
             ],
-        )
-        .map_err(|e| map_sqlite_err("append_audit_log", e))?;
+            "append_audit_log",
+        )?;
         Ok(())
     }
 
@@ -2112,7 +2261,7 @@ impl StorageBackend for SqliteStorage {
         tx.commit()
             .map_err(|e| map_sqlite_err("commit prune_old_records", e))?;
 
-        conn.execute_batch("PRAGMA incremental_vacuum(64);")
+        conn.execute_batch("PRAGMA incremental_vacuum(64); PRAGMA shrink_memory;")
             .map_err(|e| map_sqlite_err("prune incremental_vacuum", e))?;
 
         Ok(report)
@@ -2136,7 +2285,8 @@ impl StorageBackend for SqliteStorage {
         let updated_at = format_dt(&schedule.updated_at);
 
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO schedules (
                 id, title, prompt, target_agent_id, conversation_id, kind,
                 run_at, interval_secs, daily_time, cron_expr, timezone_offset_mins,
@@ -2190,17 +2340,15 @@ impl StorageBackend for SqliteStorage {
                 created_at,
                 updated_at,
             ],
-        )
-        .map_err(|e| map_sqlite_err("upsert_schedule", e))?;
+            "upsert_schedule",
+        )?;
         Ok(())
     }
 
     fn get_schedule(&self, id: &str) -> Result<Option<ScheduleRecord>> {
         let conn = self.lock_conn()?;
         let sql = format!("SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id = ?1");
-        conn.query_row(&sql, params![id], row_to_schedule)
-            .optional()
-            .map_err(|e| map_sqlite_err("get_schedule", e))
+        query_row_optional_cached(&conn, &sql, params![id], row_to_schedule, "get_schedule")
     }
 
     fn list_schedules(&self, limit: usize) -> Result<Vec<ScheduleRecord>> {
@@ -2232,8 +2380,7 @@ impl StorageBackend for SqliteStorage {
 
     fn delete_schedule(&self, id: &str) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute("DELETE FROM schedules WHERE id = ?1", params![id])
-            .map_err(|e| map_sqlite_err("delete_schedule", e))?;
+        exec_cached(&conn, "DELETE FROM schedules WHERE id = ?1", params![id], "delete_schedule")?;
         Ok(())
     }
 
@@ -2255,15 +2402,14 @@ impl StorageBackend for SqliteStorage {
     fn get_webhook(&self, id: &str) -> Result<Option<WebhookRecord>> {
         let conn = self.lock_conn()?;
         let sql = format!("SELECT {WEBHOOK_COLUMNS} FROM webhooks WHERE id = ?1");
-        conn.query_row(&sql, params![id], row_to_webhook)
-            .optional()
-            .map_err(|e| map_sqlite_err("get_webhook", e))
+        query_row_optional_cached(&conn, &sql, params![id], row_to_webhook, "get_webhook")
     }
 
     fn upsert_webhook(&self, hook: &WebhookRecord) -> Result<()> {
         let trigger_count = to_i64_checked(hook.trigger_count, "webhook.trigger_count")?;
         let conn = self.lock_conn()?;
-        conn.execute(
+        exec_cached(
+            &conn,
             "INSERT INTO webhooks (
                 id, name, enabled, secret_hash, secret_prefix, target_agent_id,
                 conversation_id, prompt_template, created_at, updated_at,
@@ -2295,16 +2441,14 @@ impl StorageBackend for SqliteStorage {
                 hook.last_triggered_at,
                 trigger_count,
             ],
-        )
-        .map_err(|e| map_sqlite_err("upsert_webhook", e))?;
+            "upsert_webhook",
+        )?;
         Ok(())
     }
 
     fn delete_webhook(&self, id: &str) -> Result<bool> {
         let conn = self.lock_conn()?;
-        let changed = conn
-            .execute("DELETE FROM webhooks WHERE id = ?1", params![id])
-            .map_err(|e| map_sqlite_err("delete_webhook", e))?;
+        let changed = exec_cached(&conn, "DELETE FROM webhooks WHERE id = ?1", params![id], "delete_webhook")?;
         Ok(changed > 0)
     }
 }
@@ -2467,7 +2611,23 @@ mod tests {
                 .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(ver, crate::CURRENT_SCHEMA_VERSION);
-            assert_eq!(ver, 5);
+            assert_eq!(ver, 6);
+            let msg_timings_col_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name = 'timings_json')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(msg_timings_col_exists);
+            let msg_conv_idx_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_conv_created')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(msg_conv_idx_exists);
             let schedules_table_exists: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schedules')",
@@ -2552,6 +2712,7 @@ mod tests {
                 archived: false,
                 created_at: "2026-11-13T10:00:00Z".to_string(),
                 attachments: vec![att.clone()],
+                timings: None,
             })
             .unwrap();
         storage
@@ -2569,6 +2730,7 @@ mod tests {
                 archived: true,
                 created_at: "2026-11-13T10:00:01Z".to_string(),
                 attachments: Vec::new(),
+                timings: None,
             })
             .unwrap();
 
@@ -2741,6 +2903,7 @@ mod tests {
                 archived: true,
                 created_at: old_ts.to_string(),
                 attachments: Vec::new(),
+                timings: None,
             })
             .unwrap();
         storage
@@ -2758,6 +2921,7 @@ mod tests {
                 archived: false,
                 created_at: old_ts.to_string(),
                 attachments: Vec::new(),
+                timings: None,
             })
             .unwrap();
 
@@ -3172,11 +3336,11 @@ mod tests {
         assert!(got2.sandbox_mode.is_none());
         assert!(got2.tool_profile.is_none());
 
-        // Simulate a DB whose agents table already has v5 columns before schema_migrations records v5.
+        // Simulate a DB whose agents/messages tables already have v5/v6 columns before schema_migrations records them.
         {
             let conn = storage.lock_conn().unwrap();
             conn.execute_batch(
-                "DELETE FROM schema_migrations WHERE version = 5;
+                "DELETE FROM schema_migrations WHERE version >= 5;
                  DROP TABLE IF EXISTS webhooks;",
             )
             .unwrap();
@@ -3189,7 +3353,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(ver, 5);
+        assert_eq!(ver, 6);
         let got_after = storage.get_agent("agent-policy").unwrap().unwrap();
         assert_eq!(got_after.denied_tools, agent.denied_tools);
         assert_eq!(got_after.sandbox_mode, agent.sandbox_mode);
@@ -3449,6 +3613,7 @@ mod tests {
                 archived: false,
                 created_at: old_ts.to_string(),
                 attachments: Vec::new(),
+                timings: None,
             })
             .unwrap();
         storage
@@ -3466,6 +3631,7 @@ mod tests {
                 archived: true,
                 created_at: fresh_ts.clone(),
                 attachments: Vec::new(),
+                timings: None,
             })
             .unwrap();
 
@@ -3580,6 +3746,7 @@ mod tests {
                     archived: false,
                     created_at: "2026-11-13T10:00:01Z".to_string(),
                     attachments: Vec::new(),
+                    timings: None,
                 })
                 .unwrap();
 
@@ -3617,5 +3784,203 @@ mod tests {
         let post_hits = recovered.search_chat_messages("  NEEDLE ", 10).unwrap();
         assert_eq!(post_hits.len(), 1);
         assert_eq!(recovered.integrity_check().unwrap(), "ok");
+    }
+
+    #[test]
+    fn message_timings_roundtrip_update_and_malformed_json_fallback() {
+        let storage = SqliteStorage::open(Path::new(":memory:"), &DatabaseConfig::default()).unwrap();
+        storage.run_migrations().unwrap();
+        storage
+            .create_conversation(&Conversation {
+                id: "c-timings".to_string(),
+                title: "Timings".to_string(),
+                mode: ConversationMode::Direct {
+                    agent_id: "commander".to_string(),
+                },
+                created_at: "2026-11-14T10:00:00Z".to_string(),
+                updated_at: "2026-11-14T10:00:00Z".to_string(),
+                archived: false,
+                sort_order: 0,
+            })
+            .unwrap();
+
+        let t1 = InferenceTimings {
+            predicted_per_second: Some(33.3),
+            prompt_per_second: Some(150.5),
+            predicted_ms: Some(900.0),
+            prompt_ms: Some(120.0),
+            predicted_n: Some(30),
+            prompt_n: Some(18),
+            cache_n: Some(6),
+        };
+        let mut msg = ChatMessage {
+            id: "m-timings".to_string(),
+            conversation_id: "c-timings".to_string(),
+            role: ChatRole::Assistant,
+            agent_id: Some("commander".to_string()),
+            content: "measured response".to_string(),
+            reasoning: None,
+            tool_calls_json: None,
+            task_id: None,
+            token_count: 30,
+            latency_ms: Some(1020),
+            archived: false,
+            created_at: "2026-11-14T10:00:01Z".to_string(),
+            attachments: Vec::new(),
+            timings: Some(t1.clone()),
+        };
+        storage.append_chat_message(&msg).unwrap();
+
+        assert_eq!(
+            storage.get_chat_message("m-timings").unwrap().unwrap().timings,
+            Some(t1.clone())
+        );
+        assert_eq!(
+            storage.list_chat_messages("c-timings", false, 10).unwrap()[0].timings,
+            Some(t1.clone())
+        );
+        assert_eq!(
+            storage.search_chat_messages("measured", 10).unwrap()[0].timings,
+            Some(t1)
+        );
+
+        let t2 = InferenceTimings {
+            predicted_per_second: Some(45.0),
+            prompt_per_second: None,
+            predicted_ms: Some(444.0),
+            prompt_ms: None,
+            predicted_n: Some(20),
+            prompt_n: None,
+            cache_n: None,
+        };
+        msg.timings = Some(t2.clone());
+        assert!(storage.update_chat_message(&msg).unwrap());
+        assert_eq!(
+            storage.get_chat_message("m-timings").unwrap().unwrap().timings,
+            Some(t2)
+        );
+
+        msg.timings = None;
+        assert!(storage.update_chat_message(&msg).unwrap());
+        assert!(storage
+            .get_chat_message("m-timings")
+            .unwrap()
+            .unwrap()
+            .timings
+            .is_none());
+
+        {
+            let conn = storage.lock_conn().unwrap();
+            conn.execute(
+                "UPDATE messages SET timings_json = '{not valid json' WHERE id = 'm-timings'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .get_chat_message("m-timings")
+            .unwrap()
+            .unwrap()
+            .timings
+            .is_none());
+
+        {
+            let conn = storage.lock_conn().unwrap();
+            conn.execute(
+                "UPDATE messages SET timings_json = '   ' WHERE id = 'm-timings'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .get_chat_message("m-timings")
+            .unwrap()
+            .unwrap()
+            .timings
+            .is_none());
+    }
+
+    #[test]
+    fn memory_stats_excludes_archived_memories() {
+        let storage = SqliteStorage::open(Path::new(":memory:"), &DatabaseConfig::default()).unwrap();
+        storage.run_migrations().unwrap();
+
+        storage
+            .upsert_memory(&MemoryItem {
+                id: "mem-active".to_string(),
+                scope: MemoryScope::Agent,
+                namespace: "default".to_string(),
+                owner_agent_id: Some("agent-stats".to_string()),
+                conversation_id: None,
+                task_id: None,
+                key: "active".to_string(),
+                content: "hello".to_string(),
+                summary: None,
+                importance: 5,
+                tags: Vec::new(),
+                archived: false,
+                created_at: "2026-11-14T10:00:00Z".to_string(),
+                updated_at: "2026-11-14T10:00:00Z".to_string(),
+            })
+            .unwrap();
+        storage
+            .upsert_memory(&MemoryItem {
+                id: "mem-arch".to_string(),
+                scope: MemoryScope::Agent,
+                namespace: "default".to_string(),
+                owner_agent_id: Some("agent-stats".to_string()),
+                conversation_id: None,
+                task_id: None,
+                key: "archived".to_string(),
+                content: "archived payload ignored".to_string(),
+                summary: None,
+                importance: 5,
+                tags: Vec::new(),
+                archived: true,
+                created_at: "2026-11-14T10:00:01Z".to_string(),
+                updated_at: "2026-11-14T10:00:01Z".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(storage.memory_stats_for_agent("agent-stats").unwrap(), (1, 5));
+    }
+
+    #[test]
+    fn sqlite_open_retries_transient_busy_then_succeeds() {
+        let dir = TempDir::new("ps5-db-sqlite-busy-retry");
+        let db_path = dir.0.join("retry.db");
+        let cfg = DatabaseConfig {
+            driver: "sqlite".to_string(),
+            path: db_path.clone(),
+            busy_timeout_ms: 0,
+            cache_size_kb: 4000,
+            wal_mode: false,
+            ..DatabaseConfig::default()
+        };
+
+        {
+            let init = SqliteStorage::open(&db_path, &cfg).unwrap();
+            init.run_migrations().unwrap();
+            init.set_setting("retry_key", "ok").unwrap();
+        }
+
+        let lock_conn = rusqlite::Connection::open(&db_path).unwrap();
+        lock_conn
+            .execute_batch(
+                "PRAGMA locking_mode = EXCLUSIVE;
+                 BEGIN EXCLUSIVE;
+                 INSERT INTO settings (key, value, updated_at) VALUES ('_tmp', '1', '2026-11-14T00:00:00Z');",
+            )
+            .unwrap();
+
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(220));
+            let _ = lock_conn.execute_batch("ROLLBACK;");
+            drop(lock_conn);
+        });
+
+        let reopened = SqliteStorage::open(&db_path, &cfg).expect("open should succeed after brief lock releases");
+        holder.join().unwrap();
+        assert_eq!(reopened.get_setting("retry_key").unwrap().as_deref(), Some("ok"));
     }
 }

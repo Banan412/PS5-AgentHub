@@ -449,18 +449,47 @@ pub fn builtin_tool_specs(default_timeout_secs: u64) -> Vec<ToolSpec> {
         spec(
             "browser",
             "web",
-            "Control a stateful pure-Rust sandbox browser session (open, snapshot, click, fill, submit, back, links, download, save_snapshot, sessions, close).",
+            "Control a stateful pure-Rust sandbox browser session (open, navigate, snapshot, text, hover, scroll, click, fill, submit, back, links, download, save_snapshot, sessions, close).",
             json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["open", "navigate", "snapshot", "click", "fill", "submit", "back", "links", "download", "save_snapshot", "sessions", "close"]
+                        "enum": [
+                            "open",
+                            "navigate",
+                            "snapshot",
+                            "text",
+                            "hover",
+                            "scroll",
+                            "click",
+                            "fill",
+                            "submit",
+                            "back",
+                            "links",
+                            "download",
+                            "save_snapshot",
+                            "sessions",
+                            "close"
+                        ]
                     },
                     "session_id": { "type": "string" },
                     "url": { "type": "string" },
                     "ref": { "type": "string", "description": "Element ref ID such as e1 from snapshot" },
                     "value": { "type": "string" },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["up", "down", "top", "bottom"],
+                        "description": "Scroll direction for scroll action"
+                    },
+                    "y_pct": {
+                        "type": "number",
+                        "description": "Target vertical scroll percentage (0..100) for scroll action"
+                    },
+                    "amount": {
+                        "type": "number",
+                        "description": "Scroll step percentage (0..100, default 25) for scroll up/down"
+                    },
                     "filename": { "type": "string" },
                     "name": { "type": "string" }
                 },

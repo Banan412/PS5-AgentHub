@@ -331,6 +331,80 @@ fn try_open_sqlite_checked(
     Ok(wrapped)
 }
 
+fn open_auto_corrupt_or_fallback(
+    cfg: &DatabaseConfig,
+    data_dir: &Path,
+    metrics: &Arc<DbMetrics>,
+    err: AgentError,
+) -> Result<(Arc<dyn StorageBackend>, Arc<DbMetrics>)> {
+    if cfg.path.as_os_str() != ":memory:" && cfg.path.is_file() {
+        let bak_path = sidecar_path(&cfg.path, ".corrupt.bak");
+        let wal_path = sidecar_path(&cfg.path, "-wal");
+        let bak_wal_path = sidecar_path(&bak_path, "-wal");
+        let shm_path = sidecar_path(&cfg.path, "-shm");
+        let journal_path = sidecar_path(&cfg.path, "-journal");
+        ps5_agent_logging::log_warn(
+            "database",
+            format!(
+                "SQLite initialization failed ({err}); backing up {} to {} and retrying fresh DB",
+                cfg.path.display(),
+                bak_path.display()
+            ),
+        );
+        let rename_res = backup_corrupt_sqlite_file(&cfg.path, &bak_path);
+
+        match rename_res {
+            Ok(()) => {
+                if wal_path.exists() {
+                    if let Err(wal_err) = backup_corrupt_sqlite_file(&wal_path, &bak_wal_path) {
+                        ps5_agent_logging::log_warn(
+                            "database",
+                            format!(
+                                "Failed to preserve WAL {} to {} ({wal_err}); removing stale WAL",
+                                wal_path.display(),
+                                bak_wal_path.display()
+                            ),
+                        );
+                        let _ = fs::remove_file(&wal_path);
+                    }
+                }
+                let _ = fs::remove_file(&shm_path);
+                let _ = fs::remove_file(&journal_path);
+                match try_open_sqlite_checked(cfg, metrics) {
+                    Ok(fresh_wrapped) => return Ok((fresh_wrapped, Arc::clone(metrics))),
+                    Err(retry_err) => {
+                        ps5_agent_logging::log_warn(
+                            "database",
+                            format!(
+                                "Fresh SQLite retry failed ({retry_err}); falling back to JsonlStorage"
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(rename_err) => {
+                ps5_agent_logging::log_warn(
+                    "database",
+                    format!(
+                        "Failed to back up corrupt SQLite DB {} ({rename_err}); falling back to JsonlStorage",
+                        cfg.path.display()
+                    ),
+                );
+            }
+        }
+    } else {
+        ps5_agent_logging::log_warn(
+            "database",
+            format!("SQLite initialization failed ({err}); falling back to JsonlStorage"),
+        );
+    }
+
+    let j = JsonlStorage::open(&data_dir.join("jsonl_db"))?;
+    let wrapped_j = Arc::new(InstrumentedStorage::new(j, Arc::clone(metrics)));
+    wrapped_j.run_migrations()?;
+    Ok((wrapped_j, Arc::clone(metrics)))
+}
+
 pub fn open_storage(cfg: &DatabaseConfig, data_dir: &Path) -> Result<(Arc<dyn StorageBackend>, Arc<DbMetrics>)> {
     let metrics = Arc::new(DbMetrics::new());
     match cfg.driver.as_str() {
@@ -344,64 +418,41 @@ pub fn open_storage(cfg: &DatabaseConfig, data_dir: &Path) -> Result<(Arc<dyn St
             wrapped.run_migrations()?;
             Ok((wrapped, metrics))
         }
-        "auto" => match try_open_sqlite_checked(cfg, &metrics) {
-            Ok(wrapped) => Ok((wrapped, metrics)),
-            Err(err) => {
-                if cfg.path.as_os_str() != ":memory:" && cfg.path.is_file() {
-                    let bak_path = sidecar_path(&cfg.path, ".corrupt.bak");
-                    let wal_path = sidecar_path(&cfg.path, "-wal");
-                    let shm_path = sidecar_path(&cfg.path, "-shm");
-                    let journal_path = sidecar_path(&cfg.path, "-journal");
+        "auto" => {
+            let first_err = match try_open_sqlite_checked(cfg, &metrics) {
+                Ok(wrapped) => return Ok((wrapped, metrics)),
+                Err(err) => err,
+            };
+
+            if crate::sqlite::is_transient_busy_or_locked_error(&first_err) {
+                let mut last_err = first_err;
+                for retry_idx in 1..=2 {
                     ps5_agent_logging::log_warn(
                         "database",
                         format!(
-                            "SQLite initialization failed ({err}); backing up {} to {} and retrying fresh DB",
-                            cfg.path.display(),
-                            bak_path.display()
+                            "SQLite initialization hit transient busy/locked error ({last_err}); retry {retry_idx}/2 without quarantining DB"
                         ),
                     );
-                    let rename_res = backup_corrupt_sqlite_file(&cfg.path, &bak_path);
-
-                    match rename_res {
-                        Ok(()) => {
-                            let _ = fs::remove_file(&wal_path);
-                            let _ = fs::remove_file(&shm_path);
-                            let _ = fs::remove_file(&journal_path);
-                            match try_open_sqlite_checked(cfg, &metrics) {
-                                Ok(fresh_wrapped) => return Ok((fresh_wrapped, metrics)),
-                                Err(retry_err) => {
-                                    ps5_agent_logging::log_warn(
-                                        "database",
-                                        format!(
-                                            "Fresh SQLite retry failed ({retry_err}); falling back to JsonlStorage"
-                                        ),
-                                    );
-                                }
-                            }
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    match try_open_sqlite_checked(cfg, &metrics) {
+                        Ok(wrapped) => return Ok((wrapped, metrics)),
+                        Err(err) if crate::sqlite::is_transient_busy_or_locked_error(&err) => {
+                            last_err = err;
                         }
-                        Err(rename_err) => {
-                            ps5_agent_logging::log_warn(
-                                "database",
-                                format!(
-                                    "Failed to back up corrupt SQLite DB {} ({rename_err}); falling back to JsonlStorage",
-                                    cfg.path.display()
-                                ),
-                            );
+                        Err(err) => {
+                            last_err = err;
+                            break;
                         }
                     }
-                } else {
-                    ps5_agent_logging::log_warn(
-                        "database",
-                        format!("SQLite initialization failed ({err}); falling back to JsonlStorage"),
-                    );
                 }
-
-                let j = JsonlStorage::open(&data_dir.join("jsonl_db"))?;
-                let wrapped_j = Arc::new(InstrumentedStorage::new(j, Arc::clone(&metrics)));
-                wrapped_j.run_migrations()?;
-                Ok((wrapped_j, metrics))
+                if crate::sqlite::is_transient_busy_or_locked_error(&last_err) {
+                    return Err(last_err);
+                }
+                return open_auto_corrupt_or_fallback(cfg, data_dir, &metrics, last_err);
             }
-        },
+
+            open_auto_corrupt_or_fallback(cfg, data_dir, &metrics, first_err)
+        }
         other => Err(AgentError::InvalidInput(format!(
             "unsupported database driver '{other}'; expected auto, sqlite, or jsonl"
         ))),
@@ -461,6 +512,99 @@ mod tests {
             fs::read(&journal_path).map(|b| b.is_empty()).unwrap_or(true),
             "stale non-empty rollback journal must be purged during recovery (TRUNCATE leaves 0-byte journal)"
         );
+    }
+
+    #[test]
+    fn auto_mode_preserves_wal_as_corrupt_bak_wal() {
+        let dir = TempDir::new("ps5-db-corrupt-bak-wal");
+        let db_path = dir.0.join("agent.db");
+        let wal_path = sidecar_path(&db_path, "-wal");
+        let shm_path = sidecar_path(&db_path, "-shm");
+        let bak_path = sidecar_path(&db_path, ".corrupt.bak");
+        let bak_wal_path = sidecar_path(&bak_path, "-wal");
+
+        fs::write(&db_path, b"corrupt main db").unwrap();
+        fs::write(&wal_path, b"uncheckpointed wal frames").unwrap();
+        fs::write(&shm_path, b"stale shm").unwrap();
+        fs::write(&bak_wal_path, b"older wal backup").unwrap();
+
+        let cfg = DatabaseConfig {
+            driver: "auto".to_string(),
+            path: db_path.clone(),
+            busy_timeout_ms: 5000,
+            cache_size_kb: 4000,
+            wal_mode: false,
+            ..DatabaseConfig::default()
+        };
+        let metrics = Arc::new(DbMetrics::new());
+
+        let (store, _) = open_auto_corrupt_or_fallback(
+            &cfg,
+            &dir.0,
+            &metrics,
+            AgentError::Storage("integrity_check failed".into()),
+        )
+        .expect("corrupt quarantine recovers fresh sqlite");
+
+        assert_eq!(store.driver_name(), "sqlite");
+        assert_eq!(fs::read(&bak_path).unwrap(), b"corrupt main db");
+        assert!(bak_wal_path.is_file());
+        assert_eq!(fs::read(&bak_wal_path).unwrap(), b"uncheckpointed wal frames");
+        assert!(!wal_path.exists());
+        assert!(!shm_path.exists());
+    }
+
+    #[test]
+    fn auto_mode_does_not_quarantine_busy_sqlite_db() {
+        let dir = TempDir::new("ps5-db-busy-no-quarantine");
+        let db_path = dir.0.join("agent.db");
+        let cfg = DatabaseConfig {
+            driver: "auto".to_string(),
+            path: db_path.clone(),
+            busy_timeout_ms: 0,
+            cache_size_kb: 4000,
+            wal_mode: false,
+            ..DatabaseConfig::default()
+        };
+
+        {
+            let store = SqliteStorage::open(&db_path, &cfg).unwrap();
+            store.run_migrations().unwrap();
+            store.set_setting("sentinel", "alive").unwrap();
+        }
+
+        let lock_conn = rusqlite::Connection::open(&db_path).unwrap();
+        lock_conn
+            .execute_batch(
+                "PRAGMA locking_mode = EXCLUSIVE;
+                 BEGIN EXCLUSIVE;
+                 INSERT INTO settings (key, value, updated_at) VALUES ('_lock', '1', '2026-11-14T00:00:00Z');",
+            )
+            .unwrap();
+
+        let err = match open_storage(&cfg, &dir.0) {
+            Ok(_) => panic!("expected transient busy failure while exclusive lock is held"),
+            Err(e) => e,
+        };
+        assert!(
+            crate::sqlite::is_transient_busy_or_locked_error(&err),
+            "expected transient busy/locked error, got: {err}"
+        );
+        assert!(
+            !sidecar_path(&db_path, ".corrupt.bak").exists(),
+            "transient lock contention must not quarantine healthy DB"
+        );
+        assert!(
+            !dir.0.join("jsonl_db").exists(),
+            "transient lock contention must not fall back to empty JsonlStorage"
+        );
+
+        lock_conn.execute_batch("ROLLBACK;").unwrap();
+        drop(lock_conn);
+
+        let (reopened, _) = open_storage(&cfg, &dir.0).expect("healthy DB opens cleanly after lock release");
+        assert_eq!(reopened.driver_name(), "sqlite");
+        assert_eq!(reopened.get_setting("sentinel").unwrap().as_deref(), Some("alive"));
     }
 
     #[test]

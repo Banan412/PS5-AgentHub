@@ -481,6 +481,609 @@ fn fold_polish_ascii(input: &str) -> String {
     out
 }
 
+#[derive(Default)]
+struct LanguageScores {
+    polish: u32,
+    english: u32,
+    german: u32,
+    spanish: u32,
+    french: u32,
+}
+
+fn is_polish_unique_diacritic(ch: char) -> bool {
+    matches!(
+        ch,
+        'ą' | 'Ą' | 'ć' | 'Ć' | 'ę' | 'Ę' | 'ł' | 'Ł' | 'ń' | 'Ń' | 'ś' | 'Ś' | 'ź' | 'Ź' | 'ż'
+            | 'Ż'
+    )
+}
+
+fn is_known_european_accent(ch: char) -> bool {
+    is_polish_unique_diacritic(ch)
+        || matches!(
+            ch,
+            'ó' | 'Ó'
+                | 'ä'
+                | 'Ä'
+                | 'ö'
+                | 'Ö'
+                | 'ü'
+                | 'Ü'
+                | 'ß'
+                | '¿'
+                | '¡'
+                | 'ñ'
+                | 'Ñ'
+                | 'á'
+                | 'Á'
+                | 'é'
+                | 'É'
+                | 'í'
+                | 'Í'
+                | 'ú'
+                | 'Ú'
+                | 'ç'
+                | 'Ç'
+                | 'œ'
+                | 'Œ'
+                | 'à'
+                | 'À'
+                | 'â'
+                | 'Â'
+                | 'è'
+                | 'È'
+                | 'ê'
+                | 'Ê'
+                | 'ë'
+                | 'Ë'
+                | 'î'
+                | 'Î'
+                | 'ï'
+                | 'Ï'
+                | 'ô'
+                | 'Ô'
+                | 'ù'
+                | 'Ù'
+                | 'û'
+                | 'Û'
+        )
+}
+
+fn normalize_lower_apostrophe(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch == '’' {
+            out.push('\'');
+        } else {
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+    out
+}
+
+fn extract_language_words(text: &str) -> Vec<(String, String)> {
+    text.split(|ch: char| !ch.is_alphanumeric() && ch != '\'' && ch != '’')
+        .filter_map(|raw| {
+            let trimmed = raw.trim_matches(|c: char| c == '\'' || c == '’');
+            if trimmed.is_empty() {
+                None
+            } else {
+                let raw_lower = normalize_lower_apostrophe(trimmed);
+                let folded = fold_polish_ascii(&raw_lower);
+                Some((raw_lower, folded))
+            }
+        })
+        .collect()
+}
+
+fn contains_word(haystack: &[&str], word: &str) -> bool {
+    haystack.contains(&word)
+}
+
+const POLISH_HIGH_SIGNAL_WORDS: &[&str] = &[
+    "czesc",
+    "hej",
+    "siema",
+    "witam",
+    "witaj",
+    "prosze",
+    "zrob",
+    "zrobic",
+    "zrobiles",
+    "sprawdz",
+    "sprawdzic",
+    "napraw",
+    "naprawic",
+    "pokaz",
+    "otworz",
+    "znajdz",
+    "szukaj",
+    "wyszukaj",
+    "wyjasnij",
+    "podsumuj",
+    "przygotuj",
+    "przypomnij",
+    "utworz",
+    "usun",
+    "zmien",
+    "dodaj",
+    "policz",
+    "spojrz",
+    "zobacz",
+    "slyszysz",
+    "slyszusz",
+    "slychac",
+    "widac",
+    "mnie",
+    "powiedz",
+    "napisz",
+    "zapytaj",
+    "spytaj",
+    "popros",
+    "przekaz",
+    "zlec",
+    "niech",
+    "odpisz",
+    "odpisac",
+    "odpowiedz",
+    "rozmawiaj",
+    "gadaj",
+    "dlaczego",
+    "czemu",
+    "gdzie",
+    "kiedy",
+    "czego",
+    "jakie",
+    "jakiego",
+    "ktory",
+    "ktora",
+    "ktore",
+    "czy",
+    "jestes",
+    "mozesz",
+    "mozna",
+    "moze",
+    "mozemy",
+    "bedzie",
+    "chce",
+    "potrzebuje",
+    "potrzeba",
+    "dziala",
+    "dzialaj",
+    "wlacz",
+    "wylacz",
+    "uruchom",
+    "zatrzymaj",
+    "odpal",
+    "wszystko",
+    "wszystkie",
+    "kazdy",
+    "teraz",
+    "jeszcze",
+    "tutaj",
+    "bardzo",
+    "dobrze",
+    "swietnie",
+    "dzisiaj",
+    "dzis",
+    "jutro",
+    "wczoraj",
+    "codziennie",
+    "tydzien",
+    "miesiac",
+    "dobry",
+    "dobranoc",
+    "dobrego",
+    "dziekuje",
+    "dzieki",
+    "przepraszam",
+    "zeby",
+    "aby",
+    "polsku",
+    "plik",
+    "pliki",
+    "plikow",
+    "pamiec",
+    "blad",
+    "bledy",
+    "pomoc",
+    "pomocy",
+    "pomoz",
+    "moj",
+    "twoj",
+    "tak",
+    "komander",
+    "dowodca",
+    "dowodco",
+    "dowodcy",
+    "wykonawca",
+    "wykonawco",
+    "wykonawcy",
+    "programista",
+    "programisto",
+    "programisty",
+    "badacz",
+    "badacza",
+    "analityk",
+    "analityka",
+    "commanderowi",
+    "executorowi",
+    "programmerowi",
+];
+
+const POLISH_PHRASES: &[(&str, &str)] = &[
+    ("dzien", "dobry"),
+    ("co", "tam"),
+    ("jak", "sie"),
+    ("po", "polsku"),
+    ("daj", "znac"),
+    ("nie", "ma"),
+    ("nie", "wiem"),
+    ("nie", "dziala"),
+    ("czy", "mozesz"),
+    ("ze", "ma"),
+];
+
+const ENGLISH_HIGH_SIGNAL_WORDS: &[&str] = &[
+    "hello",
+    "hi",
+    "hey",
+    "hear",
+    "the",
+    "is",
+    "are",
+    "was",
+    "were",
+    "can",
+    "could",
+    "would",
+    "should",
+    "will",
+    "do",
+    "does",
+    "did",
+    "you",
+    "your",
+    "my",
+    "our",
+    "they",
+    "what",
+    "how",
+    "why",
+    "where",
+    "when",
+    "who",
+    "which",
+    "please",
+    "fix",
+    "help",
+    "search",
+    "find",
+    "check",
+    "make",
+    "build",
+    "create",
+    "open",
+    "show",
+    "tell",
+    "ask",
+    "write",
+    "read",
+    "run",
+    "list",
+    "explain",
+    "describe",
+    "summarize",
+    "thanks",
+    "thank",
+    "sorry",
+    "yes",
+    "not",
+    "and",
+    "for",
+    "with",
+    "from",
+    "this",
+    "that",
+    "there",
+    "here",
+    "have",
+    "has",
+    "need",
+    "want",
+    "work",
+    "works",
+    "working",
+    "good",
+    "morning",
+    "evening",
+    "reply",
+    "answer",
+    "respond",
+    "speak",
+    "english",
+    "i'm",
+    "you're",
+    "what's",
+    "how's",
+    "it's",
+    "that's",
+    "don't",
+    "doesn't",
+    "didn't",
+    "can't",
+    "won't",
+    "isn't",
+    "aren't",
+];
+
+const GERMAN_HIGH_SIGNAL_WORDS: &[&str] = &[
+    "bitte",
+    "danke",
+    "entschuldigung",
+    "tschuss",
+    "warum",
+    "nicht",
+    "keine",
+    "naturlich",
+    "deutsch",
+    "servus",
+    "moin",
+    "hilfe",
+];
+
+const GERMAN_ACCENTED_WORDS: &[&str] = &[
+    "tschüss",
+    "natürlich",
+    "für",
+    "können",
+    "möchte",
+    "grüße",
+    "straße",
+];
+
+const GERMAN_PHRASES: &[(&str, &str)] = &[
+    ("guten", "tag"),
+    ("guten", "morgen"),
+    ("guten", "abend"),
+    ("wie", "geht"),
+    ("wie", "gehts"),
+    ("wie", "geht's"),
+    ("ich", "brauche"),
+    ("kannst", "du"),
+    ("hilf", "mir"),
+];
+
+const SPANISH_HIGH_SIGNAL_WORDS: &[&str] = &[
+    "hola",
+    "gracias",
+    "buenos",
+    "buenas",
+    "necesito",
+    "puedes",
+    "ayuda",
+    "espanol",
+    "saludos",
+];
+
+const SPANISH_ACCENTED_WORDS: &[&str] = &[
+    "qué",
+    "cómo",
+    "dónde",
+    "estás",
+    "porqué",
+    "adiós",
+    "español",
+];
+
+const SPANISH_PHRASES: &[(&str, &str)] = &[
+    ("por", "favor"),
+    ("buenos", "dias"),
+    ("buenas", "tardes"),
+    ("buenas", "noches"),
+];
+
+const FRENCH_HIGH_SIGNAL_WORDS: &[&str] = &[
+    "bonjour",
+    "bonsoir",
+    "salut",
+    "merci",
+    "pouvez",
+    "pourquoi",
+    "francais",
+    "oui",
+    "s'il",
+    "c'est",
+    "j'ai",
+    "peux",
+];
+
+const FRENCH_ACCENTED_WORDS: &[&str] = &["où", "ça", "très", "être", "français", "voilà"];
+
+const FRENCH_PHRASES: &[(&str, &str)] = &[
+    ("s'il", "vous"),
+    ("sil", "vous"),
+    ("c'est", "quoi"),
+    ("en", "francais"),
+];
+
+const AMBIGUOUS_UNIVERSAL_WORDS: &[&str] = &[
+    "ok", "okay", "k", "kk", "hm", "hmm", "mhm", "aha", "uh", "um", "eh", "oh", "ah", "lol", "gg",
+    "thx", "brb", "np", "xd",
+];
+
+/// Detects the primary natural language of the latest user message text alone,
+/// ignoring prior history/memory so short English prompts do not inherit Polish context.
+///
+/// Returns one of `"Polish"`, `"English"`, `"German"`, `"Spanish"`, `"French"`, or `"auto"`.
+pub(crate) fn detect_user_language_name(text: &str) -> &'static str {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "auto";
+    }
+
+    let mut scores = LanguageScores::default();
+    let mut has_o_acute = false;
+    let mut has_other_non_latin_alpha = false;
+
+    for ch in trimmed.chars() {
+        if is_polish_unique_diacritic(ch) {
+            scores.polish = scores.polish.saturating_add(3);
+        } else if matches!(ch, 'ó' | 'Ó') {
+            has_o_acute = true;
+        } else if ch == 'ß' {
+            scores.german = scores.german.saturating_add(3);
+        } else if matches!(ch, 'ä' | 'Ä' | 'ö' | 'Ö' | 'ü' | 'Ü') {
+            scores.german = scores.german.saturating_add(2);
+        } else if matches!(ch, '¿' | '¡' | 'ñ' | 'Ñ') {
+            scores.spanish = scores.spanish.saturating_add(3);
+        } else if matches!(ch, 'ç' | 'Ç' | 'œ' | 'Œ') {
+            scores.french = scores.french.saturating_add(2);
+        } else if ch.is_alphabetic() && !ch.is_ascii() && !is_known_european_accent(ch) {
+            has_other_non_latin_alpha = true;
+        }
+    }
+
+    if has_o_acute {
+        scores.polish = scores.polish.saturating_add(1);
+    }
+
+    let words = extract_language_words(trimmed);
+    let has_any_alpha = words
+        .iter()
+        .any(|(_, folded)| folded.chars().any(|c| c.is_alphabetic()));
+    if !has_any_alpha {
+        return "auto";
+    }
+
+    for (raw_lower, folded) in &words {
+        let f = folded.as_str();
+        let r = raw_lower.as_str();
+
+        if contains_word(POLISH_HIGH_SIGNAL_WORDS, f) {
+            scores.polish = scores.polish.saturating_add(2);
+        }
+        if contains_word(ENGLISH_HIGH_SIGNAL_WORDS, f) {
+            scores.english = scores.english.saturating_add(2);
+        } else if f == "hallo" || f == "commander" {
+            // Treat "hallo" without German words/diacritics as English ("hello" typo),
+            // and keep "commander" lighter than strong non-English words.
+            scores.english = scores.english.saturating_add(1);
+        } else if f == "me" {
+            scores.english = scores.english.saturating_add(1);
+        }
+
+        if contains_word(GERMAN_HIGH_SIGNAL_WORDS, f)
+            || contains_word(GERMAN_ACCENTED_WORDS, r)
+        {
+            scores.german = scores.german.saturating_add(2);
+        }
+        if contains_word(SPANISH_HIGH_SIGNAL_WORDS, f)
+            || contains_word(SPANISH_ACCENTED_WORDS, r)
+        {
+            scores.spanish = scores.spanish.saturating_add(2);
+        }
+        if contains_word(FRENCH_HIGH_SIGNAL_WORDS, f)
+            || contains_word(FRENCH_ACCENTED_WORDS, r)
+        {
+            scores.french = scores.french.saturating_add(2);
+        }
+    }
+
+    if scores.german == 0 && words.iter().any(|(_, f)| f == "nie") {
+        scores.polish = scores.polish.saturating_add(1);
+    }
+
+    for pair in words.windows(2) {
+        let a = pair[0].1.as_str();
+        let b = pair[1].1.as_str();
+        if POLISH_PHRASES.contains(&(a, b)) {
+            scores.polish = scores.polish.saturating_add(3);
+        }
+        if GERMAN_PHRASES.contains(&(a, b)) {
+            scores.german = scores.german.saturating_add(3);
+        }
+        if SPANISH_PHRASES.contains(&(a, b)) {
+            scores.spanish = scores.spanish.saturating_add(3);
+        }
+        if FRENCH_PHRASES.contains(&(a, b)) {
+            scores.french = scores.french.saturating_add(3);
+        }
+    }
+
+    let best = [
+        ("Polish", scores.polish),
+        ("German", scores.german),
+        ("Spanish", scores.spanish),
+        ("French", scores.french),
+        ("English", scores.english),
+    ]
+    .into_iter()
+    .max_by_key(|(_, score)| *score);
+
+    if let Some((lang, top_score)) = best {
+        if top_score > 0 {
+            return lang;
+        }
+    }
+
+    if has_other_non_latin_alpha {
+        return "auto";
+    }
+
+    let all_ambiguous_or_non_alpha = words.iter().all(|(_, f)| {
+        contains_word(AMBIGUOUS_UNIVERSAL_WORDS, f) || !f.chars().any(|c| c.is_alphabetic())
+    });
+    if all_ambiguous_or_non_alpha {
+        return "auto";
+    }
+
+    let single_letter_only = words.len() == 1
+        && words[0]
+            .1
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .count()
+            <= 1;
+    if single_letter_only {
+        return "auto";
+    }
+
+    if words
+        .iter()
+        .any(|(_, f)| f.is_ascii() && f.chars().any(|c| c.is_ascii_alphabetic()))
+    {
+        return "English";
+    }
+
+    "auto"
+}
+
+/// Builds an explicit per-turn response-language directive for the latest user message,
+/// preventing prior Polish history/memory context from overriding short English turns.
+pub(crate) fn language_response_directive(text: &str) -> &'static str {
+    match detect_user_language_name(text) {
+        "Polish" => {
+            "Respond strictly in Polish. Ignore the language of earlier messages or memory entries if the user's latest message is in Polish."
+        }
+        "English" => {
+            "Respond strictly in English. Ignore the language of earlier messages or memory entries if the user's latest message is in English."
+        }
+        "German" => {
+            "Respond strictly in German. Ignore the language of earlier messages or memory entries if the user's latest message is in German."
+        }
+        "Spanish" => {
+            "Respond strictly in Spanish. Ignore the language of earlier messages or memory entries if the user's latest message is in Spanish."
+        }
+        "French" => {
+            "Respond strictly in French. Ignore the language of earlier messages or memory entries if the user's latest message is in French."
+        }
+        _ => "Reply in the exact same language as the user's latest message above.",
+    }
+}
+
 fn trim_edge_punct(s: &str) -> &str {
     s.trim_matches(|c: char| matches!(c, ',' | '.' | ';' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']' | '`'))
 }
@@ -1278,7 +1881,7 @@ pub async fn parse_schedule_with_ai(
     }
 
     let sys_prompt = format!(
-        "Extract an autonomous schedule from the user's request (Polish or English) and reply ONLY with one valid JSON object.\n\
+        "Extract an autonomous schedule from the user's request and reply ONLY with one valid JSON object. Write title, task prompt, and explanation in the exact same language as the user's request.\n\
          Schema:\n\
          {{\"title\":\"short title\",\"prompt\":\"clean task prompt for the agent\",\"kind\":\"once|interval|daily|cron\",\
          \"run_at\":null,\"interval_secs\":null,\"daily_time\":null,\"cron_expr\":null,\"target_agent_id\":null,\"explanation\":\"short explanation\"}}\n\
@@ -1318,6 +1921,7 @@ pub async fn parse_schedule_with_ai(
         context_limit: 4096,
         stream: false,
         thinking_level: ThinkingLevel::Off,
+        slot_id: None,
     };
 
     let Ok(Ok(resp)) = tokio::time::timeout(
@@ -1643,6 +2247,7 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 usage: TokenUsage::default(),
                 latency_ms: 5,
+                timings: None,
             })
         }
 
@@ -1744,5 +2349,129 @@ mod tests {
         let neg = parse_schedule_prompt_heuristic("Za -10 minut ping", now, 0, None);
         assert_eq!(neg.kind, ScheduleKind::Once);
         assert!(neg.run_at.unwrap() >= now);
+    }
+
+    #[test]
+    fn detect_user_language_matches_user_turn_across_polish_english_and_ambiguous_inputs() {
+        assert_eq!(detect_user_language_name("dzien dobry"), "Polish");
+        assert_eq!(
+            detect_user_language_name("executor slyszusz mnie"),
+            "Polish"
+        );
+        assert_eq!(detect_user_language_name("hallo"), "English");
+        assert_eq!(detect_user_language_name("hallo commander"), "English");
+        assert_eq!(detect_user_language_name("hey hear me"), "English");
+        assert_eq!(
+            detect_user_language_name("powiedz executorowi ze ma odpisac czesc"),
+            "Polish"
+        );
+        assert_eq!(detect_user_language_name("ok"), "auto");
+        assert_eq!(detect_user_language_name("123"), "auto");
+        assert_eq!(detect_user_language_name(""), "auto");
+
+        // Additional accented / multilingual sanity checks
+        assert_eq!(
+            detect_user_language_name("Proszę sprawdzić logi i pamięć"),
+            "Polish"
+        );
+        assert_eq!(
+            detect_user_language_name("hallo, wie geht es dir?"),
+            "German"
+        );
+        assert_eq!(
+            detect_user_language_name("¿Cómo estás? gracias"),
+            "Spanish"
+        );
+        assert_eq!(detect_user_language_name("bonjour, merci beaucoup"), "French");
+        assert_eq!(
+            detect_user_language_name("Can you check what happened with jest?"),
+            "English"
+        );
+
+        assert!(language_response_directive("hey hear me").contains("Respond strictly in English."));
+        assert!(
+            language_response_directive("dzien dobry").contains("Respond strictly in Polish.")
+        );
+        assert_eq!(
+            language_response_directive("ok"),
+            "Reply in the exact same language as the user's latest message above."
+        );
+    }
+
+    struct CapturingScheduleInference {
+        captured_system: Arc<std::sync::Mutex<Option<String>>>,
+        reply: String,
+    }
+
+    #[async_trait]
+    impl InferenceProvider for CapturingScheduleInference {
+        async fn generate(
+            &self,
+            req: InferenceRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ps5_agent_core::InferenceResponse> {
+            let sys = req
+                .messages
+                .iter()
+                .find(|m| m.role == "system")
+                .map(|m| m.content.clone());
+            *self.captured_system.lock().unwrap() = sys;
+            Ok(ps5_agent_core::InferenceResponse {
+                content: self.reply.clone(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model: "mock-qwen".into(),
+                finish_reason: Some("stop".into()),
+                usage: TokenUsage::default(),
+                latency_ms: 5,
+                timings: None,
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _req: InferenceRequest,
+            _tx: mpsc::Sender<InferenceStreamChunk>,
+            _cancel: CancellationToken,
+        ) -> Result<ps5_agent_core::InferenceResponse> {
+            unreachable!()
+        }
+
+        async fn health_check(&self) -> ProviderHealth {
+            ProviderHealth {
+                reachable: true,
+                loaded_model: Some("mock-qwen".into()),
+                available_models: vec!["mock-qwen".into()],
+                error: None,
+            }
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(vec!["mock-qwen".into()])
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_schedule_with_ai_prompt_has_no_polish_bias_and_keeps_request_language() {
+        let now = dt_utc(2026, 11, 13, 12, 0, 0);
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let inf: Arc<dyn InferenceProvider> = Arc::new(CapturingScheduleInference {
+            captured_system: captured.clone(),
+            reply: "{\"title\":\"Health Ping\",\"prompt\":\"Check health\",\"kind\":\"interval\",\"interval_secs\":300,\"target_agent_id\":null,\"explanation\":\"Every 5 minutes.\"}".into(),
+        });
+        let draft = parse_schedule_with_ai(
+            Some(&inf),
+            &[],
+            "Every 5 minutes check health",
+            now,
+            0,
+            None,
+            Some("mock-qwen"),
+        )
+        .await;
+        assert_eq!(draft.source, "llm");
+        let sys_prompt = captured.lock().unwrap().clone().expect("system prompt");
+        assert!(!sys_prompt.contains("Polish or English"));
+        assert!(sys_prompt.contains("exact same language as the user's request"));
     }
 }

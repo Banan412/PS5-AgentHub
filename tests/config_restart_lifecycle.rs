@@ -408,6 +408,7 @@ max_memories_per_agent = 500
         archived: false,
         created_at: "2026-10-02T00:00:01Z".to_string(),
         attachments: Vec::new(),
+        timings: None,
     };
     v1_store.append_chat_message(&msg).unwrap();
     drop(v1_store);
@@ -628,7 +629,8 @@ async fn test_llamacpp_fields_prefill_and_sqlite_sort_order_survive_restart() {
     assert!(cfg1.inference.prefill_kv_cache);
     assert!(cfg1.inference.cache_prompt);
     assert_eq!(cfg1.inference.top_k, 40);
-    assert_eq!(cfg1.inference.repeat_last_n, 64);
+    assert_eq!(cfg1.inference.repeat_last_n, 256);
+    assert_f32_near(cfg1.inference.dry_multiplier, 0.8, "dry_multiplier");
     assert_eq!(cfg1.inference.dry_allowed_length, 2);
     assert_eq!(cfg1.inference.dry_penalty_last_n, -1);
     assert_eq!(cfg1.inference.mirostat, 0);
@@ -639,6 +641,10 @@ async fn test_llamacpp_fields_prefill_and_sqlite_sort_order_survive_restart() {
     assert_eq!(cfg1.inference.id_slot, -1);
     assert_eq!(cfg1.inference.reasoning_format, "deepseek");
     assert!(!cfg1.inference.timings_per_token);
+    assert!(cfg1.inference.smart_tool_routing);
+    assert!(cfg1.inference.cache_type_k.is_empty());
+    assert!(cfg1.inference.cache_type_v.is_empty());
+    assert!(!cfg1.inference.flash_attn);
 
     let system1 = initialize_with_warnings(cfg1, warnings1).await.unwrap();
     assert_eq!(system1.store.driver_name(), "sqlite");

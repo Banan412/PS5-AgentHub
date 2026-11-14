@@ -619,6 +619,7 @@ impl StorageBackend for JsonlStorage {
         let mut guard = self.lock_inner()?;
         let removed = guard.state.conversations.remove(conv_id).is_some();
         if removed {
+            shrink_if_sparse(&mut guard.state.conversations);
             let before_msgs = guard.state.messages.len();
             guard
                 .state
@@ -1116,7 +1117,7 @@ impl StorageBackend for JsonlStorage {
         let mut count = 0u64;
         let mut bytes = 0u64;
         for row in guard.state.memories.values() {
-            if row.item.owner_agent_id.as_deref() == Some(agent_id) {
+            if !row.item.archived && row.item.owner_agent_id.as_deref() == Some(agent_id) {
                 count += 1;
                 bytes += row.item.content.len() as u64;
             }
@@ -1873,6 +1874,10 @@ mod tests {
 
         let storage = JsonlStorage::open(&dir.0).unwrap();
         storage.run_migrations().unwrap();
+        assert_eq!(
+            storage.lock_inner().unwrap().state.schema_version,
+            crate::CURRENT_SCHEMA_VERSION
+        );
 
         let agent = storage.get_agent("a1").unwrap().unwrap();
         assert_eq!(agent.model_config.thinking_level, ThinkingLevel::Medium);
@@ -1880,7 +1885,17 @@ mod tests {
         let msgs = storage.list_chat_messages("conv-1", false, 10).unwrap();
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].attachments.is_empty());
+        assert!(msgs[0].timings.is_none());
 
+        let sample_timings = InferenceTimings {
+            predicted_per_second: Some(38.5),
+            prompt_per_second: Some(110.0),
+            predicted_ms: Some(410.0),
+            prompt_ms: Some(90.0),
+            predicted_n: Some(16),
+            prompt_n: Some(10),
+            cache_n: Some(4),
+        };
         let m2 = ChatMessage {
             id: "m2".to_string(),
             conversation_id: "conv-1".to_string(),
@@ -1902,12 +1917,14 @@ mod tests {
                 workspace_path: None,
                 size_bytes: 2,
             }],
+            timings: Some(sample_timings.clone()),
         };
         storage.append_chat_message(&m2).unwrap();
         let msgs2 = storage.list_chat_messages("conv-1", false, 10).unwrap();
         assert_eq!(msgs2.len(), 2);
         assert_eq!(msgs2[1].attachments.len(), 1);
         assert_eq!(msgs2[1].attachments[0].name, "shot.png");
+        assert_eq!(msgs2[1].timings, Some(sample_timings));
     }
 
     #[test]
@@ -2095,6 +2112,7 @@ mod tests {
                     archived: archived,
                     created_at: ts.clone(),
                     attachments: Vec::new(),
+                    timings: None,
                 })
                 .unwrap();
         }
@@ -2618,6 +2636,7 @@ mod tests {
                 archived: false,
                 created_at: "2026-11-13T10:00:00Z".to_string(),
                 attachments: Vec::new(),
+                timings: None,
             })
             .unwrap();
         let hits = storage.search_chat_messages("  needle  ", 10).unwrap();

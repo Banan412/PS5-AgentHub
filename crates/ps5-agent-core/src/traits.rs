@@ -196,6 +196,8 @@ pub struct InferenceRequest {
     pub stream: bool,
     #[serde(default)]
     pub thinking_level: ThinkingLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -214,6 +216,8 @@ pub struct InferenceResponse {
     pub finish_reason: Option<String>,
     pub usage: TokenUsage,
     pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<InferenceTimings>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +299,22 @@ pub trait InferenceProvider: Send + Sync {
         _cancel: CancellationToken,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// Re-submits an [`InferenceRequest`] for KV cache warming with optional `slot_id`.
+    async fn prefill_kv_cache_request(
+        &self,
+        _req: InferenceRequest,
+        _cancel: CancellationToken,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Imports live KV-cache and sampling parameters from the inference backend.
+    async fn import_kv_and_sampling(&self) -> Result<Ps5LmKvSamplingImport> {
+        Err(crate::error::AgentError::Inference(
+            "KV and sampling import is not supported by this provider".to_string(),
+        ))
     }
 
     async fn health_check(&self) -> ProviderHealth;

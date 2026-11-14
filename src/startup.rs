@@ -355,6 +355,63 @@ pub fn load_effective_config_with_warnings(opts: &CliOptions) -> Result<(AppConf
     Ok((cfg, warnings))
 }
 
+const BOOT_TIME_JITTER_TOLERANCE_SECS: u64 = 5;
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn process_name_bytes_match_ps5_agent(data: &[u8]) -> bool {
+    const PATTERNS: [&[u8]; 2] = [b"ps5-agent", b"ps5_agent"];
+    PATTERNS.iter().any(|needle| {
+        data.windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+    })
+}
+
+pub(crate) fn format_pid_file_record(pid: u32, boot_time_secs: Option<i64>) -> String {
+    match boot_time_secs {
+        Some(boot) => format!("{pid}:{boot}\n"),
+        None => format!("{pid}\n"),
+    }
+}
+
+pub(crate) fn parse_pid_file_record(raw: &str) -> Option<(u32, Option<i64>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.split_once(':') {
+        Some((pid_str, boot_str)) => {
+            let pid = pid_str.trim().parse::<u32>().ok()?;
+            let boot = boot_str.trim().parse::<i64>().ok()?;
+            Some((pid, Some(boot)))
+        }
+        None => {
+            let pid = trimmed.parse::<u32>().ok()?;
+            Some((pid, None))
+        }
+    }
+}
+
+pub(crate) fn is_pid_record_from_prior_boot(
+    stored_boot: Option<i64>,
+    current_boot: Option<i64>,
+) -> bool {
+    match (stored_boot, current_boot) {
+        (Some(stored), Some(current)) => stored.abs_diff(current) > BOOT_TIME_JITTER_TOLERANCE_SECS,
+        _ => false,
+    }
+}
+
+pub(crate) fn current_kernel_boot_time_secs() -> Option<i64> {
+    #[cfg(target_vendor = "sie")]
+    {
+        ps5::payload::kernel_boot_time_secs()
+    }
+    #[cfg(not(target_vendor = "sie"))]
+    {
+        None
+    }
+}
+
 #[cfg(target_os = "freebsd")]
 fn process_name_matches_ps5_agent(pid: libc::pid_t) -> bool {
     unsafe {
@@ -387,12 +444,7 @@ fn process_name_matches_ps5_agent(pid: libc::pid_t) -> bool {
                 && len > 0
             {
                 let data = &buf[..len.min(buf.len())];
-                return data
-                    .windows(b"ps5-agent.elf".len())
-                    .any(|w| w == b"ps5-agent.elf")
-                    || data
-                        .windows(b"payload.elf".len())
-                        .any(|w| w == b"payload.elf");
+                return process_name_bytes_match_ps5_agent(data);
             }
         }
         false
@@ -401,77 +453,96 @@ fn process_name_matches_ps5_agent(pid: libc::pid_t) -> bool {
 
 #[cfg(all(unix, not(target_os = "freebsd")))]
 fn process_name_matches_ps5_agent(pid: libc::pid_t) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|s| s.contains("ps5-agent.elf") || s.contains("payload.elf"))
+    fs::read(format!("/proc/{pid}/comm"))
+        .map(|bytes| process_name_bytes_match_ps5_agent(&bytes))
         .unwrap_or(false)
 }
 
 pub fn manage_pid_file(data_dir: &Path, logger: &AppLogger) {
+    manage_pid_file_with_boot_time(data_dir, logger, current_kernel_boot_time_secs());
+}
+
+pub(crate) fn manage_pid_file_with_boot_time(
+    data_dir: &Path,
+    logger: &AppLogger,
+    current_boot_secs: Option<i64>,
+) {
     let pid_path = data_dir.join("ps5-agent.pid");
     let my_pid = std::process::id();
 
     if let Ok(raw) = fs::read_to_string(&pid_path) {
-        if let Ok(old_pid) = raw.trim().parse::<u32>() {
+        if let Some((old_pid, old_boot_secs)) = parse_pid_file_record(&raw) {
             if old_pid > 1 && old_pid != my_pid {
-                #[cfg(unix)]
-                {
-                    let pid = old_pid as libc::pid_t;
-                    let alive = unsafe { libc::kill(pid, 0) == 0 };
-                    if alive {
-                        if process_name_matches_ps5_agent(pid) {
-                            logger.warn(
-                                "startup",
-                                format!("Found previous instance (pid={pid}); sending SIGTERM"),
-                            );
-                            unsafe {
-                                libc::kill(pid, libc::SIGTERM);
-                            }
-                            let mut exited = false;
-                            for _ in 0..12 {
-                                std::thread::sleep(Duration::from_millis(50));
-                                if unsafe { libc::kill(pid, 0) != 0 } {
-                                    exited = true;
-                                    break;
-                                }
-                            }
-                            if exited {
-                                logger.info(
+                if is_pid_record_from_prior_boot(old_boot_secs, current_boot_secs) {
+                    logger.info(
+                        "startup",
+                        format!(
+                            "PID file {} belongs to a prior boot (old_pid={old_pid}, stored_boot={old_boot_secs:?}, current_boot={current_boot_secs:?}); treating as stale",
+                            pid_path.display()
+                        ),
+                    );
+                    let _ = fs::remove_file(&pid_path);
+                } else {
+                    #[cfg(unix)]
+                    {
+                        let pid = old_pid as libc::pid_t;
+                        let alive = unsafe { libc::kill(pid, 0) == 0 };
+                        if alive {
+                            if process_name_matches_ps5_agent(pid) {
+                                logger.warn(
                                     "startup",
-                                    format!("Previous instance (pid={pid}) exited after SIGTERM"),
+                                    format!("Found previous instance (pid={pid}); sending SIGTERM"),
                                 );
+                                unsafe {
+                                    libc::kill(pid, libc::SIGTERM);
+                                }
+                                let mut exited = false;
+                                for _ in 0..12 {
+                                    std::thread::sleep(Duration::from_millis(50));
+                                    if unsafe { libc::kill(pid, 0) != 0 } {
+                                        exited = true;
+                                        break;
+                                    }
+                                }
+                                if exited {
+                                    logger.info(
+                                        "startup",
+                                        format!("Previous instance (pid={pid}) exited after SIGTERM"),
+                                    );
+                                } else {
+                                    logger.warn(
+                                        "startup",
+                                        format!(
+                                            "Previous instance (pid={pid}) still alive after 600ms; sending SIGKILL"
+                                        ),
+                                    );
+                                    unsafe {
+                                        libc::kill(pid, libc::SIGKILL);
+                                    }
+                                }
                             } else {
                                 logger.warn(
                                     "startup",
                                     format!(
-                                        "Previous instance (pid={pid}) still alive after 600ms; sending SIGKILL"
+                                        "PID file references unrelated live process pid={pid}; replacing PID file"
                                     ),
                                 );
-                                unsafe {
-                                    libc::kill(pid, libc::SIGKILL);
-                                }
                             }
-                        } else {
-                            logger.warn(
-                                "startup",
-                                format!(
-                                    "PID file references unrelated live process pid={pid}; replacing PID file"
-                                ),
-                            );
                         }
                     }
-                }
-                #[cfg(not(unix))]
-                {
-                    logger.info(
-                        "startup",
-                        format!("Replacing previous PID file entry (old_pid={old_pid})"),
-                    );
+                    #[cfg(not(unix))]
+                    {
+                        logger.info(
+                            "startup",
+                            format!("Replacing previous PID file entry (old_pid={old_pid})"),
+                        );
+                    }
                 }
             }
         }
     }
 
-    if let Err(e) = fs::write(&pid_path, format!("{my_pid}\n")) {
+    if let Err(e) = fs::write(&pid_path, format_pid_file_record(my_pid, current_boot_secs)) {
         logger.warn(
             "startup",
             format!("Failed to write PID file {}: {e}", pid_path.display()),
@@ -636,6 +707,7 @@ pub async fn initialize_with_warnings(
         cfg.tools.clone(),
         &cfg.data_dir,
     )?);
+    tools.browser_manager().attach_events_tx(events_tx.clone());
     sync_plugin_mcp_configs(&tools, &logger);
     logger.info(
         "startup",
@@ -784,11 +856,30 @@ pub async fn initialize_with_warnings(
         ps5lm_capabilities: RwLock::new(None),
         auto_synced_slots: AtomicUsize::new(0),
     });
-    if cfg.inference.auto_sync_from_ps5lm {
-        let _ = http_backend.sync_ps5lm_capabilities().await;
-    } else {
-        let _ = http_backend.refresh_ps5lm_health().await;
-    }
+
+    #[cfg(not(target_vendor = "sie"))]
+    let initial_caps_synced = {
+        let sync_from_ps5lm = cfg.inference.auto_sync_from_ps5lm;
+        match tokio::time::timeout(Duration::from_millis(1500), async {
+            if sync_from_ps5lm {
+                http_backend.sync_ps5lm_capabilities().await.is_ok()
+            } else {
+                let _ = http_backend.refresh_ps5lm_health().await;
+                false
+            }
+        })
+        .await
+        {
+            Ok(synced) => synced,
+            Err(_) => {
+                logger.warn(
+                    "startup",
+                    "Initial PS5LM probe timed out after 1500ms; continuing startup in background",
+                );
+                false
+            }
+        }
+    };
 
     // Background PS5LM health & capability auto-sync polling loop
     {
@@ -796,10 +887,31 @@ pub async fn initialize_with_warnings(
         let poll_shutdown = shutdown.clone();
         let interval_secs = cfg.runtime.health_poll_interval_secs.max(5);
         tokio::spawn(async move {
+            #[cfg(target_vendor = "sie")]
+            let initial_caps_synced = {
+                let init_fut = async {
+                    let cur_cfg = poll_backend.runtime.config();
+                    if cur_cfg.inference.auto_sync_from_ps5lm {
+                        poll_backend.sync_ps5lm_capabilities().await.is_ok()
+                    } else {
+                        let _ = poll_backend.refresh_ps5lm_health().await;
+                        false
+                    }
+                };
+                tokio::select! {
+                    _ = poll_shutdown.cancelled() => return,
+                    synced = init_fut => synced,
+                }
+            };
+
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
-            let mut last_caps_sync = Instant::now();
+            let mut last_caps_sync = if initial_caps_synced {
+                Some(Instant::now())
+            } else {
+                None
+            };
             loop {
                 tokio::select! {
                     _ = poll_shutdown.cancelled() => break,
@@ -808,11 +920,14 @@ pub async fn initialize_with_warnings(
                         let sync_interval = cur_cfg.inference.auto_sync_interval_secs;
                         if cur_cfg.inference.auto_sync_from_ps5lm
                             && sync_interval > 0
-                            && last_caps_sync.elapsed() + Duration::from_millis(250)
-                                >= Duration::from_secs(sync_interval)
+                            && last_caps_sync.map_or(true, |last| {
+                                last.elapsed() + Duration::from_millis(250)
+                                    >= Duration::from_secs(sync_interval)
+                            })
                         {
-                            let _ = poll_backend.sync_ps5lm_capabilities().await;
-                            last_caps_sync = Instant::now();
+                            if poll_backend.sync_ps5lm_capabilities().await.is_ok() {
+                                last_caps_sync = Some(Instant::now());
+                            }
                         } else {
                             let _ = poll_backend.refresh_ps5lm_health().await;
                         }
@@ -961,4 +1076,78 @@ pub async fn initialize_with_warnings(
         http_backend,
         http_state,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        format_pid_file_record, is_pid_record_from_prior_boot, manage_pid_file_with_boot_time,
+        parse_pid_file_record, process_name_bytes_match_ps5_agent,
+    };
+    use ps5_agent_config::AppConfig;
+    use ps5_agent_logging::AppLogger;
+    use std::fs;
+
+    #[test]
+    fn process_name_matching_accepts_only_ps5_agent_variants() {
+        assert!(process_name_bytes_match_ps5_agent(b"ps5-agent"));
+        assert!(process_name_bytes_match_ps5_agent(b"ps5-agent.elf"));
+        assert!(process_name_bytes_match_ps5_agent(b"ps5_agent"));
+        assert!(process_name_bytes_match_ps5_agent(b"ps5_agent.elf"));
+        assert!(process_name_bytes_match_ps5_agent(b"\0\0PS5-AGENT.ELF\0tail"));
+
+        assert!(!process_name_bytes_match_ps5_agent(b"payload.elf"));
+        assert!(!process_name_bytes_match_ps5_agent(b"\0\0payload.elf\0tail"));
+        assert!(!process_name_bytes_match_ps5_agent(b"homebrew-payload.elf"));
+        assert!(!process_name_bytes_match_ps5_agent(b"pldmgr.elf"));
+        assert!(!process_name_bytes_match_ps5_agent(b"ps5lm"));
+        assert!(!process_name_bytes_match_ps5_agent(b""));
+    }
+
+    #[test]
+    fn pid_file_record_round_trips_boot_time_and_legacy_bare_pid() {
+        let with_boot = format_pid_file_record(421, Some(1_700_000_500));
+        assert_eq!(with_boot, "421:1700000500\n");
+        assert_eq!(parse_pid_file_record(&with_boot), Some((421, Some(1_700_000_500))));
+
+        let without_boot = format_pid_file_record(421, None);
+        assert_eq!(without_boot, "421\n");
+        assert_eq!(parse_pid_file_record("421\r\n"), Some((421, None)));
+
+        assert_eq!(parse_pid_file_record(""), None);
+        assert_eq!(parse_pid_file_record("not-a-pid"), None);
+        assert_eq!(parse_pid_file_record("421:"), None);
+        assert_eq!(parse_pid_file_record("421:bad"), None);
+        assert_eq!(parse_pid_file_record(":123"), None);
+    }
+
+    #[test]
+    fn prior_boot_detection_tolerates_jitter_and_flags_reboots() {
+        assert!(!is_pid_record_from_prior_boot(Some(1000), Some(1000)));
+        assert!(!is_pid_record_from_prior_boot(Some(1000), Some(1005)));
+        assert!(!is_pid_record_from_prior_boot(Some(1005), Some(1000)));
+        assert!(is_pid_record_from_prior_boot(Some(1000), Some(1006)));
+        assert!(is_pid_record_from_prior_boot(Some(1006), Some(1000)));
+        assert!(!is_pid_record_from_prior_boot(None, Some(1000)));
+        assert!(!is_pid_record_from_prior_boot(Some(1000), None));
+        assert!(!is_pid_record_from_prior_boot(None, None));
+    }
+
+    #[test]
+    fn manage_pid_file_replaces_stale_prior_boot_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = AppConfig::with_data_dir(dir.path().to_path_buf());
+        cfg.logging.enable_klog = false;
+        cfg.logging.enable_toast = false;
+        fs::create_dir_all(&cfg.logging.log_dir).expect("log_dir");
+        let logger = AppLogger::init(&cfg.logging);
+
+        let pid_path = dir.path().join("ps5-agent.pid");
+        fs::write(&pid_path, format_pid_file_record(999_999, Some(1000))).expect("seed pid");
+
+        manage_pid_file_with_boot_time(dir.path(), &logger, Some(5000));
+
+        let raw = fs::read_to_string(&pid_path).expect("read updated pid");
+        assert_eq!(parse_pid_file_record(&raw), Some((std::process::id(), Some(5000))));
+    }
 }

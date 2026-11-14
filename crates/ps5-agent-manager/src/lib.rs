@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-pub const BUILTIN_AGENTS_SCHEMA_VERSION: &str = "5";
+pub const BUILTIN_AGENTS_SCHEMA_VERSION: &str = "6";
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -434,7 +434,12 @@ impl AgentManager {
 
     pub fn list_agents(&self) -> Result<Vec<AgentDefinition>> {
         let mut agents = self.storage.list_agents()?;
-        agents.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(&b.name)));
+        agents.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(agents)
     }
 
@@ -967,8 +972,6 @@ pub fn default_agent_definitions() -> Vec<AgentDefinition> {
                 "memory_write".into(),
                 "memory_search".into(),
                 "memory_get".into(),
-                "read_agent_memory".into(),
-                "write_agent_memory".into(),
                 "sessions_list".into(),
                 "sessions_spawn".into(),
                 "sessions_send".into(),
@@ -977,9 +980,6 @@ pub fn default_agent_definitions() -> Vec<AgentDefinition> {
                 "send_agent_message".into(),
                 "query_agent_status".into(),
                 "request_temporary_specialist".into(),
-                "delegate_task".into(),
-                "agent_message".into(),
-                "spawn_temp_agent".into(),
                 "write_artifact".into(),
                 "doctor".into(),
                 "system_info".into(),
@@ -989,9 +989,6 @@ pub fn default_agent_definitions() -> Vec<AgentDefinition> {
                 "schedule_update".into(),
                 "schedule_delete".into(),
                 "calculator".into(),
-                "json_parse_format".into(),
-                "timestamp_time_helper".into(),
-                "text_transform_summarize_prep".into(),
                 "datetime".into(),
                 "json_process".into(),
                 "text_process".into(),
@@ -1051,12 +1048,10 @@ pub fn default_agent_definitions() -> Vec<AgentDefinition> {
                 "memory_write".into(),
                 "memory_search".into(),
                 "memory_get".into(),
-                "read_agent_memory".into(),
-                "write_agent_memory".into(),
                 "write_artifact".into(),
-                "json_parse_format".into(),
-                "timestamp_time_helper".into(),
-                "text_transform_summarize_prep".into(),
+                "datetime".into(),
+                "json_process".into(),
+                "text_process".into(),
                 "load_skill".into(),
                 "mcp:*".into(),
                 "plugin:*".into(),
@@ -1105,14 +1100,12 @@ pub fn default_agent_definitions() -> Vec<AgentDefinition> {
                 "web_search".into(),
                 "web_fetch".into(),
                 "http_get".into(),
-                "json_parse_format".into(),
+                "json_process".into(),
                 "calculator".into(),
                 "memory_read".into(),
                 "memory_write".into(),
                 "memory_search".into(),
                 "memory_get".into(),
-                "read_agent_memory".into(),
-                "write_agent_memory".into(),
                 "write_artifact".into(),
                 "load_skill".into(),
                 "mcp:*".into(),
@@ -1149,9 +1142,9 @@ pub fn default_agent_definitions() -> Vec<AgentDefinition> {
             },
             enabled_tools: vec![
                 "calculator".into(),
-                "json_parse_format".into(),
-                "text_transform_summarize_prep".into(),
-                "timestamp_time_helper".into(),
+                "json_process".into(),
+                "text_process".into(),
+                "datetime".into(),
                 "read_file".into(),
                 "list_files".into(),
                 "grep_search".into(),
@@ -1167,8 +1160,6 @@ pub fn default_agent_definitions() -> Vec<AgentDefinition> {
                 "memory_write".into(),
                 "memory_search".into(),
                 "memory_get".into(),
-                "read_agent_memory".into(),
-                "write_agent_memory".into(),
                 "load_skill".into(),
                 "mcp:*".into(),
                 "plugin:*".into(),
@@ -1228,15 +1219,13 @@ pub fn default_agent_definitions() -> Vec<AgentDefinition> {
                 "ps5_info".into(),
                 "doctor".into(),
                 "write_artifact".into(),
-                "timestamp_time_helper".into(),
-                "json_parse_format".into(),
+                "datetime".into(),
+                "json_process".into(),
                 "calculator".into(),
                 "memory_read".into(),
                 "memory_write".into(),
                 "memory_search".into(),
                 "memory_get".into(),
-                "read_agent_memory".into(),
-                "write_agent_memory".into(),
                 "load_skill".into(),
                 "mcp:*".into(),
                 "plugin:*".into(),
@@ -1921,7 +1910,7 @@ mod tests {
 
     #[test]
     fn default_agents_use_first_person_prompts_unlimited_output_and_rich_tools() {
-        assert_eq!(BUILTIN_AGENTS_SCHEMA_VERSION, "5");
+        assert_eq!(BUILTIN_AGENTS_SCHEMA_VERSION, "6");
         let defs = default_agent_definitions();
         assert_eq!(defs.len(), 5);
         for d in &defs {
@@ -1937,6 +1926,34 @@ mod tests {
                 d.id,
                 d.system_prompt
             );
+            for legacy in [
+                "delegate_task",
+                "agent_message",
+                "spawn_temp_agent",
+                "write_agent_memory",
+                "read_agent_memory",
+                "json_parse_format",
+                "timestamp_time_helper",
+                "text_transform_summarize_prep",
+                "file_read",
+                "file_write",
+                "file_list",
+                "file_delete",
+            ] {
+                assert!(
+                    !d.enabled_tools.iter().any(|t| t == legacy),
+                    "{} must not retain redundant legacy alias {legacy}",
+                    d.id
+                );
+            }
+            let mut seen = std::collections::HashSet::new();
+            for tool in &d.enabled_tools {
+                assert!(
+                    seen.insert(tool.as_str()),
+                    "duplicate tool '{tool}' in {}",
+                    d.id
+                );
+            }
         }
         let cmd = defs.iter().find(|d| d.id == "commander").unwrap();
         let prog = defs.iter().find(|d| d.id == "programmer").unwrap();
@@ -1960,6 +1977,8 @@ mod tests {
             "glob_files",
             "sandbox_exec",
             "process",
+            "memory_read",
+            "memory_write",
             "load_skill",
             "mcp:*",
             "plugin:*",
@@ -1979,7 +1998,14 @@ mod tests {
             "sessions_spawn",
             "sessions_send",
             "session_status",
-            "delegate_task",
+            "assign_agent_task",
+            "send_agent_message",
+            "request_temporary_specialist",
+            "json_process",
+            "text_process",
+            "datetime",
+            "memory_read",
+            "memory_write",
             "doctor",
             "system_info",
             "ps5_info",
@@ -1990,11 +2016,34 @@ mod tests {
                 "commander missing {cmd_session_tool}"
             );
         }
+        // Legacy alias calls still match Commander's canonical allowlist via core policy resolution.
+        for legacy_alias in [
+            "delegate_task",
+            "agent_message",
+            "spawn_temp_agent",
+            "write_agent_memory",
+            "read_agent_memory",
+            "json_parse_format",
+            "timestamp_time_helper",
+            "text_transform_summarize_prep",
+        ] {
+            assert!(
+                ps5_agent_core::agent_allows_tool_with_policy(
+                    &cmd.enabled_tools,
+                    &cmd.denied_tools,
+                    legacy_alias,
+                    "",
+                ),
+                "commander should still execute legacy alias {legacy_alias}"
+            );
+        }
         for analyst_tool in [
             "calculator",
-            "json_parse_format",
-            "text_transform_summarize_prep",
-            "timestamp_time_helper",
+            "json_process",
+            "text_process",
+            "datetime",
+            "memory_read",
+            "memory_write",
             "system_info",
             "ps5_info",
             "doctor",
@@ -2003,6 +2052,19 @@ mod tests {
             assert!(
                 analyst.enabled_tools.iter().any(|t| t == analyst_tool),
                 "analyst missing {analyst_tool}"
+            );
+        }
+        for res_tool in ["datetime", "json_process", "text_process", "memory_read", "memory_write"] {
+            assert!(
+                res.enabled_tools.iter().any(|t| t == res_tool),
+                "researcher missing {res_tool}"
+            );
+        }
+        assert!(prog.enabled_tools.iter().any(|t| t == "json_process"));
+        for exec_tool in ["datetime", "json_process", "memory_read", "memory_write"] {
+            assert!(
+                exec.enabled_tools.iter().any(|t| t == exec_tool),
+                "executor missing {exec_tool}"
             );
         }
         for res_forbidden in [
@@ -2041,6 +2103,22 @@ mod tests {
                 );
             }
         }
+
+        let storage = Arc::new(MemStorage::default());
+        let (tx, _rx) = broadcast::channel(32);
+        let mgr = AgentManager::new(storage.clone(), ps5_agent_config::AppConfig::default().agents, tx);
+        let base = defs[0].clone();
+        for id in ["z-tie", "a-tie"] {
+            let mut a = base.clone();
+            a.id = id.to_string();
+            a.name = "Same Name".to_string();
+            a.priority = 50;
+            a.is_builtin = false;
+            a.is_protected = false;
+            storage.upsert_agent(&a).unwrap();
+        }
+        let ordered_ids: Vec<String> = mgr.list_agents().unwrap().into_iter().map(|a| a.id).collect();
+        assert_eq!(ordered_ids, vec!["a-tie".to_string(), "z-tie".to_string()]);
     }
 
     #[test]
@@ -2154,7 +2232,7 @@ mod tests {
                 .get_setting("builtin_agents_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("5")
+            Some("6")
         );
         assert_eq!(
             storage

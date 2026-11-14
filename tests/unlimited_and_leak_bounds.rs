@@ -89,6 +89,7 @@ impl InferenceProvider for ScriptedMutatingInference {
             finish_reason: Some("tool_calls".to_string()),
             usage: TokenUsage::default(),
             latency_ms: 1,
+            timings: None,
         })
     }
 
@@ -396,6 +397,7 @@ async fn test_zero_max_output_tokens_omits_max_tokens_over_http() {
         context_limit: 8192,
         stream: false,
         thinking_level: ThinkingLevel::Medium,
+        slot_id: None,
     };
     provider
         .generate(req_zero_chat, CancellationToken::new())
@@ -419,6 +421,7 @@ async fn test_zero_max_output_tokens_omits_max_tokens_over_http() {
         context_limit: 8192,
         stream: false,
         thinking_level: ThinkingLevel::Low,
+        slot_id: None,
     };
     provider
         .generate(req_zero_responses, CancellationToken::new())
@@ -442,6 +445,7 @@ async fn test_zero_max_output_tokens_omits_max_tokens_over_http() {
         context_limit: 8192,
         stream: false,
         thinking_level: ThinkingLevel::Medium,
+        slot_id: None,
     };
     provider
         .generate(req_bounded_chat, CancellationToken::new())
@@ -1021,6 +1025,7 @@ fn verify_storage_pruning(store: &dyn StorageBackend) {
                 archived,
                 created_at: ts.to_string(),
                 attachments: Vec::new(),
+                timings: None,
             })
             .unwrap();
     }

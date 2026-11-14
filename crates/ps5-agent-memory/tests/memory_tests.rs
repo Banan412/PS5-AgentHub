@@ -340,6 +340,7 @@ fn build_conversation_context_archives_summarizes_and_truncates_to_budget() {
                 latency_ms: None,
                 archived: false,
                 attachments: Vec::new(),
+                timings: None,
                 created_at: format!("2026-11-13T09:00:0{i}+00:00"),
             })
             .unwrap();

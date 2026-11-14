@@ -1180,6 +1180,23 @@ impl AppHttpBackend {
         state
     }
 
+    fn try_sync_slots_concurrency(&self, cfg: &mut AppConfig, slots: u32) -> bool {
+        if slots == 0 {
+            return false;
+        }
+        let slots_usize = slots as usize;
+        let prev_auto = self.auto_synced_slots.load(Ordering::Relaxed);
+        let cur = cfg.agents.max_concurrent_inference;
+        if cur == 0 || cur == 4 || (prev_auto > 0 && cur == prev_auto) {
+            self.auto_synced_slots.store(slots_usize, Ordering::Relaxed);
+            if cur != slots_usize {
+                cfg.agents.max_concurrent_inference = slots_usize;
+                return true;
+            }
+        }
+        false
+    }
+
     pub async fn sync_ps5lm_capabilities(&self) -> Result<Ps5LmCapabilities> {
         self.sync_ps5lm_capabilities_with_notify(false).await
     }
@@ -1241,18 +1258,9 @@ impl AppHttpBackend {
                 }
             }
             if let Some(slots) = caps.total_slots {
-                if slots > 0 {
-                    let slots_usize = slots as usize;
-                    let prev_auto = self.auto_synced_slots.load(Ordering::Relaxed);
-                    let cur = cfg.agents.max_concurrent_inference;
-                    if cur == 0 || cur == 4 || (prev_auto > 0 && cur == prev_auto) {
-                        if cur != slots_usize {
-                            cfg.agents.max_concurrent_inference = slots_usize;
-                            config_changed = true;
-                            max_conc_changed = true;
-                        }
-                        self.auto_synced_slots.store(slots_usize, Ordering::Relaxed);
-                    }
+                if self.try_sync_slots_concurrency(&mut cfg, slots) {
+                    config_changed = true;
+                    max_conc_changed = true;
                 }
             }
 
@@ -1725,6 +1733,7 @@ impl HttpBackend for AppHttpBackend {
                 created_at: now_iso(),
                 archived: false,
                 attachments: Vec::new(),
+                timings: None,
             });
         let task = self.store.get_task(&turn.task_id)?;
 
@@ -2194,6 +2203,22 @@ impl HttpBackend for AppHttpBackend {
                     }
                     _ => {}
                 }
+            }
+            if let Some(v) = inf.get("cache_type_k").and_then(Value::as_str) {
+                cfg.inference.cache_type_k = v.trim().to_ascii_lowercase();
+                inference_changed = true;
+            }
+            if let Some(v) = inf.get("cache_type_v").and_then(Value::as_str) {
+                cfg.inference.cache_type_v = v.trim().to_ascii_lowercase();
+                inference_changed = true;
+            }
+            if let Some(v) = inf.get("flash_attn").and_then(Value::as_bool) {
+                cfg.inference.flash_attn = v;
+                inference_changed = true;
+            }
+            if let Some(v) = inf.get("smart_tool_routing").and_then(Value::as_bool) {
+                cfg.inference.smart_tool_routing = v;
+                inference_changed = true;
             }
         }
 
@@ -2945,6 +2970,189 @@ impl HttpBackend for AppHttpBackend {
         self.sync_ps5lm_capabilities_with_notify(true).await
     }
 
+    async fn import_ps5lm_kv_settings(&self, actor: &str) -> Result<Value> {
+        let imported = self.inference.import_kv_and_sampling().await?;
+
+        let mut cfg = self.runtime.config();
+        let mut applied = serde_json::Map::new();
+
+        if let Some(ref model) = imported.model {
+            let trimmed = model.trim();
+            if !trimmed.is_empty() {
+                cfg.inference.model = trimmed.to_string();
+                applied.insert("model".to_string(), Value::String(trimmed.to_string()));
+            }
+        }
+        if let Some(n_ctx) = imported.n_ctx.filter(|&n| n > 0) {
+            cfg.inference.context_limit = n_ctx;
+            applied.insert("n_ctx".to_string(), json!(n_ctx));
+            applied.insert("context_limit".to_string(), json!(n_ctx));
+        }
+        for (key, dst, src) in [
+            (
+                "cache_type_k",
+                &mut cfg.inference.cache_type_k,
+                imported.cache_type_k.as_deref(),
+            ),
+            (
+                "cache_type_v",
+                &mut cfg.inference.cache_type_v,
+                imported.cache_type_v.as_deref(),
+            ),
+        ] {
+            if let Some(raw) = src {
+                let norm = raw.trim().to_ascii_lowercase();
+                if matches!(
+                    norm.as_str(),
+                    "f32" | "f16" | "bf16" | "q8_0" | "q4_0" | "q4_1" | "iq4_nl" | "q5_0" | "q5_1"
+                ) {
+                    *dst = norm.clone();
+                    applied.insert(key.to_string(), Value::String(norm));
+                }
+            }
+        }
+        if let Some(fa) = imported.flash_attn {
+            cfg.inference.flash_attn = fa;
+            applied.insert("flash_attn".to_string(), Value::Bool(fa));
+        }
+        for (key, dst, src) in [
+            ("n_keep", &mut cfg.inference.n_keep, imported.n_keep),
+            (
+                "dry_allowed_length",
+                &mut cfg.inference.dry_allowed_length,
+                imported.dry_allowed_length,
+            ),
+        ] {
+            if let Some(v) = src {
+                let clamped = i32::try_from(v).unwrap_or(i32::MAX);
+                *dst = clamped;
+                applied.insert(key.to_string(), json!(clamped));
+            }
+        }
+        for (key, dst, src) in [
+            ("temperature", &mut cfg.inference.temperature, imported.temperature),
+            ("top_p", &mut cfg.inference.top_p, imported.top_p),
+            ("min_p", &mut cfg.inference.min_p, imported.min_p),
+            (
+                "repeat_penalty",
+                &mut cfg.inference.repeat_penalty,
+                imported.repeat_penalty,
+            ),
+            (
+                "presence_penalty",
+                &mut cfg.inference.presence_penalty,
+                imported.presence_penalty,
+            ),
+            (
+                "frequency_penalty",
+                &mut cfg.inference.frequency_penalty,
+                imported.frequency_penalty,
+            ),
+            (
+                "dry_multiplier",
+                &mut cfg.inference.dry_multiplier,
+                imported.dry_multiplier,
+            ),
+            ("dry_base", &mut cfg.inference.dry_base, imported.dry_base),
+            (
+                "xtc_probability",
+                &mut cfg.inference.xtc_probability,
+                imported.xtc_probability,
+            ),
+            (
+                "xtc_threshold",
+                &mut cfg.inference.xtc_threshold,
+                imported.xtc_threshold,
+            ),
+        ] {
+            if let Some(v) = src.filter(|v| v.is_finite()) {
+                *dst = v;
+                applied.insert(key.to_string(), json!(v));
+            }
+        }
+        for (key, dst, src) in [
+            ("top_k", &mut cfg.inference.top_k, imported.top_k),
+            (
+                "repeat_last_n",
+                &mut cfg.inference.repeat_last_n,
+                imported.repeat_last_n,
+            ),
+            (
+                "dry_penalty_last_n",
+                &mut cfg.inference.dry_penalty_last_n,
+                imported.dry_penalty_last_n,
+            ),
+        ] {
+            if let Some(v) = src {
+                *dst = v;
+                applied.insert(key.to_string(), json!(v));
+            }
+        }
+        if let Some(ref samplers) = imported.samplers {
+            let joined = samplers
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            if !joined.is_empty() {
+                cfg.inference.samplers = joined.clone();
+                applied.insert("samplers".to_string(), Value::String(joined));
+            }
+        }
+
+        let mut max_conc_changed = false;
+        if let Some(slots) = imported.total_slots.filter(|&s| s > 0) {
+            if self.try_sync_slots_concurrency(&mut cfg, slots) {
+                max_conc_changed = true;
+                applied.insert(
+                    "max_concurrent_inference".to_string(),
+                    json!(cfg.agents.max_concurrent_inference),
+                );
+            }
+        }
+
+        cfg.sync_sandbox_and_tools();
+        for w in cfg.normalize_and_clamp() {
+            self.logger.warn("settings", w);
+        }
+        cfg.validate()?;
+
+        self.inference.update_config(cfg.inference.clone())?;
+        if max_conc_changed {
+            self.inference
+                .set_max_concurrent(cfg.agents.max_concurrent_inference);
+        }
+        self.runtime.update_config(cfg.clone());
+
+        cfg.save(&cfg.data_dir.join("config.toml"))?;
+        for (k, v) in &applied {
+            let val_str = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            self.store
+                .set_setting(&format!("inference.{k}"), &val_str)?;
+        }
+
+        self.logger.info(
+            "settings",
+            format!(
+                "actor '{actor}' imported KV/sampling settings from PS5LM ({})",
+                imported.raw_source
+            ),
+        );
+
+        Ok(json!({
+            "ok": true,
+            "imported": imported,
+            "applied": Value::Object(applied),
+            "endpoint": cfg.inference.base_url,
+            "total_slots": imported.total_slots,
+            "source": imported.raw_source,
+        }))
+    }
+
     async fn reorder_conversations(
         &self,
         ordered_ids: Vec<String>,
@@ -3350,6 +3558,15 @@ impl HttpBackend for AppHttpBackend {
 
     async fn close_browser_session(&self, session_id: &str) -> Result<bool> {
         Ok(self.tools.browser_manager().close_session(session_id))
+    }
+
+    async fn preview_browser_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<(String, String, String)> {
+        self.tools
+            .browser_manager()
+            .sanitized_session_preview_html(session_id)
     }
 
     async fn list_brain_files(&self) -> Result<Vec<BrainFileSummary>> {

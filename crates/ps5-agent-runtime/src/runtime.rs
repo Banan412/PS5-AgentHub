@@ -10,10 +10,10 @@ use ps5_agent_core::{
     agent_allows_tool_with_policy, canonical_tool_id, new_id, now_iso, AgentDefinition,
     AgentError, AgentMessageType, AgentRole, ApprovalRecord, ApprovalStatus, AuditLogEntry,
     ChatAttachment, ChatMessage, ChatRole, Conversation, ConversationMode, InferenceMessage,
-    InferenceProvider, InferenceRequest, InferenceResponse, InferenceStreamChunk, Result,
-    RuntimeLimits, SandboxApprovalPolicy, SandboxMode, ScheduleKind, ScheduleRecord,
-    StorageBackend, StreamEvent, TaskRecord, TaskStatus, ThinkingLevel, ToolCallRequest,
-    ToolDefinitionSchema, ToolExecutionRecord, ToolPermission, ToolSpec,
+    InferenceProvider, InferenceRequest, InferenceResponse, InferenceStreamChunk,
+    InferenceTimings, Result, RuntimeLimits, SandboxApprovalPolicy, SandboxMode, ScheduleKind,
+    ScheduleRecord, StorageBackend, StreamEvent, TaskRecord, TaskStatus, ThinkingLevel,
+    ToolCallRequest, ToolDefinitionSchema, ToolExecutionRecord, ToolPermission, ToolSpec,
 };
 use ps5_agent_logging::{log_info, log_warn};
 use ps5_agent_manager::{AgentManager, CreateAgentInput};
@@ -21,7 +21,7 @@ use ps5_agent_messaging::{MessageBus, SendMessageRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Semaphore};
@@ -326,6 +326,7 @@ struct ReactLoopOptions {
     max_iters: Option<u32>,
     thinking_level: Option<ThinkingLevel>,
     raw_user_request: String,
+    has_attachments: bool,
     auto_continuations: u8,
     continuation_parts: Vec<String>,
     did_write_file: bool,
@@ -394,6 +395,9 @@ pub struct AgentRuntime {
     approval_seq: AtomicU64,
     running_schedules: Arc<Mutex<HashSet<String>>>,
     last_heartbeat_at: Mutex<Option<Instant>>,
+    tool_schema_cache: RwLock<HashMap<(String, u64, u64), Vec<ToolDefinitionSchema>>>,
+    tool_schema_revision: AtomicU64,
+    cached_total_slots: AtomicU32,
     self_weak: RwLock<Weak<AgentRuntime>>,
 }
 
@@ -444,6 +448,9 @@ impl AgentRuntime {
             approval_seq: AtomicU64::new(1),
             running_schedules: Arc::new(Mutex::new(HashSet::new())),
             last_heartbeat_at: Mutex::new(None),
+            tool_schema_cache: RwLock::new(HashMap::new()),
+            tool_schema_revision: AtomicU64::new(1),
+            cached_total_slots: AtomicU32::new(0),
             self_weak: RwLock::new(Weak::new()),
         });
         if let Ok(mut weak) = rt.self_weak.write() {
@@ -698,6 +705,45 @@ impl AgentRuntime {
         }
         if let Ok(mut guard) = self.config.write() {
             *guard = cfg;
+        }
+        self.cached_total_slots.store(0, Ordering::Relaxed);
+        self.invalidate_tool_schema_cache();
+    }
+
+    pub fn invalidate_tool_schema_cache(&self) {
+        self.tool_schema_revision.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut cache) = self.tool_schema_cache.write() {
+            cache.clear();
+        }
+    }
+
+    async fn resolve_total_slots(&self, cfg: &AppConfig) -> u32 {
+        if cfg.inference.id_slot >= 0 {
+            return 0;
+        }
+        let cached = self.cached_total_slots.load(Ordering::Relaxed);
+        if cached > 0 {
+            return cached;
+        }
+        if !cfg.inference.auto_sync_from_ps5lm {
+            return 1;
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(250),
+            self.inference.discover_capabilities(),
+        )
+        .await
+        {
+            Ok(Ok(Some(caps))) => {
+                let slots = caps.total_slots.unwrap_or(1).max(1);
+                self.cached_total_slots.store(slots, Ordering::Relaxed);
+                slots
+            }
+            Ok(Ok(None)) => {
+                self.cached_total_slots.store(1, Ordering::Relaxed);
+                1
+            }
+            Ok(Err(_)) | Err(_) => 1,
         }
     }
 
@@ -1200,6 +1246,7 @@ impl AgentRuntime {
                 task_id: None,
                 token_count: m.token_count,
                 latency_ms: m.latency_ms,
+                timings: m.timings.clone(),
                 archived: false,
                 created_at: m.created_at.clone(),
                 attachments: m.attachments.clone(),
@@ -1302,6 +1349,7 @@ impl AgentRuntime {
                 task_id: None,
                 token_count: estimate_tokens(&fallback_content),
                 latency_ms: None,
+                timings: None,
                 archived: false,
                 created_at: now_iso(),
                 attachments: fallback_attachments,
@@ -1503,7 +1551,7 @@ impl AgentRuntime {
                 .build_context_for_agent(&bg_agent, Some(&bg_conv_id), Some(&bg_task_id), "")
                 .await
                 .unwrap_or_default();
-            let system_prompt = match rt.build_system_prompt(&bg_agent, &mem_ctx, true) {
+            let system_prompt = match rt.build_system_prompt(&bg_agent, &mem_ctx, true, None) {
                 Ok(p) => p,
                 Err(e) => {
                     rt.emit_chat_error_alert(&bg_conv_id, &e);
@@ -1522,6 +1570,7 @@ impl AgentRuntime {
                 image_urls: Vec::new(),
             }];
 
+            let is_group_conv = rt.is_group_conversation(&bg_conv_id);
             let mut included_existing = false;
             if let Ok(history) = rt.storage.list_chat_messages(
                 &bg_conv_id,
@@ -1543,6 +1592,7 @@ impl AgentRuntime {
                             messages[0].content.push_str(trimmed);
                         }
                     } else {
+                        let peer_name = message_peer_name(is_group_conv, &bg_agent.id, &m);
                         messages.push(InferenceMessage {
                             role: role.to_string(),
                             content: format_user_message_with_attachments(
@@ -1550,7 +1600,7 @@ impl AgentRuntime {
                                 &m.attachments,
                             ),
                             tool_call_id: None,
-                            name: m.agent_id,
+                            name: peer_name,
                             tool_calls: None,
                             image_urls: if m.role == ChatRole::User {
                                 extract_image_data_urls(&m.attachments)
@@ -1570,7 +1620,7 @@ impl AgentRuntime {
                     role: "assistant".to_string(),
                     content: updated_msg.content.clone(),
                     tool_call_id: None,
-                    name: Some(bg_agent.id.clone()),
+                    name: None,
                     tool_calls: None,
                     image_urls: Vec::new(),
                 });
@@ -1635,6 +1685,9 @@ impl AgentRuntime {
                             .unwrap_or(0)
                             .saturating_add(resp.latency_ms),
                     );
+                    if resp.timings.is_some() {
+                        updated_msg.timings = resp.timings.clone();
+                    }
                     if let Err(e) = rt.storage.update_chat_message(&updated_msg) {
                         log_warn(
                             "runtime",
@@ -1700,13 +1753,26 @@ impl AgentRuntime {
                 Ok(m) if !m.is_empty() => m,
                 _ => return,
             };
+            let cfg = rt.config();
+            let tools = rt.allowed_tool_schemas(&agent).await;
+            let total_slots = rt.resolve_total_slots(&cfg).await;
+            let slot_id =
+                resolve_conversation_slot_id(cfg.inference.id_slot, total_slots, Some(&conv_id));
+            let prefill_req = InferenceRequest {
+                model: agent.model_config.model_override.clone(),
+                api_mode: agent.model_config.api_mode,
+                messages: prefill_msgs,
+                tools,
+                temperature: agent.model_config.temperature,
+                max_output_tokens: 1,
+                context_limit: agent.model_config.context_limit,
+                slot_id,
+                stream: false,
+                thinking_level: agent.model_config.thinking_level,
+            };
             if let Err(e) = rt
                 .inference
-                .prefill_kv_cache(
-                    prefill_msgs,
-                    agent.model_config.model_override.clone(),
-                    CancellationToken::new(),
-                )
+                .prefill_kv_cache_request(prefill_req, CancellationToken::new())
                 .await
             {
                 log_warn(
@@ -1723,12 +1789,13 @@ impl AgentRuntime {
         agent: &AgentDefinition,
     ) -> Result<Vec<InferenceMessage>> {
         let cfg = self.config();
+        let is_group_conv = self.is_group_conversation(conversation_id);
         let mem_ctx = self
             .memory_provider
             .build_context_for_agent(agent, Some(conversation_id), None, "")
             .await
             .unwrap_or_default();
-        let mut system_parts = vec![self.build_system_prompt(agent, &mem_ctx, true)?];
+        let mut system_parts = vec![self.build_system_prompt(agent, &mem_ctx, true, None)?];
         let history = self.storage.list_chat_messages(
             conversation_id,
             false,
@@ -1737,6 +1804,7 @@ impl AgentRuntime {
 
         let mut rest = Vec::with_capacity(history.len());
         for m in history {
+            let peer_name = message_peer_name(is_group_conv, &agent.id, &m);
             let content = format_user_message_with_attachments(&m.content, &m.attachments);
             match m.role {
                 ChatRole::System => {
@@ -1749,7 +1817,7 @@ impl AgentRuntime {
                     role: "user".to_string(),
                     content,
                     tool_call_id: None,
-                    name: m.agent_id,
+                    name: peer_name,
                     tool_calls: None,
                     image_urls: extract_image_data_urls(&m.attachments),
                 }),
@@ -1757,7 +1825,7 @@ impl AgentRuntime {
                     role: "assistant".to_string(),
                     content,
                     tool_call_id: None,
-                    name: m.agent_id,
+                    name: peer_name,
                     tool_calls: None,
                     image_urls: Vec::new(),
                 }),
@@ -1765,7 +1833,7 @@ impl AgentRuntime {
                     role: "tool".to_string(),
                     content,
                     tool_call_id: None,
-                    name: m.agent_id,
+                    name: peer_name,
                     tool_calls: None,
                     image_urls: Vec::new(),
                 }),
@@ -2131,6 +2199,7 @@ impl AgentRuntime {
                     ),
                     thinking_level: state.thinking_level,
                     raw_user_request: state.raw_user_request,
+                    has_attachments: false,
                     auto_continuations: state.auto_continuations,
                     continuation_parts: state.continuation_parts,
                     did_write_file: state.did_write_file,
@@ -2580,10 +2649,15 @@ impl AgentRuntime {
              - If a specialist already answered completely or saved a workspace file, keep your response brief (1-2 sentences confirming the result or filename) and NEVER repeat full code blocks.",
             contributions.join("\n\n")
         );
+        let mut synth_sys = commander.system_prompt.clone();
+        if !user_content.trim().is_empty() && !is_internal_structured_prompt(user_content) {
+            synth_sys.push_str("\n\nLanguage Requirement: ");
+            synth_sys.push_str(crate::scheduler::language_response_directive(user_content));
+        }
         let synth_msgs = vec![
             InferenceMessage {
                 role: "system".to_string(),
-                content: commander.system_prompt.clone(),
+                content: synth_sys,
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
@@ -2621,6 +2695,7 @@ impl AgentRuntime {
                     resp.reasoning.as_deref(),
                     None,
                     resp.latency_ms,
+                    resp.timings.clone(),
                 )?;
                 self.emit_chat_completed(conversation_id, &parent_task_id, &commander.id, &msg);
                 self.task_manager
@@ -2708,6 +2783,7 @@ impl AgentRuntime {
             temperature: 0.0,
             max_output_tokens: 128,
             context_limit: commander.model_config.context_limit,
+            slot_id: None,
             stream: false,
             thinking_level: ThinkingLevel::Off,
         };
@@ -2827,7 +2903,12 @@ impl AgentRuntime {
         let is_main_or_direct = input.hop_count == 0
             || input.agent.id == "commander"
             || input.agent.role == AgentRole::Commander;
-        let system_prompt = self.build_system_prompt(&input.agent, &mem_ctx, is_main_or_direct)?;
+        let system_prompt = self.build_system_prompt(
+            &input.agent,
+            &mem_ctx,
+            is_main_or_direct,
+            Some(&input.raw_user_request),
+        )?;
         let mut messages = vec![InferenceMessage {
             role: "system".to_string(),
             content: system_prompt,
@@ -2840,8 +2921,10 @@ impl AgentRuntime {
         let current_text =
             format_user_message_with_attachments(&input.user_request, &input.attachments);
         let current_images = extract_image_data_urls(&input.attachments);
+        let has_attachments = !input.attachments.is_empty();
 
         if let Some(ref conv_id) = input.conversation_id {
+            let is_group_conv = self.is_group_conversation(conv_id);
             let history = self.storage.list_chat_messages(
                 conv_id,
                 false,
@@ -2866,16 +2949,17 @@ impl AgentRuntime {
                         role: "user".to_string(),
                         content: current_text.clone(),
                         tool_call_id: None,
-                        name: m.agent_id.clone(),
+                        name: None,
                         tool_calls: None,
                         image_urls: current_images.clone(),
                     });
                 } else {
+                    let peer_name = message_peer_name(is_group_conv, &input.agent.id, m);
                     messages.push(InferenceMessage {
                         role: role.to_string(),
                         content: format_user_message_with_attachments(&m.content, &m.attachments),
                         tool_call_id: None,
-                        name: m.agent_id.clone(),
+                        name: peer_name,
                         tool_calls: None,
                         image_urls: Vec::new(),
                     });
@@ -2913,6 +2997,7 @@ impl AgentRuntime {
                 max_iters,
                 thinking_level: input.thinking_level,
                 raw_user_request: input.raw_user_request,
+                has_attachments,
                 auto_continuations: 0,
                 continuation_parts: Vec::new(),
                 did_write_file: false,
@@ -3005,7 +3090,7 @@ impl AgentRuntime {
             role: "assistant".to_string(),
             content: pause_content,
             tool_call_id: None,
-            name: Some(agent.id.clone()),
+            name: None,
             tool_calls: Some(batch_calls.clone()),
             image_urls: Vec::new(),
         });
@@ -3091,13 +3176,25 @@ impl AgentRuntime {
             };
             let _ = self.task_manager.update_progress(task_id, pct, Some(note));
 
+            let tools_for_iter = if self.config().inference.smart_tool_routing
+                && iter == 0
+                && !opts.has_attachments
+                && !messages.iter().any(|m| m.role == "tool")
+                && allowed_tools.len() > 12
+            {
+                select_tools_for_casual_turn(&opts.raw_user_request, &allowed_tools)
+                    .unwrap_or_else(|| allowed_tools.clone())
+            } else {
+                allowed_tools.clone()
+            };
+
             let resp = self
                 .run_inference_call(
                     agent,
                     conversation_id,
                     task_id,
                     messages.clone(),
-                    allowed_tools.clone(),
+                    tools_for_iter,
                     opts.thinking_level,
                     cancel.clone(),
                 )
@@ -3118,7 +3215,7 @@ impl AgentRuntime {
                         role: "assistant".to_string(),
                         content: resp.content,
                         tool_call_id: None,
-                        name: Some(agent.id.clone()),
+                        name: None,
                         tool_calls: None,
                         image_urls: Vec::new(),
                     });
@@ -3416,6 +3513,7 @@ impl AgentRuntime {
                             resp.reasoning.as_deref(),
                             None,
                             resp.latency_ms,
+                            resp.timings.clone(),
                         )?;
                         self.emit_chat_completed(conv_id, task_id, &agent.id, &msg);
                         self.spawn_kv_cache_prefill(conv_id, agent, hop_count);
@@ -3445,7 +3543,7 @@ impl AgentRuntime {
                 role: "assistant".to_string(),
                 content: resp.content.clone(),
                 tool_call_id: None,
-                name: Some(agent.id.clone()),
+                name: None,
                 tool_calls: Some(resp.tool_calls.clone()),
                 image_urls: Vec::new(),
             });
@@ -3527,30 +3625,36 @@ impl AgentRuntime {
 
             let started = Instant::now();
 
-            let is_builtin_orchestration = matches!(
+            let is_schedule_tool = matches!(
                 tc.name.as_str(),
-                "delegate_task"
-                    | "agent_message"
-                    | "spawn_temp_agent"
-                    | "schedule_create"
-                    | "schedule_list"
-                    | "schedule_update"
-                    | "schedule_delete"
+                "schedule_create" | "schedule_list" | "schedule_update" | "schedule_delete"
             );
-            let external_spec = if is_builtin_orchestration {
+            let is_legacy_orch = matches!(
+                tc.name.as_str(),
+                "delegate_task" | "agent_message" | "spawn_temp_agent"
+            );
+            let is_canonical_orch = matches!(
+                tc.name.as_str(),
+                "assign_agent_task" | "send_agent_message" | "request_temporary_specialist"
+            );
+            let external_spec = if is_schedule_tool || is_legacy_orch {
                 None
             } else {
                 self.tool_executor.get_tool(&tc.name).await
             };
+            let is_builtin_orchestration =
+                is_schedule_tool || is_legacy_orch || (is_canonical_orch && external_spec.is_none());
             let allowed = match external_spec.as_ref() {
                 Some(spec) => agent_allows_tool_spec(agent, spec),
                 None => {
-                    let category = if is_builtin_orchestration {
-                        "orchestration"
+                    if is_schedule_tool {
+                        agent_allows_tool_name(agent, &tc.name, "orchestration")
+                    } else if is_legacy_orch || is_canonical_orch {
+                        agent_allows_tool_name(agent, &tc.name, "agent")
+                            || agent_allows_tool_name(agent, &tc.name, "orchestration")
                     } else {
-                        ""
-                    };
-                    agent_allows_tool_name(agent, &tc.name, category)
+                        agent_allows_tool_name(agent, &tc.name, "")
+                    }
                 }
             };
 
@@ -3568,7 +3672,7 @@ impl AgentRuntime {
             // Built-in runtime orchestration and scheduling tools
             if is_builtin_orchestration {
                 let res = match tc.name.as_str() {
-                    "delegate_task" => {
+                    "delegate_task" | "assign_agent_task" => {
                         self.handle_delegate_task(
                             agent,
                             task_id,
@@ -3580,13 +3684,15 @@ impl AgentRuntime {
                         )
                         .await
                     }
-                    "agent_message" => self.handle_agent_message(
+                    "agent_message" | "send_agent_message" => self.handle_agent_message(
                         agent,
                         root_task_id,
                         tc.arguments.clone(),
                         hop_count,
                     ),
-                    "spawn_temp_agent" => self.handle_spawn_temp_agent(agent, tc.arguments.clone()),
+                    "spawn_temp_agent" | "request_temporary_specialist" => {
+                        self.handle_spawn_temp_agent(agent, tc.arguments.clone())
+                    }
                     "schedule_create" => self.handle_schedule_create_tool(tc.arguments.clone()),
                     "schedule_list" => self.handle_schedule_list_tool(tc.arguments.clone()),
                     "schedule_update" => self.handle_schedule_update_tool(tc.arguments.clone()),
@@ -3700,6 +3806,19 @@ impl AgentRuntime {
                 }));
             }
 
+            let web_activity_info = web_tool_activity_start(&tc.name, &tc.arguments);
+            if let Some((action, ref url, ref title)) = web_activity_info {
+                self.emit_web_browser_activity(
+                    conversation_id,
+                    task_id,
+                    &agent.id,
+                    action,
+                    url.clone(),
+                    title.clone(),
+                    "started",
+                );
+            }
+
             match self
                 .tool_executor
                 .execute_tool_with_context(
@@ -3716,6 +3835,31 @@ impl AgentRuntime {
                 .await
             {
                 Ok(out) => {
+                    if let Some((action, url, title)) = web_activity_info {
+                        let resolved_url = out
+                            .output
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .map(sanitize_url_for_event)
+                            .filter(|s| !s.is_empty())
+                            .or(url);
+                        let resolved_title = out
+                            .output
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .map(|t| t.chars().take(120).collect::<String>())
+                            .filter(|s| !s.trim().is_empty())
+                            .or(title);
+                        self.emit_web_browser_activity(
+                            conversation_id,
+                            task_id,
+                            &agent.id,
+                            action,
+                            resolved_url,
+                            resolved_title,
+                            "completed",
+                        );
+                    }
                     if out.is_mutating {
                         let _ = self.task_manager.mark_side_effects(task_id);
                         if root_task_id != task_id {
@@ -3784,11 +3928,33 @@ impl AgentRuntime {
                     }));
                 }
                 Err(e @ AgentError::Cancelled(_)) => {
+                    if let Some((action, url, title)) = web_activity_info {
+                        self.emit_web_browser_activity(
+                            conversation_id,
+                            task_id,
+                            &agent.id,
+                            action,
+                            url,
+                            title,
+                            "error",
+                        );
+                    }
                     let msg = e.to_string();
                     self.record_tool_failure(agent, task_id, &tc.name, &args_json, &msg, started);
                     return Err(e);
                 }
                 Err(e) => {
+                    if let Some((action, url, title)) = web_activity_info {
+                        self.emit_web_browser_activity(
+                            conversation_id,
+                            task_id,
+                            &agent.id,
+                            action,
+                            url,
+                            title,
+                            "error",
+                        );
+                    }
                     let msg = e.to_string();
                     self.record_tool_failure(agent, task_id, &tc.name, &args_json, &msg, started);
                     messages.push(tool_observation_msg(tc, serde_json::json!({ "error": msg })));
@@ -3897,13 +4063,19 @@ impl AgentRuntime {
         cancel: CancellationToken,
     ) -> Result<serde_json::Value> {
         let target_id = args
-            .get("agent_id")
+            .get("target_agent_id")
+            .or_else(|| args.get("agent_id"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::InvalidInput("delegate_task requires 'agent_id'".into()))?;
+            .ok_or_else(|| {
+                AgentError::InvalidInput("assign_agent_task requires 'target_agent_id'".into())
+            })?;
         let subtask_prompt = args
-            .get("task")
+            .get("user_request")
+            .or_else(|| args.get("task"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::InvalidInput("delegate_task requires 'task'".into()))?;
+            .ok_or_else(|| {
+                AgentError::InvalidInput("assign_agent_task requires 'user_request'".into())
+            })?;
 
         let next_hop = hop_count + 1;
         // Enforce A2A permissions and loop protection via MessageBus
@@ -4040,16 +4212,25 @@ impl AgentRuntime {
         let name = args
             .get("name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::InvalidInput("spawn_temp_agent requires 'name'".into()))?;
+            .ok_or_else(|| {
+                AgentError::InvalidInput("request_temporary_specialist requires 'name'".into())
+            })?;
         let description = args
             .get("description")
+            .or_else(|| args.get("role_label"))
             .and_then(|v| v.as_str())
             .unwrap_or("Temporary specialist");
+        let role_label = args
+            .get("role_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Temporary Specialist");
         let system_prompt = args
             .get("system_prompt")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                AgentError::InvalidInput("spawn_temp_agent requires 'system_prompt'".into())
+                AgentError::InvalidInput(
+                    "request_temporary_specialist requires 'system_prompt'".into(),
+                )
             })?;
         let id = args
             .get("id")
@@ -4080,7 +4261,7 @@ impl AgentRuntime {
                 name: name.to_string(),
                 description: description.to_string(),
                 role: AgentRole::Custom,
-                role_label: Some("Temporary Specialist".into()),
+                role_label: Some(role_label.to_string()),
                 system_prompt: system_prompt.to_string(),
                 model_config: None,
                 enabled_tools,
@@ -4119,6 +4300,9 @@ impl AgentRuntime {
     ) -> Result<InferenceResponse> {
         let cfg = self.config();
         let stream_enabled = cfg.inference.stream_enabled;
+        let total_slots = self.resolve_total_slots(&cfg).await;
+        let slot_id =
+            resolve_conversation_slot_id(cfg.inference.id_slot, total_slots, conversation_id);
         let req = InferenceRequest {
             model: agent.model_config.model_override.clone(),
             api_mode: agent.model_config.api_mode,
@@ -4127,6 +4311,7 @@ impl AgentRuntime {
             temperature: agent.model_config.temperature,
             max_output_tokens: agent.model_config.max_output_tokens,
             context_limit: agent.model_config.context_limit,
+            slot_id,
             stream: stream_enabled,
             thinking_level: thinking_override.unwrap_or(agent.model_config.thinking_level),
         };
@@ -4179,15 +4364,28 @@ impl AgentRuntime {
         res
     }
 
-    async fn allowed_tool_schemas(&self, agent: &AgentDefinition) -> Vec<ToolDefinitionSchema> {
-        let mut schemas = Vec::new();
-        for builtin in builtin_orchestration_schemas() {
-            if agent_allows_tool_name(agent, &builtin.name, "orchestration") {
-                schemas.push(builtin);
+    pub(crate) async fn allowed_tool_schemas(
+        &self,
+        agent: &AgentDefinition,
+    ) -> Vec<ToolDefinitionSchema> {
+        let executor_specs = self.tool_executor.list_tools().await;
+        let policy_hash = tool_policy_hash(agent);
+        let revision = tools_revision_hash(&executor_specs)
+            ^ self.tool_schema_revision.load(Ordering::Relaxed);
+        let cache_key = (agent.id.clone(), policy_hash, revision);
+
+        if let Ok(cache) = self.tool_schema_cache.read() {
+            if let Some(hit) = cache.get(&cache_key) {
+                return hit.clone();
             }
         }
-        for spec in self.tool_executor.list_tools().await {
-            if spec.enabled && agent_allows_tool_spec(agent, &spec) {
+
+        let mut schemas = Vec::new();
+        let mut seen = HashSet::new();
+
+        for spec in executor_specs {
+            if spec.enabled && agent_allows_tool_spec(agent, &spec) && seen.insert(spec.id.clone())
+            {
                 schemas.push(ToolDefinitionSchema {
                     name: spec.id,
                     description: spec.description,
@@ -4195,27 +4393,46 @@ impl AgentRuntime {
                 });
             }
         }
+
+        for builtin in builtin_orchestration_schemas() {
+            let allowed = if matches!(
+                builtin.name.as_str(),
+                "assign_agent_task" | "send_agent_message" | "request_temporary_specialist"
+            ) {
+                agent_allows_tool_name(agent, &builtin.name, "agent")
+                    || agent_allows_tool_name(agent, &builtin.name, "orchestration")
+            } else {
+                agent_allows_tool_name(agent, &builtin.name, "orchestration")
+            };
+            if allowed && seen.insert(builtin.name.clone()) {
+                schemas.push(builtin);
+            }
+        }
+
+        if let Ok(mut cache) = self.tool_schema_cache.write() {
+            cache.retain(|(aid, _, _), _| aid != &agent.id);
+            cache.insert(cache_key, schemas.clone());
+        }
+
         schemas
     }
 
-    fn build_system_prompt(
+    pub(crate) fn build_system_prompt(
         &self,
         agent: &AgentDefinition,
         mem_ctx: &str,
         include_user_brain: bool,
+        user_prompt_for_lang: Option<&str>,
     ) -> Result<String> {
         let mut prompt = format!(
-            "{}\n\nAgent Identity: {} (id: {}, role: {})\nCurrent UTC time: {}",
-            agent.system_prompt,
-            agent.name,
-            agent.id,
-            agent.role_label,
-            Utc::now().to_rfc3339()
+            "{}\n\nAgent Identity: {} (id: {}, role: {})",
+            agent.system_prompt, agent.name, agent.id, agent.role_label,
         );
 
         prompt.push_str(
             "\n\nCore Response Rules:\n\
              - Always speak directly in the 1st person (\"I...\"), never refer to yourself in the 3rd person.\n\
+             - NEVER begin a response with self-addressing greetings or filler like \"Got it, <AgentName>!\" or \"Got it, Commander!\"; answer the user directly in the user's own language and NEVER repeat your own sentences or paragraphs verbatim.\n\
              - Never dump your tool list unless the user explicitly asks what tools you have.\n\
              - When asked to create or build code, HTML, apps, games, or scripts, save the complete working file via `write_file` instead of pasting long truncated code blocks in chat, then briefly confirm the saved filename.",
         );
@@ -4235,13 +4452,14 @@ impl AgentRuntime {
         }
 
         if agent.can_communicate {
-            let peers: Vec<String> = self
+            let mut peers: Vec<String> = self
                 .agent_manager
                 .list_agents()?
                 .into_iter()
                 .filter(|a| a.enabled && a.id != agent.id)
                 .map(|a| format!("{} ({}): {}", a.id, a.role_label, a.description))
                 .collect();
+            peers.sort();
             if !peers.is_empty() {
                 prompt.push_str("\n\nAvailable peer agents:\n");
                 for p in peers {
@@ -4250,7 +4468,9 @@ impl AgentRuntime {
             }
         }
 
-        let (skills, plugin_rules) = self.tool_executor.extension_prompt_context();
+        let (mut skills, mut plugin_rules) = self.tool_executor.extension_prompt_context();
+        skills.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        plugin_rules.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         if !skills.is_empty() && agent_allows_tool_name(agent, "load_skill", "skills") {
             prompt.push_str(
                 "\n\nAvailable Skills (call `load_skill` with skill id/name when relevant):\n",
@@ -4266,11 +4486,56 @@ impl AgentRuntime {
             }
         }
 
+        // Dynamic tail appended AFTER static prefix so prompt KV cache prefix stays identical across turns.
         if !mem_ctx.trim().is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(mem_ctx);
         }
+        if let Some(raw) = user_prompt_for_lang {
+            if !raw.trim().is_empty() && !is_internal_structured_prompt(raw) {
+                prompt.push_str("\n\nLanguage Requirement: ");
+                prompt.push_str(crate::scheduler::language_response_directive(raw));
+            }
+        }
         Ok(prompt)
+    }
+
+    fn is_group_conversation(&self, conv_id: &str) -> bool {
+        self.storage
+            .get_conversation(conv_id)
+            .ok()
+            .flatten()
+            .is_some_and(|c| matches!(c.mode, ConversationMode::Group { .. }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_web_browser_activity(
+        &self,
+        conversation_id: Option<&str>,
+        task_id: &str,
+        agent_id: &str,
+        action: &str,
+        url: Option<String>,
+        title: Option<String>,
+        status: &str,
+    ) {
+        let _ = self.events_tx.send(StreamEvent::BrowserActivity {
+            conversation_id: conversation_id.map(str::to_string),
+            task_id: Some(task_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            session_id: format!("tool-{task_id}"),
+            action: action.to_string(),
+            url,
+            title,
+            selector: None,
+            x_pct: None,
+            y_pct: None,
+            w_pct: None,
+            h_pct: None,
+            scroll_y: None,
+            status: status.to_string(),
+            timestamp: now_iso(),
+        });
     }
 
     fn append_user_message_with_attachments(
@@ -4290,6 +4555,7 @@ impl AgentRuntime {
             task_id: None,
             token_count: estimate_tokens(content),
             latency_ms: None,
+            timings: None,
             archived: false,
             attachments,
             created_at: now_iso(),
@@ -4308,6 +4574,7 @@ impl AgentRuntime {
         reasoning: Option<&str>,
         tool_calls_json: Option<&str>,
         latency_ms: u64,
+        timings: Option<InferenceTimings>,
     ) -> Result<ChatMessage> {
         let msg = ChatMessage {
             id: new_id(),
@@ -4320,6 +4587,7 @@ impl AgentRuntime {
             task_id: Some(task_id.to_string()),
             token_count: estimate_tokens(content),
             latency_ms: Some(latency_ms),
+            timings,
             archived: false,
             attachments: Vec::new(),
             created_at: now_iso(),
@@ -4342,6 +4610,7 @@ impl AgentRuntime {
             message_id: msg.id.clone(),
             content: msg.content.clone(),
             reasoning: msg.reasoning.clone(),
+            timings: msg.timings.clone(),
         });
     }
 
@@ -5416,13 +5685,196 @@ fn extract_agent_addressed_request_with_options(
     None
 }
 
-fn is_casual_greeting_or_ping(user_content: &str) -> bool {
-    let trimmed = user_content.trim();
-    if trimmed.is_empty() {
-        return false;
+const NON_CASUAL_TOOL_CUE_WORDS: &[&str] = &[
+    "code",
+    "kod",
+    "file",
+    "files",
+    "plik",
+    "pliki",
+    "app",
+    "aplikacja",
+    "aplikacje",
+    "game",
+    "gra",
+    "gry",
+    "html",
+    "css",
+    "js",
+    "rust",
+    "python",
+    "py",
+    "script",
+    "skrypt",
+    "search",
+    "szukaj",
+    "wyszukaj",
+    "web",
+    "internet",
+    "browser",
+    "open",
+    "otworz",
+    "click",
+    "kliknij",
+    "scroll",
+    "navigate",
+    "fetch",
+    "pobierz",
+    "http",
+    "https",
+    "url",
+    "curl",
+    "mcp",
+    "plugin",
+    "plugins",
+    "skill",
+    "skills",
+    "custom",
+    "memory",
+    "pamiec",
+    "remember",
+    "zapamietaj",
+    "recall",
+    "przypomnij",
+    "bash",
+    "shell",
+    "cmd",
+    "terminal",
+    "patch",
+    "schedule",
+    "harmonogram",
+    "cron",
+    "timer",
+    "reminder",
+    "calc",
+    "calculator",
+    "math",
+    "policz",
+    "oblicz",
+    "json",
+    "yaml",
+    "time",
+    "datetime",
+    "date",
+    "today",
+    "czas",
+    "data",
+    "godzina",
+    "tool",
+    "tools",
+    "narzedzie",
+    "narzedzia",
+    "build",
+    "zbuduj",
+    "create",
+    "stworz",
+    "utworz",
+    "write",
+    "napisz",
+    "edit",
+    "edytuj",
+    "fix",
+    "napraw",
+    "debug",
+    "run",
+    "uruchom",
+    "exec",
+    "wykonaj",
+    "analyze",
+    "przeanalizuj",
+    "research",
+    "zbadaj",
+    "summarize",
+    "podsumuj",
+    "project",
+    "projekt",
+    "delete",
+    "usun",
+    "read",
+    "przeczytaj",
+    "workspace",
+    "folder",
+    "directory",
+    "katalog",
+    "page",
+    "strona",
+    "strone",
+    "link",
+    "check",
+    "sprawdz",
+    "find",
+    "znajdz",
+    "list",
+    "wypisz",
+    "show",
+    "pokaz",
+    "status",
+    "system",
+    "info",
+    "ps5",
+    "log",
+    "logs",
+    "logi",
+    "grep",
+    "glob",
+    "git",
+    "cargo",
+    "wtyczka",
+    "wtyczki",
+    "flappy",
+    "programmer",
+    "researcher",
+    "executor",
+    "reviewer",
+    "sysadmin",
+    "historian",
+    "designer",
+    "agent",
+    "agents",
+    "analyst",
+    "coordinate",
+    "delegate",
+    "delegation",
+    "orchestrate",
+    "assign",
+    "collaborate",
+    "team",
+    "specialist",
+    "specialists",
+    "architecture",
+    "review",
+    "audit",
+    "workflow",
+    "koordynuj",
+    "deleguj",
+    "zlec",
+    "przydziel",
+    "zespol",
+    "architektura",
+    "przeglad",
+    "audyt",
+];
+
+fn contains_tool_or_action_cue(trimmed: &str, words: &[String]) -> bool {
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("://")
+        || trimmed.contains('`')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains('[')
+        || trimmed.contains(']')
+        || trimmed.contains('<')
+        || trimmed.contains('>')
+        || trimmed.contains('=')
+        || (trimmed.chars().any(|c| c.is_ascii_digit())
+            && trimmed
+                .chars()
+                .any(|c| matches!(c, '+' | '-' | '*' | '/' | '%')))
+    {
+        return true;
     }
 
-    // Any dotted filename or domain token (e.g. index.html, helper.py, example.com) must route normally.
     for raw_tok in trimmed.split_whitespace() {
         let cleaned = trim_routing_punct(raw_tok);
         if let Some(dot_idx) = cleaned.find('.') {
@@ -5430,9 +5882,20 @@ fn is_casual_greeting_or_ping(user_content: &str) -> bool {
             let after = &cleaned[dot_idx + 1..];
             if before.chars().any(char::is_alphanumeric) && after.chars().any(char::is_alphanumeric)
             {
-                return false;
+                return true;
             }
         }
+    }
+
+    words
+        .iter()
+        .any(|w| NON_CASUAL_TOOL_CUE_WORDS.contains(&w.as_str()))
+}
+
+pub(crate) fn is_casual_greeting_or_ping(user_content: &str) -> bool {
+    let trimmed = user_content.trim();
+    if trimmed.is_empty() {
+        return false;
     }
 
     let folded = fold_polish_ascii(trimmed);
@@ -5441,85 +5904,8 @@ fn is_casual_greeting_or_ping(user_content: &str) -> bool {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    if words.is_empty() || words.len() > 6 {
+    if words.is_empty() || words.len() > 6 || contains_tool_or_action_cue(trimmed, &words) {
         return false;
-    }
-
-    for w in &words {
-        if matches!(
-            w.as_str(),
-            "code"
-                | "kod"
-                | "file"
-                | "plik"
-                | "app"
-                | "aplikacja"
-                | "aplikacje"
-                | "game"
-                | "gra"
-                | "gry"
-                | "html"
-                | "css"
-                | "js"
-                | "rust"
-                | "python"
-                | "py"
-                | "script"
-                | "skrypt"
-                | "search"
-                | "szukaj"
-                | "wyszukaj"
-                | "web"
-                | "internet"
-                | "schedule"
-                | "harmonogram"
-                | "cron"
-                | "timer"
-                | "tool"
-                | "tools"
-                | "narzedzie"
-                | "narzedzia"
-                | "build"
-                | "zbuduj"
-                | "create"
-                | "stworz"
-                | "utworz"
-                | "write"
-                | "napisz"
-                | "edit"
-                | "edytuj"
-                | "fix"
-                | "napraw"
-                | "debug"
-                | "run"
-                | "uruchom"
-                | "exec"
-                | "wykonaj"
-                | "analyze"
-                | "przeanalizuj"
-                | "research"
-                | "zbadaj"
-                | "summarize"
-                | "podsumuj"
-                | "project"
-                | "projekt"
-                | "delete"
-                | "usun"
-                | "read"
-                | "przeczytaj"
-                | "workspace"
-                | "flappy"
-                | "programmer"
-                | "researcher"
-                | "executor"
-                | "reviewer"
-                | "sysadmin"
-                | "historian"
-                | "designer"
-                | "agent"
-        ) {
-            return false;
-        }
     }
 
     let filtered: Vec<&str> = words
@@ -5546,6 +5932,7 @@ fn is_casual_greeting_or_ping(user_content: &str) -> bool {
         "witam",
         "witaj",
         "hello",
+        "hallo",
         "hi",
         "hey",
         "yo",
@@ -5576,6 +5963,185 @@ fn is_casual_greeting_or_ping(user_content: &str) -> bool {
                 .strip_prefix(g)
                 .is_some_and(|tail| tail.is_empty() || tail.starts_with(' '))
     })
+}
+
+fn is_extension_or_conversational_tool(name: &str) -> bool {
+    name.starts_with("mcp:")
+        || name.starts_with("plugin:")
+        || name.starts_with("custom:")
+        || name == "load_skill"
+        || matches!(
+            canonical_tool_id(name),
+            "memory_read" | "memory_search" | "datetime"
+        )
+}
+
+pub(crate) fn select_tools_for_casual_turn(
+    raw_user_request: &str,
+    allowed_tools: &[ToolDefinitionSchema],
+) -> Option<Vec<ToolDefinitionSchema>> {
+    if is_casual_greeting_or_ping(raw_user_request) {
+        return Some(Vec::new());
+    }
+
+    let trimmed = raw_user_request.trim();
+    if trimmed.is_empty() || trimmed.len() > 140 || trimmed.contains('\n') {
+        return None;
+    }
+
+    let folded = fold_polish_ascii(trimmed);
+    let words: Vec<String> = folded
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if words.is_empty() || words.len() > 20 || contains_tool_or_action_cue(trimmed, &words) {
+        return None;
+    }
+
+    let slimmed: Vec<ToolDefinitionSchema> = allowed_tools
+        .iter()
+        .filter(|t| is_extension_or_conversational_tool(&t.name))
+        .cloned()
+        .collect();
+    if slimmed.len() < allowed_tools.len() {
+        Some(slimmed)
+    } else {
+        None
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn fnv1a_hash_str(mut hash: u64, s: &str) -> u64 {
+    const FNV_PRIME: u64 = 0x100000001b3;
+    for &b in s.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash ^= 0xff;
+    hash.wrapping_mul(FNV_PRIME)
+}
+
+fn tool_policy_hash(agent: &AgentDefinition) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for p in &agent.enabled_tools {
+        hash = fnv1a_hash_str(hash, p);
+    }
+    hash = fnv1a_hash_str(hash, "--denied--");
+    for p in &agent.denied_tools {
+        hash = fnv1a_hash_str(hash, p);
+    }
+    hash
+}
+
+fn tools_revision_hash(specs: &[ToolSpec]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for spec in specs {
+        hash = fnv1a_hash_str(hash, &spec.id);
+        hash = fnv1a_hash_str(hash, if spec.enabled { "1" } else { "0" });
+        hash = fnv1a_hash_str(hash, &spec.category);
+        hash = fnv1a_hash_str(hash, &spec.description);
+    }
+    hash
+}
+
+pub(crate) fn resolve_conversation_slot_id(
+    configured_id_slot: i32,
+    total_slots: u32,
+    conversation_id: Option<&str>,
+) -> Option<i32> {
+    if configured_id_slot >= 0 {
+        return Some(configured_id_slot);
+    }
+    if total_slots > 1 {
+        if let Some(conv_id) = conversation_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let slot = (fnv1a_64(conv_id.as_bytes()) % u64::from(total_slots)) as i32;
+            return Some(slot);
+        }
+    }
+    None
+}
+
+fn message_peer_name(
+    is_group_conv: bool,
+    current_agent_id: &str,
+    msg: &ChatMessage,
+) -> Option<String> {
+    match msg.role {
+        ChatRole::Tool => msg.agent_id.clone(),
+        ChatRole::Assistant => {
+            if is_group_conv
+                && msg
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|id| !id.trim().is_empty() && id != current_agent_id)
+            {
+                msg.agent_id.clone()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_internal_structured_prompt(raw: &str) -> bool {
+    let trimmed = raw.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+fn sanitize_url_for_event(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let without_qf = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    if let Some(scheme_pos) = without_qf.find("://") {
+        let after_scheme = &without_qf[scheme_pos + 3..];
+        let auth_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+        if let Some(at_pos) = after_scheme[..auth_end].rfind('@') {
+            return format!(
+                "{}{}",
+                &without_qf[..scheme_pos + 3],
+                &after_scheme[at_pos + 1..]
+            );
+        }
+    }
+    without_qf.to_string()
+}
+
+fn web_tool_activity_start(
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Option<(&'static str, Option<String>, Option<String>)> {
+    match canonical_tool_id(tool_name) {
+        "web_search" => {
+            let title = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|q| format!("Search: {}", q.chars().take(120).collect::<String>()));
+            Some(("search", None, title))
+        }
+        "web_fetch" | "http_get" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(sanitize_url_for_event)
+                .filter(|s| !s.is_empty());
+            Some(("fetch", url, None))
+        }
+        _ => None,
+    }
 }
 
 fn resolve_agent_routing_for_mode(
@@ -5994,20 +6560,21 @@ fn strip_json_fences(raw: &str) -> &str {
 fn builtin_orchestration_schemas() -> Vec<ToolDefinitionSchema> {
     vec![
         ToolDefinitionSchema {
-            name: "delegate_task".to_string(),
-            description: "Delegate a subtask to another enabled agent by agent_id and await its result.".to_string(),
+            name: "assign_agent_task".to_string(),
+            description: "Delegate a sub-task to another enabled agent.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "agent_id": { "type": "string" },
-                    "task": { "type": "string" }
+                    "target_agent_id": { "type": "string" },
+                    "user_request": { "type": "string" }
                 },
-                "required": ["agent_id", "task"]
+                "required": ["target_agent_id", "user_request"]
             }),
         },
         ToolDefinitionSchema {
-            name: "agent_message".to_string(),
-            description: "Send a persistent A2A message to another agent via MessageBus.".to_string(),
+            name: "send_agent_message".to_string(),
+            description: "Send an agent-to-agent message through the runtime messaging bus."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -6019,18 +6586,19 @@ fn builtin_orchestration_schemas() -> Vec<ToolDefinitionSchema> {
             }),
         },
         ToolDefinitionSchema {
-            name: "spawn_temp_agent".to_string(),
-            description: "Create a temporary specialist agent (Commander only).".to_string(),
+            name: "request_temporary_specialist".to_string(),
+            description: "Request creation of a temporary specialist agent for a focused sub-task."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string" },
                     "name": { "type": "string" },
-                    "description": { "type": "string" },
+                    "role_label": { "type": "string" },
                     "system_prompt": { "type": "string" },
-                    "enabled_tools": { "type": "array", "items": { "type": "string" } }
+                    "enabled_tools": { "type": "array", "items": { "type": "string" } },
+                    "task_request": { "type": "string" }
                 },
-                "required": ["name", "description", "system_prompt"]
+                "required": ["name", "role_label", "system_prompt"]
             }),
         },
         ToolDefinitionSchema {

@@ -660,6 +660,13 @@ pub trait HttpBackend: Send + Sync {
         ))
     }
 
+    /// Imports live KV-cache and sampling settings from the configured PS5LM server.
+    async fn import_ps5lm_kv_settings(&self, _actor: &str) -> Result<serde_json::Value> {
+        Err(AgentError::Inference(
+            "PS5LM KV settings import not configured on backend".into(),
+        ))
+    }
+
     async fn reorder_conversations(
         &self,
         _ordered_ids: Vec<String>,
@@ -868,6 +875,16 @@ pub trait HttpBackend: Send + Sync {
 
     async fn close_browser_session(&self, _session_id: &str) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Returns `(session_id, sanitized_url, sanitized_html)` for an active sandbox browser session.
+    async fn preview_browser_session(
+        &self,
+        _session_id: Option<&str>,
+    ) -> Result<(String, String, String)> {
+        Err(AgentError::NotFound(
+            "No active browser session to preview".into(),
+        ))
     }
 
     async fn list_brain_files(&self) -> Result<Vec<BrainFileSummary>> {

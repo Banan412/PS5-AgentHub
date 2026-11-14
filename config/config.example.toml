@@ -19,6 +19,13 @@ context_limit = 8192
 max_output_tokens = 1024
 stream_enabled = true
 max_retries = 2
+repeat_last_n = 256
+dry_multiplier = 0.8
+smart_tool_routing = true
+# Optional llama-server KV cache quantization types ("", "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1")
+cache_type_k = ""
+cache_type_v = ""
+flash_attn = false
 
 [server]
 bind_host = "0.0.0.0"

@@ -1,13 +1,15 @@
 use crate::parser::{
-    normalize_conversation_messages, parse_model_output, StreamPiece, ThinkStreamSplitter,
+    normalize_conversation_messages, parse_model_output, truncate_verbatim_prose_loops,
+    StreamPiece, StreamingLoopDecision, StreamingRepetitionGuard, ThinkStreamSplitter,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use ps5_agent_config::InferenceConfig;
 use ps5_agent_core::{
     now_iso, AgentError, ApiMode, InferenceMessage, InferenceProvider, InferenceRequest,
-    InferenceResponse, InferenceStreamChunk, ProviderHealth, Ps5LmCapabilities, Result,
-    SystemOneRequest, SystemOneResponse, ThinkingLevel, TokenUsage, ToolCallRequest,
+    InferenceResponse, InferenceStreamChunk, InferenceTimings, ProviderHealth, Ps5LmCapabilities,
+    Ps5LmKvSamplingImport, Result, SystemOneRequest, SystemOneResponse, ThinkingLevel, TokenUsage,
+    ToolCallRequest,
 };
 use ps5_agent_logging::{log_debug, log_error, log_info, log_warn};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -639,9 +641,15 @@ impl Ps5LmProvider {
                         )
                         .await?;
                         consumed = line_end + 1;
+                        if sse_state.aborted_loop_clean.is_some() {
+                            break;
+                        }
                     }
                     if consumed > 0 {
                         raw_buf.drain(..consumed);
+                    }
+                    if sse_state.aborted_loop_clean.is_some() {
+                        break;
                     }
                 }
                 Some(Err(err)) => {
@@ -651,7 +659,7 @@ impl Ps5LmProvider {
             }
         }
 
-        if !raw_buf.is_empty() {
+        if !raw_buf.is_empty() && sse_state.aborted_loop_clean.is_none() {
             let mut tail = raw_buf.as_slice();
             if tail.ends_with(b"\r") {
                 tail = &tail[..tail.len() - 1];
@@ -665,11 +673,26 @@ impl Ps5LmProvider {
             }
         }
 
+        let was_aborted = sse_state.aborted_loop_clean.is_some();
         for piece in splitter.finish() {
-            emit_stream_piece(piece, tx).await;
+            match &piece {
+                StreamPiece::Reasoning(r) => {
+                    sse_state.inline_reasoning.push_str(r);
+                    emit_stream_piece(piece, tx).await;
+                }
+                StreamPiece::Text(t) if !was_aborted => {
+                    if !t.is_empty() {
+                        sse_state.emitted_text = true;
+                    }
+                    emit_stream_piece(piece, tx).await;
+                }
+                StreamPiece::Text(_) => {}
+            }
         }
 
-        if !sse_state.saw_done {
+        sse_state.finalize_loop_guard_eof();
+
+        if !sse_state.saw_done && sse_state.aborted_loop_clean.is_none() {
             return Err(AgentError::Inference(
                 "incomplete SSE stream: stream ended before completion marker".into(),
             ));
@@ -1036,6 +1059,39 @@ impl InferenceProvider for Ps5LmProvider {
         if messages.is_empty() || cancel.is_cancelled() {
             return Ok(());
         }
+        let Ok((cfg, _, _, _)) = self.snapshot_client() else {
+            return Ok(());
+        };
+        let thinking_level = cfg
+            .thinking_level
+            .parse::<ThinkingLevel>()
+            .unwrap_or(ThinkingLevel::Off);
+        let req = InferenceRequest {
+            model: model_override,
+            api_mode: ApiMode::ChatCompletions,
+            messages,
+            tools: Vec::new(),
+            temperature: cfg.temperature,
+            max_output_tokens: 0,
+            context_limit: cfg.context_limit,
+            stream: false,
+            thinking_level,
+            slot_id: None,
+        };
+        self.prefill_kv_cache_request(req, cancel).await
+    }
+
+    async fn prefill_kv_cache_request(
+        &self,
+        req: InferenceRequest,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        if req.messages.is_empty() || cancel.is_cancelled() {
+            return Ok(());
+        }
+        if req.api_mode == ApiMode::SystemOne {
+            return Ok(());
+        }
         let Ok((cfg, client, _root_url, v1_url)) = self.snapshot_client() else {
             return Ok(());
         };
@@ -1047,30 +1103,31 @@ impl InferenceProvider for Ps5LmProvider {
             return Ok(());
         };
 
-        let model = resolve_model(&model_override, &cfg.model);
-        let url = endpoint_url(&v1_url, ApiMode::ChatCompletions);
-        let headers = build_headers(ApiMode::ChatCompletions, cfg.api_key.as_deref());
-        let req = InferenceRequest {
-            model: model_override,
-            api_mode: ApiMode::ChatCompletions,
-            messages,
-            tools: Vec::new(),
-            temperature: cfg.temperature,
-            max_output_tokens: 0,
-            context_limit: cfg.context_limit,
-            stream: false,
-            thinking_level: ThinkingLevel::Off,
-        };
-        let normalized = normalize_conversation_messages(&req.messages, true);
+        let normalized = normalize_conversation_messages(&req.messages, false);
         if normalized.is_empty() {
             return Ok(());
         }
-        let mut payload = build_chat_completions_payload(&req, &normalized, &cfg, &model, false);
+
+        let model = resolve_model(&req.model, &cfg.model);
+        let prefill_mode = match req.api_mode {
+            ApiMode::Completions => ApiMode::Completions,
+            _ => ApiMode::ChatCompletions,
+        };
+        let url = endpoint_url(&v1_url, prefill_mode);
+        let headers = build_headers(prefill_mode, cfg.api_key.as_deref());
+        let mut payload = match prefill_mode {
+            ApiMode::Completions => {
+                build_completions_payload(&req, &normalized, &cfg, &model, false)
+            }
+            _ => build_chat_completions_payload(&req, &normalized, &cfg, &model, false),
+        };
         payload["stream"] = json!(false);
         payload["cache_prompt"] = json!(true);
         payload["max_tokens"] = json!(0);
         payload["n_predict"] = json!(0);
-        payload["chat_template_kwargs"] = json!({"enable_thinking": false});
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("stream_options");
+        }
 
         let send_fut = client
             .post(&url)
@@ -1106,6 +1163,64 @@ impl InferenceProvider for Ps5LmProvider {
             }
         }
         Ok(())
+    }
+
+    async fn import_kv_and_sampling(&self) -> Result<Ps5LmKvSamplingImport> {
+        let (cfg, client, root_url, _v1_url) = self.snapshot_client()?;
+        let headers = build_headers(ApiMode::ChatCompletions, cfg.api_key.as_deref());
+        let cancel = CancellationToken::new();
+        let probe_t = probe_timeout(&cfg);
+
+        let props_url = format!("{root_url}/props");
+        let slots_url = format!("{root_url}/slots");
+        let health_url = format!("{root_url}/health");
+
+        let (props_probe, slots_probe, health_probe) = tokio::join!(
+            self.probe_get_json(&client, &props_url, headers.clone(), probe_t, &cancel),
+            self.probe_get_json(&client, &slots_url, headers.clone(), probe_t, &cancel),
+            self.probe_get_json(&client, &health_url, headers, probe_t, &cancel),
+        );
+
+        let mut sources: Vec<&'static str> = Vec::new();
+        let props_val = match props_probe {
+            ProbeResult::Json(v) => {
+                sources.push("props");
+                Some(v)
+            }
+            _ => None,
+        };
+        let slots_val = match slots_probe {
+            ProbeResult::Json(v) => {
+                sources.push("slots");
+                Some(v)
+            }
+            _ => None,
+        };
+        let health_val = match health_probe {
+            ProbeResult::Json(v) => {
+                sources.push("health");
+                Some(v)
+            }
+            ProbeResult::PlainOk => {
+                sources.push("health");
+                None
+            }
+            _ => None,
+        };
+
+        if sources.is_empty() {
+            return Err(AgentError::InferenceUnavailable(
+                "PS5LM /props, /slots, and /health endpoints were unreachable or returned unavailable status"
+                    .to_string(),
+            ));
+        }
+
+        Ok(parse_kv_and_sampling_from_probes(
+            props_val.as_ref(),
+            slots_val.as_ref(),
+            health_val.as_ref(),
+            sources,
+        ))
     }
 }
 
@@ -1308,21 +1423,7 @@ fn apply_props_json(
     }
 
     if loaded_model.is_none() {
-        let alias = val
-            .get("model_alias")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let from_path = val
-            .get("model_path")
-            .and_then(|v| v.as_str())
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .and_then(|f| f.to_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        *loaded_model = alias.or(from_path);
+        *loaded_model = extract_model_from_props_json(val);
     }
 
     if let Some(modalities) = val.get("modalities") {
@@ -1359,12 +1460,41 @@ fn apply_props_json(
     }
 }
 
+fn extract_model_from_props_json(val: &Value) -> Option<String> {
+    let alias = val
+        .get("model_alias")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let from_path = val
+        .get("model_path")
+        .and_then(|v| v.as_str())
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|f| f.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let direct = val
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    alias.or(from_path).or(direct)
+}
+
+fn extract_slots_array(val: &Value) -> Option<&Vec<Value>> {
+    val.as_array()
+        .or_else(|| val.get("slots").and_then(Value::as_array))
+}
+
 fn apply_slots_json(
     val: &Value,
     context_length: &mut Option<u32>,
     total_slots: &mut Option<u32>,
 ) {
-    let Some(arr) = val.as_array() else {
+    let Some(arr) = extract_slots_array(val) else {
         return;
     };
     if total_slots.is_none() && !arr.is_empty() {
@@ -1377,6 +1507,265 @@ fn apply_slots_json(
             .and_then(|v| v.as_u64())
             .and_then(|n| u32::try_from(n).ok())
             .filter(|&n| n > 0);
+    }
+}
+
+fn normalize_sampler_token(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mapped = match t.to_ascii_lowercase().as_str() {
+        "e" | "cp" | "penalties" => "penalties",
+        "d" | "dry" => "dry",
+        "k" | "top_k" | "top-k" => "top_k",
+        "y" | "typ_p" | "typical_p" | "typical" => "typ_p",
+        "p" | "top_p" | "top-p" => "top_p",
+        "m" | "min_p" | "min-p" => "min_p",
+        "x" | "xtc" => "xtc",
+        "t" | "temp" | "temperature" => "temperature",
+        "s" | "top_n_sigma" => "top_n_sigma",
+        "i" | "infill" => "infill",
+        _ => return Some(t.to_string()),
+    };
+    Some(mapped.to_string())
+}
+
+fn parse_samplers_str(raw: &str) -> Option<Vec<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('[') {
+        if let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed) {
+            let normalized: Vec<String> = arr
+                .iter()
+                .filter_map(|s| normalize_sampler_token(s))
+                .collect();
+            if !normalized.is_empty() {
+                return Some(normalized);
+            }
+        }
+    }
+    if trimmed.contains(',') || trimmed.contains(';') || trimmed.chars().any(char::is_whitespace) {
+        let normalized: Vec<String> = trimmed
+            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .filter_map(normalize_sampler_token)
+            .collect();
+        return (!normalized.is_empty()).then_some(normalized);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let is_named = matches!(
+        lower.as_str(),
+        "penalties"
+            | "dry"
+            | "top_k"
+            | "top-k"
+            | "typ_p"
+            | "typical_p"
+            | "typical"
+            | "top_p"
+            | "top-p"
+            | "min_p"
+            | "min-p"
+            | "xtc"
+            | "temperature"
+            | "temp"
+            | "mirostat"
+            | "infill"
+            | "top_n_sigma"
+    );
+    if !is_named
+        && trimmed.len() >= 2
+        && trimmed.chars().all(|c| {
+            matches!(
+                c.to_ascii_lowercase(),
+                'e' | 'd' | 'k' | 'y' | 'p' | 'm' | 'x' | 't' | 's' | 'i'
+            )
+        })
+    {
+        let expanded: Vec<String> = trimmed
+            .chars()
+            .filter_map(|c| {
+                let mut buf = [0u8; 4];
+                normalize_sampler_token(c.encode_utf8(&mut buf))
+            })
+            .collect();
+        if !expanded.is_empty() {
+            return Some(expanded);
+        }
+    }
+    normalize_sampler_token(trimmed).map(|s| vec![s])
+}
+
+fn parse_samplers_value(val: &Value) -> Option<Vec<String>> {
+    match val {
+        Value::Array(arr) => {
+            let normalized: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(normalize_sampler_token)
+                .collect();
+            (!normalized.is_empty()).then_some(normalized)
+        }
+        Value::String(s) => parse_samplers_str(s),
+        _ => None,
+    }
+}
+
+fn pick_non_null_value<'a>(containers: &[Option<&'a Value>], keys: &[&str]) -> Option<&'a Value> {
+    for container in containers.iter().flatten() {
+        for &key in keys {
+            if let Some(v) = container.get(key) {
+                if !v.is_null() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn pick_f32_finite(containers: &[Option<&Value>], keys: &[&str], min_zero: bool) -> Option<f32> {
+    let raw = pick_non_null_value(containers, keys)?.as_f64()?;
+    if !raw.is_finite() || (min_zero && raw < 0.0) {
+        return None;
+    }
+    let val = raw as f32;
+    val.is_finite().then_some(val)
+}
+
+fn pick_f32_unit_interval(containers: &[Option<&Value>], keys: &[&str]) -> Option<f32> {
+    pick_f32_finite(containers, keys, true).map(|v| v.clamp(0.0, 1.0))
+}
+
+fn pick_i32_field(containers: &[Option<&Value>], keys: &[&str]) -> Option<i32> {
+    pick_non_null_value(containers, keys)?
+        .as_i64()
+        .and_then(|n| i32::try_from(n).ok())
+}
+
+fn pick_u32_field(containers: &[Option<&Value>], keys: &[&str]) -> Option<u32> {
+    pick_non_null_value(containers, keys)?
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+fn pick_kv_cache_type(containers: &[Option<&Value>], keys: &[&str]) -> Option<String> {
+    let s = pick_non_null_value(containers, keys)?.as_str()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    lower
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        .then_some(lower)
+}
+
+fn pick_flash_attn(containers: &[Option<&Value>], keys: &[&str]) -> Option<bool> {
+    match pick_non_null_value(containers, keys)? {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => match n.as_i64() {
+            Some(1) => Some(true),
+            Some(0) => Some(false),
+            _ => None,
+        },
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "on" | "enabled" | "enable" | "1" | "yes" => Some(true),
+            "false" | "off" | "disabled" | "disable" | "0" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_kv_and_sampling_from_probes(
+    props: Option<&Value>,
+    slots: Option<&Value>,
+    health: Option<&Value>,
+    sources: Vec<&'static str>,
+) -> Ps5LmKvSamplingImport {
+    let dgs = props.and_then(|p| p.get("default_generation_settings"));
+    let dgs_params = dgs.and_then(|d| d.get("params"));
+    let props_params = props.and_then(|p| p.get("params"));
+    let props_kv = props.and_then(|p| p.get("kv_cache"));
+    let props_cache = props.and_then(|p| p.get("cache"));
+    let props_server = props.and_then(|p| p.get("server_params"));
+
+    let slots_arr = slots.and_then(extract_slots_array);
+    let slot0 = slots_arr.and_then(|arr| arr.first());
+    let slot0_params = slot0.and_then(|s| s.get("params"));
+    let slot0_kv = slot0.and_then(|s| s.get("kv_cache"));
+
+    let sampling_sources = [dgs_params, dgs, props_params, props, slot0_params, slot0];
+    let kv_sources = [
+        props_kv,
+        props_cache,
+        props_server,
+        dgs_params,
+        dgs,
+        props_params,
+        props,
+        slot0_params,
+        slot0,
+        slot0_kv,
+    ];
+
+    let model = health
+        .and_then(|h| {
+            h.get("loaded_model")
+                .or_else(|| h.get("model"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| props.and_then(extract_model_from_props_json));
+
+    let n_ctx = dgs
+        .and_then(|d| d.get("n_ctx"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| props.and_then(|p| p.get("n_ctx")).and_then(|v| v.as_u64()))
+        .or_else(|| slot0.and_then(|s| s.get("n_ctx")).and_then(|v| v.as_u64()))
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n > 0);
+
+    let total_slots = props
+        .and_then(|p| p.get("total_slots"))
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n > 0)
+        .or_else(|| {
+            slots_arr
+                .and_then(|arr| u32::try_from(arr.len()).ok())
+                .filter(|&n| n > 0)
+        });
+
+    Ps5LmKvSamplingImport {
+        model,
+        n_ctx,
+        total_slots,
+        cache_type_k: pick_kv_cache_type(&kv_sources, &["cache_type_k", "type_k", "kv_cache_type_k"]),
+        cache_type_v: pick_kv_cache_type(&kv_sources, &["cache_type_v", "type_v", "kv_cache_type_v"]),
+        flash_attn: pick_flash_attn(&kv_sources, &["flash_attn", "flash_attention"]),
+        n_keep: pick_u32_field(&sampling_sources, &["n_keep"]),
+        temperature: pick_f32_finite(&sampling_sources, &["temperature", "temp"], true),
+        top_k: pick_i32_field(&sampling_sources, &["top_k"]),
+        top_p: pick_f32_unit_interval(&sampling_sources, &["top_p"]),
+        min_p: pick_f32_unit_interval(&sampling_sources, &["min_p"]),
+        repeat_penalty: pick_f32_finite(&sampling_sources, &["repeat_penalty"], true),
+        repeat_last_n: pick_i32_field(&sampling_sources, &["repeat_last_n"]),
+        presence_penalty: pick_f32_finite(&sampling_sources, &["presence_penalty"], false),
+        frequency_penalty: pick_f32_finite(&sampling_sources, &["frequency_penalty"], false),
+        dry_multiplier: pick_f32_finite(&sampling_sources, &["dry_multiplier"], true),
+        dry_base: pick_f32_finite(&sampling_sources, &["dry_base"], true),
+        dry_allowed_length: pick_u32_field(&sampling_sources, &["dry_allowed_length"]),
+        dry_penalty_last_n: pick_i32_field(&sampling_sources, &["dry_penalty_last_n"]),
+        xtc_probability: pick_f32_unit_interval(&sampling_sources, &["xtc_probability"]),
+        xtc_threshold: pick_f32_finite(&sampling_sources, &["xtc_threshold"], true),
+        samplers: pick_non_null_value(&sampling_sources, &["samplers"]).and_then(parse_samplers_value),
+        raw_source: sources.join("+"),
     }
 }
 
@@ -1535,7 +1924,9 @@ fn parse_health_body(
 }
 
 fn build_http_client(cfg: &InferenceConfig) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder()
+        .tcp_nodelay(true)
+        .pool_idle_timeout(Duration::from_secs(45));
     if cfg.connect_timeout_secs > 0 {
         builder = builder.connect_timeout(Duration::from_secs(cfg.connect_timeout_secs));
     }
@@ -1627,10 +2018,16 @@ pub fn apply_llamacpp_sampling_fields(
     obj.insert("top_k".into(), json!(cfg.top_k));
     obj.insert("top_p".into(), json!(cfg.top_p));
     obj.insert("min_p".into(), json!(cfg.min_p));
-    obj.insert("repeat_penalty".into(), json!(cfg.repeat_penalty));
+    if cfg.repeat_penalty.is_finite() && (cfg.repeat_penalty - 1.0).abs() >= 1e-5 {
+        obj.insert("repeat_penalty".into(), json!(cfg.repeat_penalty));
+    }
     obj.insert("repeat_last_n".into(), json!(cfg.repeat_last_n));
-    obj.insert("presence_penalty".into(), json!(cfg.presence_penalty));
-    obj.insert("frequency_penalty".into(), json!(cfg.frequency_penalty));
+    if cfg.presence_penalty.is_finite() && cfg.presence_penalty.abs() >= 1e-5 {
+        obj.insert("presence_penalty".into(), json!(cfg.presence_penalty));
+    }
+    if cfg.frequency_penalty.is_finite() && cfg.frequency_penalty.abs() >= 1e-5 {
+        obj.insert("frequency_penalty".into(), json!(cfg.frequency_penalty));
+    }
 
     if cfg.dynatemp_range > 0.0 {
         obj.insert("dynatemp_range".into(), json!(cfg.dynatemp_range));
@@ -1666,28 +2063,13 @@ pub fn apply_llamacpp_sampling_fields(
     if cfg.n_keep != 0 {
         obj.insert("n_keep".into(), json!(cfg.n_keep));
     }
-    if cfg.id_slot >= 0 {
-        obj.insert("id_slot".into(), json!(cfg.id_slot));
+    let effective_slot = req.slot_id.unwrap_or(cfg.id_slot);
+    if effective_slot >= 0 {
+        obj.insert("id_slot".into(), json!(effective_slot));
     }
 
-    let samplers_trimmed = cfg.samplers.trim();
-    if !samplers_trimmed.is_empty() {
-        let parsed = if samplers_trimmed.starts_with('[') {
-            serde_json::from_str::<Vec<String>>(samplers_trimmed).ok()
-        } else {
-            None
-        };
-        let list: Vec<String> = parsed.unwrap_or_else(|| {
-            samplers_trimmed
-                .split(|c| c == ',' || c == ';')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        });
-        if !list.is_empty() {
-            obj.insert("samplers".into(), json!(list));
-        }
+    if let Some(list) = parse_samplers_str(&cfg.samplers) {
+        obj.insert("samplers".into(), json!(list));
     }
 
     if !cfg.grammar.trim().is_empty() {
@@ -1809,8 +2191,12 @@ fn build_chat_completions_payload(
             if let Some(ref tc_id) = m.tool_call_id {
                 obj["tool_call_id"] = Value::String(tc_id.clone());
             }
-            if let Some(ref name) = m.name {
-                obj["name"] = Value::String(name.clone());
+            if m.role.eq_ignore_ascii_case("tool") {
+                if let Some(ref name) = m.name {
+                    if !name.trim().is_empty() {
+                        obj["name"] = Value::String(name.clone());
+                    }
+                }
             }
             if let Some(ref tcs) = m.tool_calls {
                 if !tcs.is_empty() {
@@ -1840,6 +2226,9 @@ fn build_chat_completions_payload(
         "temperature": req.temperature,
         "stream": stream,
     });
+    if stream {
+        payload["stream_options"] = json!({"include_usage": true});
+    }
     if req.max_output_tokens > 0 {
         payload["max_tokens"] = json!(req.max_output_tokens);
     }
@@ -1891,6 +2280,14 @@ fn build_chat_completions_payload(
     }
 
     apply_llamacpp_sampling_fields(&mut payload, cfg, req);
+    if !stream {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("stream_options");
+        }
+    }
+    if !cfg.stop_sequences.iter().any(|s| !s.is_empty()) && payload.get("stop").is_none() {
+        payload["stop"] = json!(["<|im_end|>", "<|endoftext|>"]);
+    }
 
     payload
 }
@@ -1993,6 +2390,11 @@ fn build_responses_payload(
     }
 
     apply_llamacpp_sampling_fields(&mut payload, cfg, req);
+    if !stream {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("stream_options");
+        }
+    }
 
     payload
 }
@@ -2262,10 +2664,18 @@ fn build_completions_payload(
         "stream": stream,
         "stop": ["<|im_end|>"],
     });
+    if stream {
+        payload["stream_options"] = json!({"include_usage": true});
+    }
     if req.max_output_tokens > 0 {
         payload["max_tokens"] = json!(req.max_output_tokens);
     }
     apply_llamacpp_sampling_fields(&mut payload, cfg, req);
+    if !stream {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("stream_options");
+        }
+    }
     payload
 }
 
@@ -2377,6 +2787,7 @@ fn parse_completions_json(
         .and_then(|v| v.as_str())
         .map(str::to_string);
     let usage = parse_usage(val.get("usage"));
+    let timings = parse_timings(val.get("timings"));
     let parsed = parse_model_output(&raw_content, None, Vec::new());
 
     Ok(InferenceResponse {
@@ -2387,6 +2798,7 @@ fn parse_completions_json(
         finish_reason,
         usage,
         latency_ms,
+        timings,
     })
 }
 
@@ -2415,6 +2827,7 @@ fn parse_systemone_json(
         finish_reason: Some("stop".to_string()),
         usage,
         latency_ms,
+        timings: None,
     })
 }
 
@@ -2466,6 +2879,7 @@ fn parse_chat_completions_json(
         .map(str::to_string);
 
     let usage = parse_usage(val.get("usage"));
+    let timings = parse_timings(val.get("timings"));
     let parsed = parse_model_output(&raw_content, api_reasoning, api_tool_calls);
 
     Ok(InferenceResponse {
@@ -2476,6 +2890,7 @@ fn parse_chat_completions_json(
         finish_reason,
         usage,
         latency_ms,
+        timings,
     })
 }
 
@@ -2556,6 +2971,7 @@ fn parse_responses_json(
         .and_then(|v| v.as_str())
         .map(str::to_string);
     let usage = parse_usage(val.get("usage"));
+    let timings = parse_timings(val.get("timings"));
     let parsed = parse_model_output(&raw_content, api_reasoning, api_tool_calls);
 
     Ok(InferenceResponse {
@@ -2566,6 +2982,7 @@ fn parse_responses_json(
         finish_reason,
         usage,
         latency_ms,
+        timings,
     })
 }
 
@@ -2634,6 +3051,7 @@ fn parse_anthropic_json(
         .and_then(|v| v.as_str())
         .map(str::to_string);
     let usage = parse_usage(val.get("usage"));
+    let timings = parse_timings(val.get("timings"));
     let parsed = parse_model_output(&raw_content, api_reasoning, api_tool_calls);
 
     Ok(InferenceResponse {
@@ -2644,6 +3062,7 @@ fn parse_anthropic_json(
         finish_reason,
         usage,
         latency_ms,
+        timings,
     })
 }
 
@@ -2709,6 +3128,73 @@ fn parse_usage(usage_val: Option<&Value>) -> TokenUsage {
     }
 }
 
+fn finite_non_neg_f64(val: Option<&Value>) -> Option<f64> {
+    val.and_then(|v| v.as_f64())
+        .filter(|&x| x.is_finite() && x >= 0.0)
+}
+
+fn opt_u32(val: Option<&Value>) -> Option<u32> {
+    val.and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+fn parse_timings(timings_val: Option<&Value>) -> Option<InferenceTimings> {
+    let obj = timings_val?.as_object()?;
+    let t = InferenceTimings {
+        predicted_per_second: finite_non_neg_f64(obj.get("predicted_per_second")),
+        prompt_per_second: finite_non_neg_f64(obj.get("prompt_per_second")),
+        predicted_ms: finite_non_neg_f64(obj.get("predicted_ms")),
+        prompt_ms: finite_non_neg_f64(obj.get("prompt_ms")),
+        predicted_n: opt_u32(obj.get("predicted_n")),
+        prompt_n: opt_u32(obj.get("prompt_n")),
+        cache_n: opt_u32(obj.get("cache_n")),
+    };
+    if t.predicted_per_second.is_none()
+        && t.prompt_per_second.is_none()
+        && t.predicted_ms.is_none()
+        && t.prompt_ms.is_none()
+        && t.predicted_n.is_none()
+        && t.prompt_n.is_none()
+        && t.cache_n.is_none()
+    {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+fn merge_timings(dst: &mut Option<InferenceTimings>, incoming: Option<InferenceTimings>) {
+    let Some(inc) = incoming else {
+        return;
+    };
+    match dst {
+        None => *dst = Some(inc),
+        Some(cur) => {
+            if inc.predicted_per_second.is_some() {
+                cur.predicted_per_second = inc.predicted_per_second;
+            }
+            if inc.prompt_per_second.is_some() {
+                cur.prompt_per_second = inc.prompt_per_second;
+            }
+            if inc.predicted_ms.is_some() {
+                cur.predicted_ms = inc.predicted_ms;
+            }
+            if inc.prompt_ms.is_some() {
+                cur.prompt_ms = inc.prompt_ms;
+            }
+            if inc.predicted_n.is_some() {
+                cur.predicted_n = inc.predicted_n;
+            }
+            if inc.prompt_n.is_some() {
+                cur.prompt_n = inc.prompt_n;
+            }
+            if inc.cache_n.is_some() {
+                cur.cache_n = inc.cache_n;
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct ToolCallPartial {
     id: String,
@@ -2722,12 +3208,18 @@ struct SseAccumulator {
     model: String,
     raw_content: String,
     api_reasoning: String,
+    inline_reasoning: String,
     tool_calls: BTreeMap<usize, ToolCallPartial>,
     response_item_to_index: BTreeMap<String, usize>,
     finish_reason: Option<String>,
     usage: TokenUsage,
+    timings: Option<InferenceTimings>,
     saw_done: bool,
     final_response_override: Option<Value>,
+    loop_guard: StreamingRepetitionGuard,
+    loop_guard_finished: bool,
+    aborted_loop_clean: Option<String>,
+    emitted_text: bool,
 }
 
 impl SseAccumulator {
@@ -2737,12 +3229,84 @@ impl SseAccumulator {
             model,
             raw_content: String::new(),
             api_reasoning: String::new(),
+            inline_reasoning: String::new(),
             tool_calls: BTreeMap::new(),
             response_item_to_index: BTreeMap::new(),
             finish_reason: None,
             usage: TokenUsage::default(),
+            timings: None,
             saw_done: false,
             final_response_override: None,
+            loop_guard: StreamingRepetitionGuard::new(),
+            loop_guard_finished: false,
+            aborted_loop_clean: None,
+            emitted_text: false,
+        }
+    }
+
+    async fn push_content_delta(
+        &mut self,
+        delta: &str,
+        splitter: &mut ThinkStreamSplitter,
+        tx: &mpsc::Sender<InferenceStreamChunk>,
+    ) {
+        if self.aborted_loop_clean.is_some() || delta.is_empty() {
+            return;
+        }
+        match self.loop_guard.push_delta(delta) {
+            StreamingLoopDecision::Continue => {
+                self.raw_content.push_str(delta);
+                for piece in splitter.push(delta) {
+                    match &piece {
+                        StreamPiece::Reasoning(r) => {
+                            self.inline_reasoning.push_str(r);
+                        }
+                        StreamPiece::Text(t) => {
+                            if !t.is_empty() {
+                                self.emitted_text = true;
+                            }
+                        }
+                    }
+                    emit_stream_piece(piece, tx).await;
+                }
+            }
+            StreamingLoopDecision::AbortRepeatedLoop {
+                truncated_clean_visible,
+            } => {
+                for piece in splitter.push(delta) {
+                    if let StreamPiece::Reasoning(r) = &piece {
+                        self.inline_reasoning.push_str(r);
+                        emit_stream_piece(piece, tx).await;
+                    }
+                }
+                if !self.emitted_text && !truncated_clean_visible.is_empty() {
+                    self.emitted_text = true;
+                    let _ = tx
+                        .send(InferenceStreamChunk::TextDelta(
+                            truncated_clean_visible.clone(),
+                        ))
+                        .await;
+                }
+                self.aborted_loop_clean = Some(truncated_clean_visible);
+                self.finish_reason = Some("repetition_abort".to_string());
+            }
+        }
+    }
+
+    fn finalize_loop_guard_eof(&mut self) {
+        if self.loop_guard_finished {
+            return;
+        }
+        self.loop_guard_finished = true;
+        if self.aborted_loop_clean.is_some() {
+            return;
+        }
+        if let StreamingLoopDecision::AbortRepeatedLoop {
+            truncated_clean_visible,
+        } = self.loop_guard.finish()
+        {
+            self.aborted_loop_clean = Some(truncated_clean_visible);
+            self.finish_reason = Some("repetition_abort".to_string());
         }
     }
 
@@ -2781,7 +3345,32 @@ impl SseAccumulator {
             .collect()
     }
 
-    fn into_response(self, latency_ms: u64) -> Result<InferenceResponse> {
+    fn into_response(mut self, latency_ms: u64) -> Result<InferenceResponse> {
+        if let Some(clean_visible) = self.aborted_loop_clean.take() {
+            let api_tcs = self.finalize_tool_calls();
+            let reasoning = match (
+                non_empty_opt(&self.api_reasoning),
+                non_empty_opt(&self.inline_reasoning),
+            ) {
+                (Some(api), Some(inline)) if api != inline => Some(format!("{api}\n{inline}")),
+                (Some(api), _) => Some(api),
+                (None, Some(inline)) => Some(inline),
+                (None, None) => None,
+            };
+            return Ok(InferenceResponse {
+                content: truncate_verbatim_prose_loops(&clean_visible),
+                reasoning,
+                tool_calls: api_tcs,
+                model: self.model,
+                finish_reason: self
+                    .finish_reason
+                    .or_else(|| Some("repetition_abort".to_string())),
+                usage: self.usage,
+                latency_ms,
+                timings: self.timings,
+            });
+        }
+
         if self.mode == ApiMode::Responses {
             if let Some(ref resp_obj) = self.final_response_override {
                 if let Ok(mut parsed) = parse_responses_json(&self.model, resp_obj, latency_ms) {
@@ -2810,6 +3399,9 @@ impl SseAccumulator {
                     if parsed.finish_reason.is_none() {
                         parsed.finish_reason = self.finish_reason;
                     }
+                    let mut combined_timings = self.timings;
+                    merge_timings(&mut combined_timings, parsed.timings.take());
+                    parsed.timings = combined_timings;
                     return Ok(parsed);
                 }
             }
@@ -2829,6 +3421,7 @@ impl SseAccumulator {
             finish_reason: self.finish_reason,
             usage: self.usage,
             latency_ms,
+            timings: self.timings,
         })
     }
 }
@@ -2933,6 +3526,7 @@ async fn process_sse_line(
     let payload_str = data.trim();
     if payload_str == "[DONE]" {
         acc.saw_done = true;
+        acc.finalize_loop_guard_eof();
         return Ok(());
     }
 
@@ -2941,6 +3535,10 @@ async fn process_sse_line(
 
     if let Some(err_msg) = extract_sse_error(&val, current_event.as_deref()) {
         return Err(AgentError::Inference(format!("PS5LM SSE error: {err_msg}")));
+    }
+
+    if val.get("timings").is_some() {
+        merge_timings(&mut acc.timings, parse_timings(val.get("timings")));
     }
 
     match acc.mode {
@@ -2969,10 +3567,7 @@ async fn process_sse_line(
                         let _ = tx.send(InferenceStreamChunk::ReasoningDelta(r.to_string())).await;
                     }
                     if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
-                        acc.raw_content.push_str(c);
-                        for piece in splitter.push(c) {
-                            emit_stream_piece(piece, tx).await;
-                        }
+                        acc.push_content_delta(c, splitter, tx).await;
                     }
                     if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                         for tc in tcs {
@@ -3009,10 +3604,7 @@ async fn process_sse_line(
             match ev_type {
                 "response.output_text.delta" => {
                     if let Some(delta) = val.get("delta").and_then(|v| v.as_str()) {
-                        acc.raw_content.push_str(delta);
-                        for piece in splitter.push(delta) {
-                            emit_stream_piece(piece, tx).await;
-                        }
+                        acc.push_content_delta(delta, splitter, tx).await;
                     }
                 }
                 "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
@@ -3145,6 +3737,7 @@ async fn process_sse_line(
                 }
                 "response.completed" | "response.incomplete" => {
                     acc.saw_done = true;
+                    acc.finalize_loop_guard_eof();
                     let default_status = if ev_type == "response.incomplete" {
                         "incomplete"
                     } else {
@@ -3161,6 +3754,9 @@ async fn process_sse_line(
                         acc.final_response_override = Some(resp.clone());
                         if resp.get("usage").is_some() {
                             acc.usage = parse_usage(resp.get("usage"));
+                        }
+                        if resp.get("timings").is_some() {
+                            merge_timings(&mut acc.timings, parse_timings(resp.get("timings")));
                         }
                     }
                 }
@@ -3228,10 +3824,7 @@ async fn process_sse_line(
                         match delta.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                             "text_delta" => {
                                 if let Some(txt) = delta.get("text").and_then(|v| v.as_str()) {
-                                    acc.raw_content.push_str(txt);
-                                    for piece in splitter.push(txt) {
-                                        emit_stream_piece(piece, tx).await;
-                                    }
+                                    acc.push_content_delta(txt, splitter, tx).await;
                                 }
                             }
                             "thinking_delta" => {
@@ -3272,6 +3865,7 @@ async fn process_sse_line(
                 }
                 "message_stop" => {
                     acc.saw_done = true;
+                    acc.finalize_loop_guard_eof();
                 }
                 _ => {}
             }
@@ -3292,10 +3886,7 @@ async fn process_sse_line(
                     acc.finish_reason = Some(fr.to_string());
                 }
                 if let Some(txt) = choice.get("text").and_then(|v| v.as_str()) {
-                    acc.raw_content.push_str(txt);
-                    for piece in splitter.push(txt) {
-                        emit_stream_piece(piece, tx).await;
-                    }
+                    acc.push_content_delta(txt, splitter, tx).await;
                 }
             }
         }
@@ -3359,6 +3950,7 @@ mod tests {
             context_limit: 8192,
             stream: false,
             thinking_level,
+            slot_id: None,
         }
     }
 
@@ -3452,7 +4044,7 @@ mod tests {
         assert_eq!(payload["top_k"], 40);
         assert!((payload["top_p"].as_f64().unwrap() - 0.95).abs() < 1e-5);
         assert!((payload["min_p"].as_f64().unwrap() - 0.05).abs() < 1e-5);
-        assert_eq!(payload["repeat_last_n"], 64);
+        assert_eq!(payload["repeat_last_n"], 256);
         assert_eq!(payload["mirostat"], 2);
         assert_eq!(payload["seed"], 42);
         assert_eq!(payload["ignore_eos"], true);
@@ -3688,6 +4280,7 @@ mod tests {
             context_limit: 8192,
             stream: false,
             thinking_level: ThinkingLevel::Off,
+            slot_id: None,
         };
 
         let chat = build_request_payload(&req, &cfg, "qwen3", false);
@@ -3749,12 +4342,11 @@ mod tests {
         let prefills = mock.recorded_prefill_requests();
         assert_eq!(prefills.len(), 1);
         let sent_msgs = prefills[0].body["messages"].as_array().unwrap();
-        assert_eq!(sent_msgs.len(), 4);
+        assert_eq!(sent_msgs.len(), 3);
         assert_eq!(sent_msgs[0]["role"], "system");
         assert_eq!(sent_msgs[1]["role"], "user");
         assert_eq!(sent_msgs[2]["role"], "assistant");
         assert_eq!(sent_msgs[2]["content"], "part1\n\npart2");
-        assert_eq!(sent_msgs[3]["role"], "user");
         assert_eq!(prefills[0].body["n_predict"], 0);
 
         // Hold the sole concurrency permit and verify prefill skips immediately without queueing
@@ -3807,6 +4399,7 @@ mod tests {
             context_limit: 8192,
             stream: false,
             thinking_level: ThinkingLevel::Medium,
+            slot_id: None,
         };
         let payload = build_request_payload(&req, &cfg, "claude", false);
         assert!(payload.get("thinking").is_some());
@@ -3873,6 +4466,7 @@ mod tests {
             context_limit: 8192,
             stream: true,
             thinking_level: ThinkingLevel::Medium,
+            slot_id: None,
         };
         let payload = build_request_payload(&req, &cfg, "qwen3", true);
         let prompt = payload["prompt"].as_str().unwrap();
@@ -4051,5 +4645,372 @@ mod tests {
         assert!(provider.gate.try_acquire().is_none());
         drop(p2);
         assert!(provider.gate.try_acquire().is_some());
+    }
+
+    #[test]
+    fn chat_completions_payload_omits_neutral_penalties_restricts_name_default_stop_slot_id_and_stream_options() {
+        let mut cfg = InferenceConfig::default();
+        let mut req = req_with(ApiMode::ChatCompletions, ThinkingLevel::Off, 0, vec![]);
+        req.messages = vec![
+            InferenceMessage {
+                role: "system".into(),
+                content: "Sys".into(),
+                name: Some("sys_name".into()),
+                ..Default::default()
+            },
+            InferenceMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+                name: Some("alice".into()),
+                ..Default::default()
+            },
+            InferenceMessage {
+                role: "assistant".into(),
+                content: "".into(),
+                name: Some("bot".into()),
+                tool_calls: Some(vec![ToolCallRequest {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "a.txt"}),
+                }]),
+                ..Default::default()
+            },
+            InferenceMessage {
+                role: "tool".into(),
+                content: "ok".into(),
+                tool_call_id: Some("call_1".into()),
+                name: Some("read".into()),
+                ..Default::default()
+            },
+            InferenceMessage {
+                role: "tool".into(),
+                content: "ok2".into(),
+                tool_call_id: Some("call_2".into()),
+                name: Some("   ".into()),
+                ..Default::default()
+            },
+        ];
+
+        let default_payload = build_request_payload(&req, &cfg, "qwen3", false);
+        // InferenceConfig::default() has repeat_penalty=1.05 (non-neutral) and presence/frequency=0.0 (neutral).
+        assert!((default_payload["repeat_penalty"].as_f64().unwrap() - 1.05).abs() < 1e-4);
+        assert!(default_payload.get("presence_penalty").is_none());
+        assert!(default_payload.get("frequency_penalty").is_none());
+        assert_eq!(default_payload["repeat_last_n"], 256);
+        assert!(default_payload.get("id_slot").is_none());
+        assert!(default_payload.get("stream_options").is_none());
+        assert_eq!(
+            default_payload["stop"],
+            json!(["<|im_end|>", "<|endoftext|>"])
+        );
+
+        let mut neutral_cfg = cfg.clone();
+        neutral_cfg.repeat_penalty = 1.0;
+        let neutral_payload = build_request_payload(&req, &neutral_cfg, "qwen3", false);
+        assert!(neutral_payload.get("repeat_penalty").is_none());
+        assert!(neutral_payload.get("presence_penalty").is_none());
+        assert!(neutral_payload.get("frequency_penalty").is_none());
+        assert_eq!(neutral_payload["repeat_last_n"], 256);
+
+        let msgs = default_payload["messages"].as_array().unwrap();
+        assert!(msgs[0].get("name").is_none());
+        assert!(msgs[1].get("name").is_none());
+        assert!(msgs[2].get("name").is_none());
+        assert_eq!(msgs[3]["name"], "read");
+        assert!(msgs[4].get("name").is_none());
+
+        let resp_default = build_request_payload(
+            &req_with(ApiMode::Responses, ThinkingLevel::Off, 0, vec![]),
+            &cfg,
+            "qwen3",
+            false,
+        );
+        assert!(resp_default.get("stop").is_none());
+
+        cfg.repeat_penalty = 1.15;
+        cfg.presence_penalty = 0.25;
+        cfg.frequency_penalty = -0.2;
+        cfg.id_slot = 1;
+        cfg.custom_extra_body_json = r#"{"stream_options":{"include_usage":true}}"#.into();
+
+        let non_stream = build_request_payload(&req, &cfg, "qwen3", false);
+        assert!((non_stream["repeat_penalty"].as_f64().unwrap() - 1.15).abs() < 1e-5);
+        assert!((non_stream["presence_penalty"].as_f64().unwrap() - 0.25).abs() < 1e-5);
+        assert!((non_stream["frequency_penalty"].as_f64().unwrap() + 0.2).abs() < 1e-5);
+        assert_eq!(non_stream["id_slot"], 1);
+        assert!(non_stream.get("stream_options").is_none());
+
+        req.slot_id = Some(3);
+        let stream_payload = build_request_payload(&req, &cfg, "qwen3", true);
+        assert_eq!(stream_payload["id_slot"], 3);
+        assert_eq!(stream_payload["stream_options"], json!({"include_usage": true}));
+
+        req.slot_id = Some(-1);
+        let omitted_slot = build_request_payload(&req, &cfg, "qwen3", true);
+        assert!(omitted_slot.get("id_slot").is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_timings_clamps_invalid_values_and_merges_sse_chunks() {
+        assert_eq!(parse_timings(None), None);
+        assert_eq!(parse_timings(Some(&json!({}))), None);
+        assert_eq!(
+            parse_timings(Some(&json!({"predicted_per_second": -5.0, "cache_n": -1}))),
+            None
+        );
+
+        let partial = parse_timings(Some(&json!({
+            "predicted_per_second": 122.5,
+            "predicted_ms": -10.0,
+            "cache_n": 256,
+            "prompt_n": -3
+        })))
+        .expect("partially valid timings should still parse");
+        assert_eq!(partial.predicted_per_second, Some(122.5));
+        assert_eq!(partial.predicted_ms, None);
+        assert_eq!(partial.cache_n, Some(256));
+        assert_eq!(partial.prompt_n, None);
+
+        let non_stream = parse_chat_completions_json(
+            "qwen3",
+            &json!({
+                "model": "qwen3",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                "timings": {
+                    "predicted_per_second": 119.2,
+                    "prompt_per_second": 520.0,
+                    "predicted_ms": 42.0,
+                    "prompt_ms": 19.2,
+                    "predicted_n": 5,
+                    "prompt_n": 10,
+                    "cache_n": 128
+                }
+            }),
+            50,
+        )
+        .unwrap();
+        let t = non_stream.timings.expect("non-stream timings expected");
+        assert_eq!(t.predicted_per_second, Some(119.2));
+        assert_eq!(t.prompt_per_second, Some(520.0));
+        assert_eq!(t.cache_n, Some(128));
+
+        let (tx, _rx) = mpsc::channel(32);
+        let mut acc = SseAccumulator::new(ApiMode::ChatCompletions, "qwen3".into());
+        let mut splitter = ThinkStreamSplitter::new();
+        let mut ev = None;
+        for line in [
+            r#"data: {"choices":[{"delta":{"content":"hello "}}],"timings":{"prompt_n":16,"cache_n":512,"prompt_per_second":480.0}}"#,
+            r#"data: {"choices":[{"delta":{"content":"world"},"finish_reason":"stop"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":16,"completion_tokens":2,"total_tokens":18},"timings":{"predicted_n":2,"predicted_ms":16.0,"predicted_per_second":125.0}}"#,
+            "data: [DONE]",
+        ] {
+            process_sse_line(line, &mut ev, &mut acc, &mut splitter, &tx)
+                .await
+                .unwrap();
+        }
+        let resp = acc.into_response(20).unwrap();
+        assert_eq!(resp.content, "hello world");
+        assert_eq!(resp.usage.completion_tokens, 2);
+        let sse_t = resp.timings.expect("SSE timings should merge across chunks");
+        assert_eq!(sse_t.cache_n, Some(512));
+        assert_eq!(sse_t.prompt_n, Some(16));
+        assert_eq!(sse_t.predicted_n, Some(2));
+        assert_eq!(sse_t.predicted_per_second, Some(125.0));
+    }
+
+    #[tokio::test]
+    async fn sse_repetition_guard_aborts_early_without_done_and_preserves_reasoning() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 4096];
+            let _ = socket.read(&mut req_buf).await;
+
+            let mut sse = String::new();
+            sse.push_str(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"<think>analyze carefully</think>\\nFirst valid summary line.\\n\"}}]}\n\n",
+            );
+            for _ in 0..8 {
+                sse.push_str(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Repeating the exact same status sentence over and over again.\\n\"}}]}\n\n",
+                );
+            }
+            // Deliberately close stream without sending `data: [DONE]`.
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                sse.len()
+            );
+            let _ = socket.write_all(hdr.as_bytes()).await;
+            let _ = socket.write_all(sse.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let mut cfg = InferenceConfig::default();
+        cfg.base_url = format!("http://{addr}");
+        cfg.max_retries = 0;
+        let provider = Ps5LmProvider::new(cfg).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let resp = provider
+            .generate_stream(
+                req_with(ApiMode::ChatCompletions, ThinkingLevel::Medium, 256, vec![]),
+                tx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let mut streamed_reasoning = String::new();
+        while let Some(chunk) = rx.recv().await {
+            if let InferenceStreamChunk::ReasoningDelta(r) = chunk {
+                streamed_reasoning.push_str(&r);
+            }
+        }
+        let _ = server.await;
+
+        assert_eq!(resp.finish_reason.as_deref(), Some("repetition_abort"));
+        assert_eq!(resp.reasoning.as_deref(), Some("analyze carefully"));
+        assert_eq!(streamed_reasoning, "analyze carefully");
+        assert!(resp.content.contains("First valid summary line."));
+        assert!(
+            resp.content.matches("Repeating the exact same status sentence over and over again.").count() <= 2
+        );
+
+        let (acc_tx, _acc_rx) = mpsc::channel(32);
+        let mut acc = SseAccumulator::new(ApiMode::ChatCompletions, "qwen3".into());
+        let mut splitter = ThinkStreamSplitter::new();
+        let mut ev = None;
+        process_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"API think step"}}]}"#,
+            &mut ev,
+            &mut acc,
+            &mut splitter,
+            &acc_tx,
+        )
+        .await
+        .unwrap();
+        for _ in 0..8 {
+            process_sse_line(
+                r#"data: {"choices":[{"delta":{"content":"Hearing you loud and clear, Commander! Let me fix this!\n"}}]}"#,
+                &mut ev,
+                &mut acc,
+                &mut splitter,
+                &acc_tx,
+            )
+            .await
+            .unwrap();
+        }
+        let api_resp = acc.into_response(10).unwrap();
+        assert_eq!(api_resp.reasoning.as_deref(), Some("API think step"));
+        assert_eq!(api_resp.finish_reason.as_deref(), Some("repetition_abort"));
+    }
+
+    #[tokio::test]
+    async fn import_kv_and_sampling_probes_endpoints_normalizes_samplers_and_hides_api_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut req_buf = [0u8; 4096];
+                let n = socket.read(&mut req_buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let first_line = req_str.lines().next().unwrap_or("");
+                let body = if first_line.contains(" /props ") {
+                    json!({
+                        "model_path": "/models/Qwen3-32B-Q8_0.gguf",
+                        "total_slots": 2,
+                        "default_generation_settings": {
+                            "n_ctx": 32768,
+                            "params": {
+                                "kv_cache_type_k": "q8_0",
+                                "kv_cache_type_v": "f16",
+                                "flash_attention": true,
+                                "n_keep": 128,
+                                "temperature": 0.6,
+                                "top_k": 30,
+                                "top_p": 0.9,
+                                "min_p": 0.04,
+                                "repeat_penalty": 1.08,
+                                "repeat_last_n": 256,
+                                "presence_penalty": 0.1,
+                                "frequency_penalty": 0.05,
+                                "dry_multiplier": 0.8,
+                                "dry_base": 1.75,
+                                "dry_allowed_length": 2,
+                                "dry_penalty_last_n": 4096,
+                                "xtc_probability": 0.1,
+                                "xtc_threshold": 0.2,
+                                "samplers": "edkypmxt"
+                            }
+                        }
+                    })
+                    .to_string()
+                } else if first_line.contains(" /slots ") {
+                    json!([{"id": 0, "n_ctx": 32768}, {"id": 1, "n_ctx": 32768}]).to_string()
+                } else {
+                    json!({"status": "ok"}).to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let secret_key = "super-secret-kv-token-999";
+        let mut cfg = InferenceConfig::default();
+        cfg.base_url = format!("http://{addr}");
+        cfg.api_key = Some(secret_key.into());
+        let provider = Ps5LmProvider::new(cfg).unwrap();
+
+        let imported = provider.import_kv_and_sampling().await.unwrap();
+        let _ = server.await;
+
+        assert_eq!(imported.model.as_deref(), Some("Qwen3-32B-Q8_0.gguf"));
+        assert_eq!(imported.n_ctx, Some(32768));
+        assert_eq!(imported.total_slots, Some(2));
+        assert_eq!(imported.cache_type_k.as_deref(), Some("q8_0"));
+        assert_eq!(imported.cache_type_v.as_deref(), Some("f16"));
+        assert_eq!(imported.flash_attn, Some(true));
+        assert_eq!(imported.n_keep, Some(128));
+        assert_eq!(imported.top_k, Some(30));
+        assert_eq!(
+            imported.samplers.as_deref(),
+            Some(
+                [
+                    "penalties",
+                    "dry",
+                    "top_k",
+                    "typ_p",
+                    "top_p",
+                    "min_p",
+                    "xtc",
+                    "temperature",
+                ]
+                .map(str::to_string)
+                .as_slice()
+            )
+        );
+        let serialized = serde_json::to_string(&imported).unwrap();
+        assert!(!serialized.contains(secret_key));
+
+        let unreachable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = unreachable_listener.local_addr().unwrap();
+        drop(unreachable_listener);
+        let mut bad_cfg = InferenceConfig::default();
+        bad_cfg.base_url = format!("http://{closed_addr}");
+        let bad_provider = Ps5LmProvider::new(bad_cfg).unwrap();
+        let err = bad_provider.import_kv_and_sampling().await.unwrap_err();
+        assert!(matches!(err, AgentError::InferenceUnavailable(_)));
     }
 }

@@ -5,6 +5,7 @@ use ps5_agent_core::{
     MemoryItem, MemoryPermissions, MemoryScope, Result, StorageBackend,
 };
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -59,6 +60,19 @@ fn find_ascii_ci(haystack: &str, from: usize, needle: &[u8]) -> Option<usize> {
         .map(|rel| from + rel)
 }
 
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    find_ascii_ci(haystack, 0, needle.as_bytes()).is_some()
+}
+
+fn starts_with_ascii_ci(text: &str, prefix: &[u8]) -> bool {
+    text.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 /// Finds the next inline `data:<mime>;base64,<payload>` span starting at or after `from`.
 /// Returns `(start_byte, end_byte, mime, payload_len)`.
 fn find_next_base64_data_url(text: &str, mut from: usize) -> Option<(usize, usize, &str, usize)> {
@@ -70,7 +84,7 @@ fn find_next_base64_data_url(text: &str, mut from: usize) -> Option<(usize, usiz
         let candidate = &rest[..uri_end_rel];
         if let Some(comma) = candidate.find(',') {
             let header = &candidate["data:".len()..comma];
-            if comma <= 128 && header.to_ascii_lowercase().contains(";base64") {
+            if comma <= 128 && contains_ascii_ci(header, ";base64") {
                 let mime = header.split(';').next().unwrap_or("").trim();
                 let payload_len = candidate.len().saturating_sub(comma + 1);
                 return Some((uri_start, uri_start + uri_end_rel, mime, payload_len));
@@ -95,7 +109,7 @@ fn sanitize_inline_data_urls(text: &str) -> String {
             out.push_str(&text[cursor..start]);
         }
         let label = if mime.is_empty() { "binary" } else { mime };
-        out.push_str(&format!("[inline {label} data omitted ({payload_len} chars)]"));
+        let _ = write!(out, "[inline {label} data omitted ({payload_len} chars)]");
         cursor = end;
         next = find_next_base64_data_url(text, cursor);
     }
@@ -122,7 +136,7 @@ fn estimate_text_tokens_without_data_urls(text: &str) -> usize {
         if start > cursor {
             total_tokens += estimate_tokens(&text[cursor..start]);
         }
-        let cost = if mime.to_ascii_lowercase().starts_with("image/") {
+        let cost = if starts_with_ascii_ci(mime, b"image/") {
             IMAGE_ATTACHMENT_TOKEN_ESTIMATE
         } else {
             DATA_URI_PLACEHOLDER_TOKENS
@@ -144,7 +158,7 @@ fn image_attachment_url(att: &ChatAttachment) -> Option<&str> {
         return None;
     }
     let is_image = att.kind.eq_ignore_ascii_case("image")
-        || att.mime_type.to_ascii_lowercase().starts_with("image/")
+        || starts_with_ascii_ci(&att.mime_type, b"image/")
         || url.starts_with("data:image/");
     if is_image {
         Some(url)
@@ -195,18 +209,17 @@ fn can_read_memory(reader_agent_id: &str, perms: &MemoryPermissions, item: &Memo
 }
 
 fn tokenize_query(text: &str) -> Vec<String> {
-    let raw: Vec<String> = text
+    let mut tokens: Vec<String> = text
         .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|t| t.trim().to_ascii_lowercase())
         .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
         .collect();
-    let long: Vec<String> = raw.iter().filter(|t| t.len() >= 2).cloned().collect();
-    let dedup_src = if long.is_empty() { raw } else { long };
-    let mut seen = HashSet::new();
-    dedup_src
-        .into_iter()
-        .filter(|t| seen.insert(t.clone()))
-        .collect()
+    if tokens.iter().any(|t| t.len() >= 2) {
+        tokens.retain(|t| t.len() >= 2);
+    }
+    let mut seen = HashSet::with_capacity(tokens.len());
+    tokens.retain(|t| seen.insert(t.clone()));
+    tokens
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -720,60 +733,65 @@ impl MemoryManager {
             0
         };
 
-        let all_messages = self
-            .storage
-            .list_chat_messages(conversation_id, true, fetch_cap.saturating_add(1024))?;
-        let archived_turns: Vec<&ChatMessage> =
-            all_messages.iter().filter(|m| m.archived).collect();
-        let active_turns: Vec<&ChatMessage> =
-            all_messages.iter().filter(|m| !m.archived).collect();
-
-        let rolling_summary = if archived_turns.is_empty() {
-            None
-        } else {
+        let (active_turns, rolling_summary) = if archived_count == 0 {
             let summary_id = format!("rolling-summary-{conversation_id}");
-            let existing = if archived_count == 0 {
-                self.storage
-                    .query_memories(
-                        Some(MemoryScope::Conversation),
-                        Some("conversation_summary"),
-                        None,
-                        false,
-                        50,
-                    )?
-                    .into_iter()
-                    .find(|m| m.id == summary_id)
-                    .map(|m| m.content)
-            } else {
-                None
-            };
-
-            let summary_text = match existing {
-                Some(text) => text,
-                None => {
-                    let generated = synthesize_rolling_summary(&archived_turns, 1200);
-                    let now = now_iso();
-                    let mem = MemoryItem {
-                        id: summary_id,
-                        scope: MemoryScope::Conversation,
-                        namespace: "conversation_summary".to_string(),
-                        owner_agent_id: None,
-                        conversation_id: Some(conversation_id.to_string()),
-                        task_id: None,
-                        key: format!("rolling_summary:{conversation_id}"),
-                        content: generated.clone(),
-                        summary: None,
-                        importance: 8,
-                        tags: vec!["rolling_summary".to_string()],
-                        archived: false,
-                        created_at: now.clone(),
-                        updated_at: now,
-                    };
-                    self.storage.upsert_memory(&mem)?;
-                    generated
+            let existing = self
+                .storage
+                .query_memories(
+                    Some(MemoryScope::Conversation),
+                    Some("conversation_summary"),
+                    None,
+                    false,
+                    500,
+                )?
+                .into_iter()
+                .find(|m| m.id == summary_id)
+                .map(|m| m.content);
+            (active_before, existing)
+        } else {
+            drop(active_before);
+            let all_messages = self.storage.list_chat_messages(
+                conversation_id,
+                true,
+                fetch_cap.saturating_add(1024),
+            )?;
+            let mut archived_turns = Vec::new();
+            let mut active_turns = Vec::new();
+            for msg in all_messages {
+                if msg.archived {
+                    archived_turns.push(msg);
+                } else {
+                    active_turns.push(msg);
                 }
+            }
+
+            let rolling_summary = if archived_turns.is_empty() {
+                None
+            } else {
+                let archived_refs: Vec<&ChatMessage> = archived_turns.iter().collect();
+                let generated = synthesize_rolling_summary(&archived_refs, 1200);
+                let summary_id = format!("rolling-summary-{conversation_id}");
+                let now = now_iso();
+                let mem = MemoryItem {
+                    id: summary_id,
+                    scope: MemoryScope::Conversation,
+                    namespace: "conversation_summary".to_string(),
+                    owner_agent_id: None,
+                    conversation_id: Some(conversation_id.to_string()),
+                    task_id: None,
+                    key: format!("rolling_summary:{conversation_id}"),
+                    content: generated.clone(),
+                    summary: None,
+                    importance: 8,
+                    tags: vec!["rolling_summary".to_string()],
+                    archived: false,
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                self.storage.upsert_memory(&mem)?;
+                Some(generated)
             };
-            Some(summary_text)
+            (active_turns, rolling_summary)
         };
 
         let mut system_sections = Vec::new();
@@ -903,22 +921,18 @@ fn score_memory(
         return 0.60 * importance_score + 0.40 * recency_score + affinity_bonus;
     }
 
-    let haystack = format!(
-        "{} {} {} {}",
-        item.key,
-        item.content,
-        item.summary.as_deref().unwrap_or(""),
-        item.tags.join(" ")
-    )
-    .to_ascii_lowercase();
-    let key_lower = item.key.to_ascii_lowercase();
-    let tags_lower: Vec<String> = item.tags.iter().map(|t| t.to_ascii_lowercase()).collect();
-
     let mut hits = 0.0;
     for tok in tokens {
-        if haystack.contains(tok) {
+        let in_key = contains_ascii_ci(&item.key, tok);
+        let exact_tag = item.tags.iter().any(|t| t.eq_ignore_ascii_case(tok));
+        let in_haystack = in_key
+            || exact_tag
+            || contains_ascii_ci(&item.content, tok)
+            || contains_ascii_ci(item.summary.as_deref().unwrap_or(""), tok)
+            || item.tags.iter().any(|t| contains_ascii_ci(t, tok));
+        if in_haystack {
             hits += 1.0;
-            if key_lower.contains(tok) || tags_lower.iter().any(|t| t == tok) {
+            if in_key || exact_tag {
                 hits += 0.15;
             }
         }
@@ -939,6 +953,7 @@ mod tests {
         memories: Mutex<Vec<MemoryItem>>,
         messages: Mutex<Vec<ChatMessage>>,
         last_query_limit: Mutex<Option<usize>>,
+        chat_list_calls: Mutex<Vec<(bool, usize)>>,
     }
 
     impl StorageBackend for MockMemoryStorage {
@@ -959,6 +974,10 @@ mod tests {
             Ok(())
         }
         fn list_chat_messages(&self, conv_id: &str, include_archived: bool, limit: usize) -> Result<Vec<ChatMessage>> {
+            self.chat_list_calls
+                .lock()
+                .unwrap()
+                .push((include_archived, limit));
             Ok(self
                 .messages
                 .lock()
@@ -1104,6 +1123,7 @@ mod tests {
                     archived: false,
                     created_at: now_iso(),
                     attachments: vec![],
+                    timings: None,
                 })
                 .unwrap();
         }
@@ -1142,6 +1162,7 @@ mod tests {
                     workspace_path: None,
                     size_bytes: 30_000,
                 }],
+                timings: None,
             })
             .unwrap();
 
@@ -1245,6 +1266,7 @@ mod tests {
                 archived: true,
                 created_at: now_iso(),
                 attachments: Vec::new(),
+                timings: None,
             })
             .collect();
         let refs: Vec<&ChatMessage> = msgs.iter().collect();
@@ -1289,6 +1311,7 @@ mod tests {
                     archived: false,
                     created_at: now_iso(),
                     attachments: Vec::new(),
+                    timings: None,
                 })
                 .unwrap();
         }
@@ -1322,6 +1345,7 @@ mod tests {
                 archived: false,
                 created_at: now_iso(),
                 attachments: Vec::new(),
+                timings: None,
             })
             .unwrap();
 
@@ -1336,5 +1360,202 @@ mod tests {
         assert!(!msg_text.contains("BBBB"));
         assert!(msg_text.contains("[inline image/png data omitted (20000 chars)]"));
         assert!(msg_text.contains("[inline text/plain data omitted (8000 chars)]"));
+    }
+
+    #[test]
+    fn build_conversation_context_skips_second_chat_list_when_archived_count_is_zero() {
+        let storage = Arc::new(MockMemoryStorage::default());
+        let mgr = MemoryManager::new(
+            storage.clone(),
+            MemoryConfig {
+                archive_after_messages: 4,
+                keep_recent_messages: 2,
+                ..MemoryConfig::default()
+            },
+        );
+
+        for i in 1..=3 {
+            storage
+                .append_chat_message(&ChatMessage {
+                    id: format!("m-{i}"),
+                    conversation_id: "conv-skip".to_string(),
+                    role: ChatRole::User,
+                    agent_id: None,
+                    content: format!("Turn {i} uncompacted"),
+                    reasoning: None,
+                    tool_calls_json: None,
+                    task_id: None,
+                    token_count: 10,
+                    latency_ms: None,
+                    archived: false,
+                    created_at: now_iso(),
+                    attachments: Vec::new(),
+                    timings: None,
+                })
+                .unwrap();
+        }
+
+        // Below threshold: archived_count == 0, only include_archived=false query runs.
+        let ctx1 = mgr
+            .build_conversation_context("conv-skip", "Sys.", None, 1024)
+            .unwrap();
+        assert_eq!(ctx1.archived_count, 0);
+        assert!(ctx1.rolling_summary.is_none());
+        assert_eq!(ctx1.messages.len(), 4);
+        assert_eq!(*storage.chat_list_calls.lock().unwrap(), vec![(false, 1028)]);
+
+        // Cross threshold (> 4): triggers archive + include_archived=true reload.
+        for i in 4..=5 {
+            storage
+                .append_chat_message(&ChatMessage {
+                    id: format!("m-{i}"),
+                    conversation_id: "conv-skip".to_string(),
+                    role: ChatRole::Assistant,
+                    agent_id: Some("commander".to_string()),
+                    content: format!("Turn {i} overflow"),
+                    reasoning: None,
+                    tool_calls_json: None,
+                    task_id: None,
+                    token_count: 10,
+                    latency_ms: None,
+                    archived: false,
+                    created_at: now_iso(),
+                    attachments: Vec::new(),
+                    timings: None,
+                })
+                .unwrap();
+        }
+        storage.chat_list_calls.lock().unwrap().clear();
+
+        let ctx2 = mgr
+            .build_conversation_context("conv-skip", "Sys.", None, 1024)
+            .unwrap();
+        assert_eq!(ctx2.archived_count, 3);
+        assert!(ctx2.rolling_summary.is_some());
+        assert_eq!(ctx2.messages.len(), 3);
+        assert_eq!(
+            *storage.chat_list_calls.lock().unwrap(),
+            vec![(false, 1028), (true, 2052)]
+        );
+
+        // Next turn below threshold again: archived_count == 0, rolling_summary preserved,
+        // and the second include_archived=true list call is skipped.
+        storage
+            .append_chat_message(&ChatMessage {
+                id: "m-6".to_string(),
+                conversation_id: "conv-skip".to_string(),
+                role: ChatRole::User,
+                agent_id: None,
+                content: "Turn 6 follow-up".to_string(),
+                reasoning: None,
+                tool_calls_json: None,
+                task_id: None,
+                token_count: 10,
+                latency_ms: None,
+                archived: false,
+                created_at: now_iso(),
+                attachments: Vec::new(),
+                timings: None,
+            })
+            .unwrap();
+        storage.chat_list_calls.lock().unwrap().clear();
+
+        let ctx3 = mgr
+            .build_conversation_context("conv-skip", "Sys.", None, 1024)
+            .unwrap();
+        assert_eq!(ctx3.archived_count, 0);
+        assert_eq!(ctx3.rolling_summary, ctx2.rolling_summary);
+        assert_eq!(ctx3.messages.len(), 4);
+        assert_eq!(*storage.chat_list_calls.lock().unwrap(), vec![(false, 1028)]);
+    }
+
+    #[test]
+    fn score_memory_matches_legacy_lowercase_semantics() {
+        fn baseline_score(
+            item: &MemoryItem,
+            tokens: &[String],
+            conversation_id: Option<&str>,
+            task_id: Option<&str>,
+            now: DateTime<Utc>,
+        ) -> f64 {
+            let importance_score = (item.importance.min(10) as f64) / 10.0;
+            let recency_score = DateTime::parse_from_rfc3339(&item.updated_at)
+                .or_else(|_| DateTime::parse_from_rfc3339(&item.created_at))
+                .map(|dt| {
+                    let age_secs = now
+                        .signed_duration_since(dt.with_timezone(&Utc))
+                        .num_seconds()
+                        .max(0);
+                    let age_hours = (age_secs as f64) / 3600.0;
+                    1.0 / (1.0 + age_hours / 24.0)
+                })
+                .unwrap_or(0.5);
+            let mut affinity_bonus = 0.0;
+            if let (Some(qt), Some(it)) = (task_id, item.task_id.as_deref()) {
+                if qt == it {
+                    affinity_bonus += 0.05;
+                }
+            }
+            if let (Some(qc), Some(ic)) = (conversation_id, item.conversation_id.as_deref()) {
+                if qc == ic {
+                    affinity_bonus += 0.05;
+                }
+            }
+            if tokens.is_empty() {
+                return 0.60 * importance_score + 0.40 * recency_score + affinity_bonus;
+            }
+            let haystack = format!(
+                "{} {} {} {}",
+                item.key,
+                item.content,
+                item.summary.as_deref().unwrap_or(""),
+                item.tags.join(" ")
+            )
+            .to_ascii_lowercase();
+            let key_lower = item.key.to_ascii_lowercase();
+            let tags_lower: Vec<String> = item.tags.iter().map(|t| t.to_ascii_lowercase()).collect();
+            let mut hits = 0.0;
+            for tok in tokens {
+                if haystack.contains(tok) {
+                    hits += 1.0;
+                    if key_lower.contains(tok) || tags_lower.iter().any(|t| t == tok) {
+                        hits += 0.15;
+                    }
+                }
+            }
+            let keyword_score = (hits / tokens.len() as f64).min(1.0);
+            0.50 * keyword_score + 0.30 * importance_score + 0.20 * recency_score + affinity_bonus
+        }
+
+        let now = now_utc();
+        let mut item_key = make_item("SQLite_WAL_Mode", "agent-a");
+        item_key.content = "Fallback to TRUNCATE in Łódź".to_string();
+        item_key.summary = Some("PS5 /data Summary Żółć".to_string());
+        item_key.tags = vec!["SQLite".to_string(), "wal_tuning".to_string()];
+        item_key.conversation_id = Some("conv-1".to_string());
+        item_key.task_id = Some("task-1".to_string());
+
+        let mut item_partial_tag = make_item("other_key", "agent-a");
+        item_partial_tag.content = "Check TRUNCATE behavior".to_string();
+        item_partial_tag.tags = vec!["wal_tuning".to_string()];
+
+        for q in [
+            "",
+            "sqlite wal truncate",
+            "Łódź Żółć",
+            "WAL ps5 summary",
+            "wal_tuning",
+        ] {
+            let tokens = tokenize_query(q);
+            for item in [&item_key, &item_partial_tag] {
+                let actual = score_memory(item, &tokens, Some("conv-1"), Some("task-1"), now);
+                let expected = baseline_score(item, &tokens, Some("conv-1"), Some("task-1"), now);
+                assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "score mismatch for query={q:?}, item={}: actual={actual}, expected={expected}",
+                    item.id
+                );
+            }
+        }
     }
 }

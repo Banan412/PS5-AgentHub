@@ -175,6 +175,7 @@ async fn stress_120_message_conversation_compaction_and_rolling_summary() {
                 latency_ms: Some(12),
                 archived: false,
                 attachments: Vec::new(),
+                timings: None,
                 created_at: format!("2026-11-13T12:{:02}:{:02}Z", i / 60, i % 60),
             })
             .unwrap();
@@ -322,6 +323,7 @@ async fn chaos_five_agent_workflow_and_all_ps5lm_modes_under_503_recovery() {
                 context_limit: 2048,
                 stream: false,
                 thinking_level: ThinkingLevel::default(),
+                slot_id: None,
             },
             CancellationToken::new(),
         )

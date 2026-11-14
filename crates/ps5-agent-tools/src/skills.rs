@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::time::SystemTime;
 
 const MAX_SKILL_SLUG_LEN: usize = 64;
 const MAX_SKILL_MARKDOWN_BYTES: usize = 512 * 1024;
@@ -56,12 +57,70 @@ struct LoadedSkillEntry {
     raw_markdown: String,
 }
 
+impl LoadedSkillEntry {
+    fn summary_with_enabled(&self, enabled: bool) -> SkillSummary {
+        let mut summary = self.summary.clone();
+        summary.enabled = enabled;
+        summary
+    }
+
+    fn document_with_enabled(&self, enabled: bool) -> SkillDocument {
+        SkillDocument {
+            summary: self.summary_with_enabled(enabled),
+            instructions: self.instructions.clone(),
+            raw_markdown: self.raw_markdown.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SkillScanCache {
+    generation: u64,
+    fingerprint: ScanFingerprint,
+    entries: BTreeMap<String, LoadedSkillEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanFingerprint {
+    workspace_dirs: Vec<PathBuf>,
+    roots: Vec<RootFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootFingerprint {
+    exists: bool,
+    dir_modified: Option<SystemTime>,
+    raw_entry_count: usize,
+    skills: Vec<SkillDirFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillDirFingerprint {
+    slug: String,
+    dir_modified: Option<SystemTime>,
+    skill_md_modified: Option<SystemTime>,
+    skill_md_len: Option<u64>,
+    resource_dirs: [ResourceDirFingerprint; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResourceDirFingerprint {
+    exists: bool,
+    dir_modified: Option<SystemTime>,
+    entry_count: usize,
+    max_dir_modified: Option<SystemTime>,
+}
+
 #[derive(Debug)]
 pub struct SkillManager {
     data_dir: PathBuf,
     data_skills_dir: PathBuf,
     workspace_skills_dirs: Vec<PathBuf>,
     disabled_ids: RwLock<HashSet<String>>,
+    cache_generation: AtomicU64,
+    scan_cache: RwLock<Option<SkillScanCache>>,
+    #[cfg(test)]
+    disk_scan_count: AtomicU64,
 }
 
 impl SkillManager {
@@ -86,6 +145,10 @@ impl SkillManager {
             data_skills_dir,
             workspace_skills_dirs,
             disabled_ids: RwLock::new(disabled),
+            cache_generation: AtomicU64::new(0),
+            scan_cache: RwLock::new(None),
+            #[cfg(test)]
+            disk_scan_count: AtomicU64::new(0),
         }
     }
 
@@ -99,6 +162,7 @@ impl SkillManager {
 
     pub fn add_workspace_skills_dir(&mut self, dir: impl Into<PathBuf>) {
         self.workspace_skills_dirs.push(dir.into());
+        self.invalidate_cache();
     }
 
     pub fn set_disabled_ids(&self, ids: HashSet<String>) {
@@ -117,18 +181,22 @@ impl SkillManager {
     }
 
     pub fn list_skills(&self) -> Vec<SkillSummary> {
-        self.scan_all_entries()
-            .into_values()
-            .map(|entry| entry.summary)
-            .collect()
+        self.with_cached_entries(|entries, disabled| {
+            entries
+                .iter()
+                .map(|(id, entry)| entry.summary_with_enabled(!disabled.contains(id)))
+                .collect()
+        })
     }
 
     pub fn list_enabled_summaries(&self) -> Vec<SkillSummary> {
-        self.scan_all_entries()
-            .into_values()
-            .map(|entry| entry.summary)
-            .filter(|summary| summary.enabled)
-            .collect()
+        self.with_cached_entries(|entries, disabled| {
+            entries
+                .iter()
+                .filter(|(id, _)| !disabled.contains(*id))
+                .map(|(_, entry)| entry.summary_with_enabled(true))
+                .collect()
+        })
     }
 
     pub fn load_skill(&self, id_or_name: &str) -> Result<SkillDocument> {
@@ -139,32 +207,24 @@ impl SkillManager {
             ));
         }
 
-        let entries = self.scan_all_entries();
-        if let Some(entry) = entries.get(query) {
-            return Ok(SkillDocument {
-                summary: entry.summary.clone(),
-                instructions: entry.instructions.clone(),
-                raw_markdown: entry.raw_markdown.clone(),
-            });
-        }
+        self.with_cached_entries(|entries, disabled| {
+            let found = entries
+                .get(query)
+                .or_else(|| {
+                    entries
+                        .values()
+                        .find(|e| e.summary.id.eq_ignore_ascii_case(query))
+                })
+                .or_else(|| {
+                    entries
+                        .values()
+                        .find(|e| e.summary.name.eq_ignore_ascii_case(query))
+                });
 
-        if let Some(entry) = entries
-            .values()
-            .find(|e| e.summary.id.eq_ignore_ascii_case(query))
-            .or_else(|| {
-                entries
-                    .values()
-                    .find(|e| e.summary.name.eq_ignore_ascii_case(query))
-            })
-        {
-            return Ok(SkillDocument {
-                summary: entry.summary.clone(),
-                instructions: entry.instructions.clone(),
-                raw_markdown: entry.raw_markdown.clone(),
-            });
-        }
-
-        Err(AgentError::NotFound(format!("skill '{query}' not found")))
+            found
+                .map(|entry| entry.document_with_enabled(!disabled.contains(&entry.summary.id)))
+                .ok_or_else(|| AgentError::NotFound(format!("skill '{query}' not found")))
+        })
     }
 
     pub fn import_skill(&self, slug: Option<&str>, markdown_content: &str) -> Result<SkillSummary> {
@@ -206,6 +266,7 @@ impl SkillManager {
         let skill_md_path = skill_dir.join("SKILL.md");
         ensure_real_file_if_exists(&skill_md_path)?;
         atomic_write_bytes(&skill_md_path, markdown_content.as_bytes())?;
+        self.invalidate_cache();
 
         let disabled = self.disabled_ids();
         let entry = load_skill_from_dir(
@@ -225,7 +286,7 @@ impl SkillManager {
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<SkillSummary> {
         let valid_id = validate_skill_slug(id)?;
-        let exists = self.scan_all_entries().contains_key(&valid_id);
+        let exists = self.with_cached_entries(|entries, _| entries.contains_key(&valid_id));
         if !exists {
             return Err(AgentError::NotFound(format!("skill '{valid_id}' not found")));
         }
@@ -245,11 +306,12 @@ impl SkillManager {
 
         self.persist_disabled_ids(&snapshot)?;
 
-        let entries = self.scan_all_entries();
-        entries
-            .get(&valid_id)
-            .map(|e| e.summary.clone())
-            .ok_or_else(|| AgentError::NotFound(format!("skill '{valid_id}' not found")))
+        self.with_cached_entries(|entries, disabled| {
+            entries
+                .get(&valid_id)
+                .map(|entry| entry.summary_with_enabled(!disabled.contains(&valid_id)))
+                .ok_or_else(|| AgentError::NotFound(format!("skill '{valid_id}' not found")))
+        })
     }
 
     pub fn delete_skill(&self, id: &str) -> Result<()> {
@@ -275,6 +337,7 @@ impl SkillManager {
                         skill_dir.display()
                     ))
                 })?;
+                self.invalidate_cache();
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(AgentError::NotFound(format!(
@@ -316,17 +379,241 @@ impl SkillManager {
         atomic_write_bytes(&state_path, &json)
     }
 
-    fn scan_all_entries(&self) -> BTreeMap<String, LoadedSkillEntry> {
+    fn invalidate_cache(&self) {
+        self.cache_generation.fetch_add(1, Ordering::AcqRel);
+        let mut guard = self
+            .scan_cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
+    }
+
+    fn with_cached_entries<R>(
+        &self,
+        f: impl FnOnce(&BTreeMap<String, LoadedSkillEntry>, &HashSet<String>) -> R,
+    ) -> R {
+        let gen_before = self.cache_generation.load(Ordering::Acquire);
+        let fingerprint =
+            compute_scan_fingerprint(&self.workspace_skills_dirs, &self.data_skills_dir);
         let disabled = self.disabled_ids();
+
+        {
+            let guard = self
+                .scan_cache
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = guard.as_ref() {
+                if cached.generation == gen_before && cached.fingerprint == fingerprint {
+                    return f(&cached.entries, &disabled);
+                }
+            }
+        }
+
+        let fresh_entries = self.scan_raw_entries_uncached();
+        #[cfg(test)]
+        self.disk_scan_count.fetch_add(1, Ordering::Relaxed);
+        let disabled = self.disabled_ids();
+
+        let mut guard = self
+            .scan_cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.cache_generation.load(Ordering::Acquire) == gen_before {
+            *guard = Some(SkillScanCache {
+                generation: gen_before,
+                fingerprint,
+                entries: fresh_entries,
+            });
+            return f(&guard.as_ref().expect("just inserted").entries, &disabled);
+        }
+
+        drop(guard);
+        f(&fresh_entries, &disabled)
+    }
+
+    fn scan_raw_entries_uncached(&self) -> BTreeMap<String, LoadedSkillEntry> {
+        let empty_disabled = HashSet::new();
         let mut entries = BTreeMap::new();
 
         for ws_dir in &self.workspace_skills_dirs {
-            scan_skills_root(ws_dir, "workspace", &disabled, &mut entries);
+            scan_skills_root(ws_dir, "workspace", &empty_disabled, &mut entries);
         }
         // User/data skills override workspace skills when IDs collide.
-        scan_skills_root(&self.data_skills_dir, "user", &disabled, &mut entries);
+        scan_skills_root(&self.data_skills_dir, "user", &empty_disabled, &mut entries);
 
         entries
+    }
+
+    #[cfg(test)]
+    fn disk_scan_count(&self) -> u64 {
+        self.disk_scan_count.load(Ordering::Relaxed)
+    }
+}
+
+fn compute_scan_fingerprint(workspace_dirs: &[PathBuf], data_skills_dir: &Path) -> ScanFingerprint {
+    let mut roots = Vec::with_capacity(workspace_dirs.len() + 1);
+    for ws_dir in workspace_dirs {
+        roots.push(fingerprint_skills_root(ws_dir));
+    }
+    roots.push(fingerprint_skills_root(data_skills_dir));
+    ScanFingerprint {
+        workspace_dirs: workspace_dirs.to_vec(),
+        roots,
+    }
+}
+
+fn fingerprint_skills_root(root: &Path) -> RootFingerprint {
+    let root_meta = match fs::symlink_metadata(root) {
+        Ok(m) if !m.file_type().is_symlink() && m.is_dir() => m,
+        _ => {
+            return RootFingerprint {
+                exists: false,
+                dir_modified: None,
+                raw_entry_count: 0,
+                skills: Vec::new(),
+            };
+        }
+    };
+    let dir_modified = root_meta.modified().ok();
+    let entries = match fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(_) => {
+            return RootFingerprint {
+                exists: true,
+                dir_modified,
+                raw_entry_count: 0,
+                skills: Vec::new(),
+            };
+        }
+    };
+
+    let mut raw_entry_count = 0usize;
+    let mut skills = Vec::new();
+    for item in entries.flatten() {
+        raw_entry_count += 1;
+        let file_type = match item.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let dir_name = item.file_name();
+        let Some(slug) = dir_name.to_str() else {
+            continue;
+        };
+        if validate_skill_slug(slug).is_err() {
+            continue;
+        }
+        skills.push(fingerprint_skill_dir(slug, &item.path()));
+    }
+    skills.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+    RootFingerprint {
+        exists: true,
+        dir_modified,
+        raw_entry_count,
+        skills,
+    }
+}
+
+fn fingerprint_skill_dir(slug: &str, skill_dir: &Path) -> SkillDirFingerprint {
+    let dir_modified = fs::symlink_metadata(skill_dir)
+        .ok()
+        .and_then(|m| m.modified().ok());
+
+    let (skill_md_modified, skill_md_len) = match fs::symlink_metadata(skill_dir.join("SKILL.md")) {
+        Ok(m) if !m.file_type().is_symlink() && m.is_file() => {
+            (m.modified().ok(), Some(m.len()))
+        }
+        _ => (None, None),
+    };
+
+    let resource_dirs = RESOURCE_SUBDIRS.map(|sub| fingerprint_resource_dir(&skill_dir.join(sub)));
+
+    SkillDirFingerprint {
+        slug: slug.to_string(),
+        dir_modified,
+        skill_md_modified,
+        skill_md_len,
+        resource_dirs,
+    }
+}
+
+fn fingerprint_resource_dir(base: &Path) -> ResourceDirFingerprint {
+    let meta = match fs::symlink_metadata(base) {
+        Ok(m) if !m.file_type().is_symlink() && m.is_dir() => m,
+        _ => {
+            return ResourceDirFingerprint {
+                exists: false,
+                dir_modified: None,
+                entry_count: 0,
+                max_dir_modified: None,
+            };
+        }
+    };
+
+    let dir_modified = meta.modified().ok();
+    let mut entry_count = 0usize;
+    let mut max_dir_modified = dir_modified;
+    accumulate_resource_dir_stats(base, 0, &mut entry_count, &mut max_dir_modified);
+
+    ResourceDirFingerprint {
+        exists: true,
+        dir_modified,
+        entry_count,
+        max_dir_modified,
+    }
+}
+
+fn accumulate_resource_dir_stats(
+    dir: &Path,
+    depth: usize,
+    entry_count: &mut usize,
+    max_dir_modified: &mut Option<SystemTime>,
+) {
+    let max_entries = MAX_RESOURCE_FILES * 2;
+    if depth >= MAX_RESOURCE_SCAN_DEPTH || *entry_count >= max_entries {
+        return;
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        if *entry_count >= max_entries {
+            break;
+        }
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        if name.to_str().is_none_or(|s| s.starts_with('.')) {
+            continue;
+        }
+        *entry_count += 1;
+        if ft.is_dir() {
+            let path = entry.path();
+            if let Some(mtime) = fs::symlink_metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+            {
+                update_max_time(max_dir_modified, mtime);
+            }
+            accumulate_resource_dir_stats(&path, depth + 1, entry_count, max_dir_modified);
+        }
+    }
+}
+
+fn update_max_time(max: &mut Option<SystemTime>, candidate: SystemTime) {
+    if max.is_none_or(|cur| candidate > cur) {
+        *max = Some(candidate);
     }
 }
 
@@ -1265,5 +1552,122 @@ mod tests {
             mgr.delete_skill("sym-skill"),
             Err(AgentError::PermissionDenied(_))
         ));
+    }
+
+    #[test]
+    fn scan_cache_hits_and_invalidates_on_mutations_mtime_and_workspace_dirs() {
+        use std::fs::OpenOptions;
+        use std::time::Duration;
+
+        let data_tmp = TempDir::new().unwrap();
+        let ws1_tmp = TempDir::new().unwrap();
+        let ws2_tmp = TempDir::new().unwrap();
+
+        let ws1_skills = ws1_tmp.path().join(".agents").join("skills");
+        let alpha_dir = ws1_skills.join("alpha");
+        fs::create_dir_all(&alpha_dir).unwrap();
+        let alpha_md = alpha_dir.join("SKILL.md");
+        fs::write(&alpha_md, "---\nname: Alpha\ndescription: v1\n---\nBody v1").unwrap();
+
+        let mut mgr = SkillManager::new(data_tmp.path(), Some(ws1_tmp.path()));
+        assert_eq!(mgr.disk_scan_count(), 0);
+
+        // First read populates cache (1 disk scan).
+        let first = mgr.list_skills();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].description, "v1");
+        assert_eq!(mgr.disk_scan_count(), 1);
+
+        // Repeated queries reuse cached entries without re-reading SKILL.md.
+        assert_eq!(mgr.list_skills().len(), 1);
+        assert_eq!(mgr.list_enabled_summaries().len(), 1);
+        assert_eq!(mgr.load_skill("alpha").unwrap().instructions, "Body v1");
+        assert_eq!(mgr.disk_scan_count(), 1);
+
+        // Toggle via set_enabled and set_disabled_ids reflects immediately without stale cache.
+        let toggled = mgr.set_enabled("alpha", false).unwrap();
+        assert!(!toggled.enabled);
+        assert!(mgr.list_enabled_summaries().is_empty());
+        assert!(!mgr.load_skill("alpha").unwrap().summary.enabled);
+        assert_eq!(mgr.disk_scan_count(), 1);
+
+        mgr.set_disabled_ids(HashSet::new());
+        assert_eq!(mgr.list_enabled_summaries().len(), 1);
+        assert!(mgr.load_skill("alpha").unwrap().summary.enabled);
+        assert_eq!(mgr.disk_scan_count(), 1);
+
+        // Out-of-band SKILL.md edit with identical byte length + advanced mtime invalidates cache.
+        fs::write(&alpha_md, "---\nname: Alpha\ndescription: v2\n---\nBody v2").unwrap();
+        let future = SystemTime::now() + Duration::from_secs(10);
+        OpenOptions::new()
+            .write(true)
+            .open(&alpha_md)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        let after_mtime = mgr.list_skills();
+        assert_eq!(after_mtime[0].description, "v2");
+        assert_eq!(mgr.load_skill("alpha").unwrap().instructions, "Body v2");
+        assert_eq!(mgr.disk_scan_count(), 2);
+
+        // Repeated reads hit cache again after mtime rescan.
+        assert_eq!(mgr.list_enabled_summaries().len(), 1);
+        assert_eq!(mgr.disk_scan_count(), 2);
+
+        // Out-of-band resource directory/file creation invalidates cache cleanly.
+        let scripts_dir = alpha_dir.join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::write(scripts_dir.join("helper.sh"), "#!/bin/sh\n").unwrap();
+        let with_script = mgr.list_skills();
+        assert!(with_script[0].has_scripts);
+        assert_eq!(with_script[0].resources, vec!["scripts/helper.sh"]);
+        assert_eq!(mgr.disk_scan_count(), 3);
+
+        // import_skill invalidates cache immediately even with same-tick writes.
+        let imported = mgr
+            .import_skill(
+                Some("beta"),
+                "---\nname: Beta\ndescription: imp1\n---\nBeta body",
+            )
+            .unwrap();
+        assert_eq!(imported.id, "beta");
+        assert_eq!(mgr.list_skills().len(), 2);
+        assert_eq!(mgr.disk_scan_count(), 4);
+        assert_eq!(mgr.load_skill("beta").unwrap().instructions, "Beta body");
+        assert_eq!(mgr.disk_scan_count(), 4);
+
+        // Re-importing same slug with same byte length invalidates immediately.
+        mgr.import_skill(
+            Some("beta"),
+            "---\nname: Beta\ndescription: imp2\n---\nBeta body",
+        )
+        .unwrap();
+        assert_eq!(mgr.load_skill("beta").unwrap().summary.description, "imp2");
+        assert_eq!(mgr.disk_scan_count(), 5);
+
+        // delete_skill invalidates cache immediately.
+        mgr.delete_skill("beta").unwrap();
+        assert_eq!(mgr.list_skills().len(), 1);
+        assert!(mgr.load_skill("beta").is_err());
+        assert_eq!(mgr.disk_scan_count(), 6);
+
+        // Adding another workspace skills dir invalidates cache and respects the new root.
+        let ws2_skills = ws2_tmp.path().join(".agents").join("skills");
+        let gamma_dir = ws2_skills.join("gamma");
+        fs::create_dir_all(&gamma_dir).unwrap();
+        fs::write(
+            gamma_dir.join("SKILL.md"),
+            "---\nname: Gamma\ndescription: ws2\n---\nGamma body",
+        )
+        .unwrap();
+        mgr.add_workspace_skills_dir(&ws2_skills);
+        let after_ws_add = mgr.list_skills();
+        assert_eq!(
+            after_ws_add.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "gamma"]
+        );
+        assert_eq!(mgr.disk_scan_count(), 7);
+        assert_eq!(mgr.load_skill("gamma").unwrap().instructions, "Gamma body");
+        assert_eq!(mgr.disk_scan_count(), 7);
     }
 }

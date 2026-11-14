@@ -51,6 +51,92 @@ pub struct ScriptedResponse {
     pub finish_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MockKvSampling {
+    pub cache_type_k: Option<String>,
+    pub cache_type_v: Option<String>,
+    pub flash_attn: Option<bool>,
+    pub n_keep: i32,
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: i32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: u32,
+    pub dry_penalty_last_n: i32,
+    pub xtc_probability: f32,
+    pub xtc_threshold: f32,
+    pub samplers: Vec<String>,
+}
+
+impl Default for MockKvSampling {
+    fn default() -> Self {
+        Self {
+            cache_type_k: Some("q8_0".to_string()),
+            cache_type_v: Some("q8_0".to_string()),
+            flash_attn: Some(true),
+            n_keep: 0,
+            temperature: 0.7,
+            top_k: 40,
+            top_p: 0.95,
+            min_p: 0.05,
+            repeat_penalty: 1.05,
+            repeat_last_n: 256,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            dry_multiplier: 0.8,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: 4096,
+            xtc_probability: 0.0,
+            xtc_threshold: 0.1,
+            samplers: vec![
+                "penalties".to_string(),
+                "dry".to_string(),
+                "top_k".to_string(),
+                "typ_p".to_string(),
+                "top_p".to_string(),
+                "min_p".to_string(),
+                "xtc".to_string(),
+                "temperature".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MockTimings {
+    pub predicted_per_second: f64,
+    pub prompt_per_second: f64,
+    pub predicted_ms: f64,
+    pub prompt_ms: f64,
+    pub predicted_n: u32,
+    pub prompt_n: u32,
+    /// Optional explicit `cache_n` override. When `None`, derived from shared leading message prefix.
+    pub cache_n: Option<u32>,
+}
+
+impl Default for MockTimings {
+    fn default() -> Self {
+        Self {
+            predicted_per_second: 118.4,
+            prompt_per_second: 420.0,
+            predicted_ms: 101.4,
+            prompt_ms: 38.1,
+            predicted_n: 12,
+            prompt_n: 16,
+            cache_n: None,
+        }
+    }
+}
+
 struct MockInner {
     mode: MockMode,
     model_name: String,
@@ -60,6 +146,8 @@ struct MockInner {
     total_slots: u32,
     supports_vision: bool,
     supports_thinking: bool,
+    kv_sampling: MockKvSampling,
+    timings: MockTimings,
     scripted: VecDeque<ScriptedResponse>,
     recorded: Vec<RecordedRequest>,
     recorded_prefills: Vec<RecordedRequest>,
@@ -74,6 +162,7 @@ struct PropsSnapshot {
     total_slots: u32,
     supports_vision: bool,
     supports_thinking: bool,
+    kv_sampling: MockKvSampling,
 }
 
 struct RequestSnapshot {
@@ -88,6 +177,60 @@ struct RequestSnapshot {
 pub struct RecordedRequest {
     pub path: String,
     pub body: Value,
+}
+
+impl RecordedRequest {
+    pub fn id_slot(&self) -> Option<i64> {
+        self.body.get("id_slot").and_then(Value::as_i64)
+    }
+
+    pub fn stream_options(&self) -> Option<&Value> {
+        self.body.get("stream_options")
+    }
+
+    pub fn has_field(&self, field: &str) -> bool {
+        self.body.get(field).is_some()
+    }
+
+    pub fn field(&self, field: &str) -> Option<&Value> {
+        self.body.get(field)
+    }
+
+    /// Collects present sampling / llama.cpp telemetry-related keys recorded in `body`.
+    pub fn sampling_fields(&self) -> serde_json::Map<String, Value> {
+        const KEYS: &[&str] = &[
+            "temperature",
+            "top_k",
+            "top_p",
+            "min_p",
+            "typical_p",
+            "repeat_penalty",
+            "repeat_last_n",
+            "presence_penalty",
+            "frequency_penalty",
+            "dry_multiplier",
+            "dry_base",
+            "dry_allowed_length",
+            "dry_penalty_last_n",
+            "xtc_probability",
+            "xtc_threshold",
+            "samplers",
+            "n_keep",
+            "seed",
+            "id_slot",
+            "stream_options",
+            "stop",
+            "cache_prompt",
+            "timings_per_token",
+        ];
+        let mut out = serde_json::Map::new();
+        for &key in KEYS {
+            if let Some(val) = self.body.get(key) {
+                out.insert(key.to_string(), val.clone());
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone)]
@@ -107,6 +250,8 @@ impl MockState {
                 total_slots: 4,
                 supports_vision: true,
                 supports_thinking: true,
+                kv_sampling: MockKvSampling::default(),
+                timings: MockTimings::default(),
                 scripted: VecDeque::new(),
                 recorded: Vec::new(),
                 recorded_prefills: Vec::new(),
@@ -197,6 +342,45 @@ impl MockState {
         self.inner.lock().map(|g| g.supports_thinking).unwrap_or(true)
     }
 
+    pub fn set_mock_kv_sampling(&self, kv_sampling: MockKvSampling) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.kv_sampling = kv_sampling;
+        }
+    }
+
+    pub fn mock_kv_sampling(&self) -> MockKvSampling {
+        self.inner
+            .lock()
+            .map(|g| g.kv_sampling.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_kv_cache(
+        &self,
+        cache_type_k: Option<String>,
+        cache_type_v: Option<String>,
+        flash_attn: Option<bool>,
+    ) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.kv_sampling.cache_type_k = cache_type_k;
+            g.kv_sampling.cache_type_v = cache_type_v;
+            g.kv_sampling.flash_attn = flash_attn;
+        }
+    }
+
+    pub fn set_mock_timings(&self, timings: MockTimings) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.timings = timings;
+        }
+    }
+
+    pub fn mock_timings(&self) -> MockTimings {
+        self.inner
+            .lock()
+            .map(|g| g.timings.clone())
+            .unwrap_or_default()
+    }
+
     pub fn push_scripted(&self, resp: ScriptedResponse) {
         if let Ok(mut g) = self.inner.lock() {
             g.scripted.push_back(resp);
@@ -263,6 +447,7 @@ impl MockState {
                 total_slots: 4,
                 supports_vision: true,
                 supports_thinking: true,
+                kv_sampling: MockKvSampling::default(),
             };
         };
         let model_path = g
@@ -278,6 +463,7 @@ impl MockState {
             total_slots: g.total_slots,
             supports_vision: g.supports_vision,
             supports_thinking: g.supports_thinking,
+            kv_sampling: g.kv_sampling.clone(),
         }
     }
 
@@ -303,6 +489,33 @@ impl MockState {
             supports_thinking: g.supports_thinking,
             scripted,
         }
+    }
+
+    fn resolve_chat_timings_json(&self, body: &Value, is_prefill: bool) -> Value {
+        let (cfg, auto_cache_n) = {
+            let Ok(g) = self.inner.lock() else {
+                let d = MockTimings::default();
+                return build_timings_json(&d, d.cache_n.unwrap_or(0), is_prefill);
+            };
+            let auto_cache_n = if g.timings.cache_n.is_none() {
+                let prior_recorded = if !is_prefill && !g.recorded.is_empty() {
+                    &g.recorded[..g.recorded.len() - 1]
+                } else {
+                    &g.recorded[..]
+                };
+                let prior_prefills = if is_prefill && !g.recorded_prefills.is_empty() {
+                    &g.recorded_prefills[..g.recorded_prefills.len() - 1]
+                } else {
+                    &g.recorded_prefills[..]
+                };
+                estimate_shared_prefix_tokens(prior_recorded, prior_prefills, body)
+            } else {
+                0
+            };
+            (g.timings.clone(), auto_cache_n)
+        };
+        let cache_n = cfg.cache_n.unwrap_or(auto_cache_n);
+        build_timings_json(&cfg, cache_n, is_prefill)
     }
 }
 
@@ -370,6 +583,32 @@ impl MockPs5LmHandle {
 
     pub fn set_supports_thinking(&self, supports_thinking: bool) {
         self.state.set_supports_thinking(supports_thinking);
+    }
+
+    pub fn set_mock_kv_sampling(&self, kv_sampling: MockKvSampling) {
+        self.state.set_mock_kv_sampling(kv_sampling);
+    }
+
+    pub fn mock_kv_sampling(&self) -> MockKvSampling {
+        self.state.mock_kv_sampling()
+    }
+
+    pub fn set_kv_cache(
+        &self,
+        cache_type_k: Option<String>,
+        cache_type_v: Option<String>,
+        flash_attn: Option<bool>,
+    ) {
+        self.state
+            .set_kv_cache(cache_type_k, cache_type_v, flash_attn);
+    }
+
+    pub fn set_mock_timings(&self, timings: MockTimings) {
+        self.state.set_mock_timings(timings);
+    }
+
+    pub fn mock_timings(&self) -> MockTimings {
+        self.state.mock_timings()
     }
 
     pub fn push_scripted(&self, resp: ScriptedResponse) {
@@ -491,22 +730,168 @@ async fn handle_health(State(state): State<MockState>) -> Response {
     }
 }
 
+fn sampling_params_value(kv: &MockKvSampling) -> Value {
+    json!({
+        "n_keep": kv.n_keep,
+        "temperature": kv.temperature,
+        "top_k": kv.top_k,
+        "top_p": kv.top_p,
+        "min_p": kv.min_p,
+        "repeat_penalty": kv.repeat_penalty,
+        "repeat_last_n": kv.repeat_last_n,
+        "presence_penalty": kv.presence_penalty,
+        "frequency_penalty": kv.frequency_penalty,
+        "dry_multiplier": kv.dry_multiplier,
+        "dry_base": kv.dry_base,
+        "dry_allowed_length": kv.dry_allowed_length,
+        "dry_penalty_last_n": kv.dry_penalty_last_n,
+        "xtc_probability": kv.xtc_probability,
+        "xtc_threshold": kv.xtc_threshold,
+        "samplers": kv.samplers,
+    })
+}
+
+fn insert_kv_metadata(map: &mut serde_json::Map<String, Value>, kv: &MockKvSampling) {
+    if let Some(ref k) = kv.cache_type_k {
+        map.insert("cache_type_k".into(), json!(k));
+    }
+    if let Some(ref v) = kv.cache_type_v {
+        map.insert("cache_type_v".into(), json!(v));
+    }
+    if let Some(fa) = kv.flash_attn {
+        map.insert("flash_attn".into(), json!(fa));
+    }
+}
+
+fn build_timings_json(cfg: &MockTimings, cache_n: u32, is_prefill: bool) -> Value {
+    if is_prefill {
+        json!({
+            "predicted_per_second": 0.0,
+            "prompt_per_second": cfg.prompt_per_second,
+            "predicted_ms": 0.0,
+            "prompt_ms": cfg.prompt_ms,
+            "predicted_n": 0,
+            "prompt_n": cfg.prompt_n,
+            "cache_n": cache_n
+        })
+    } else {
+        json!({
+            "predicted_per_second": cfg.predicted_per_second,
+            "prompt_per_second": cfg.prompt_per_second,
+            "predicted_ms": cfg.predicted_ms,
+            "prompt_ms": cfg.prompt_ms,
+            "predicted_n": cfg.predicted_n,
+            "prompt_n": cfg.prompt_n,
+            "cache_n": cache_n
+        })
+    }
+}
+
+fn chat_message_prefix_signature(msg: &Value) -> Option<(String, String)> {
+    let role = msg.get("role")?.as_str()?.to_string();
+    let mut sig = serde_json::Map::new();
+    sig.insert("role".into(), json!(role));
+    if let Some(c) = msg.get("content") {
+        sig.insert("content".into(), c.clone());
+    }
+    if let Some(tc) = msg.get("tool_calls") {
+        sig.insert("tool_calls".into(), tc.clone());
+    }
+    if let Some(id) = msg.get("tool_call_id") {
+        sig.insert("tool_call_id".into(), id.clone());
+    }
+    Some((role, Value::Object(sig).to_string()))
+}
+
+fn estimate_shared_prefix_tokens(
+    prior_recorded: &[RecordedRequest],
+    prior_prefills: &[RecordedRequest],
+    current_body: &Value,
+) -> u32 {
+    let Some(cur_msgs_raw) = current_body.get("messages").and_then(Value::as_array) else {
+        return 0;
+    };
+    let cur_msgs: Vec<(String, String)> = cur_msgs_raw
+        .iter()
+        .filter_map(chat_message_prefix_signature)
+        .collect();
+    if cur_msgs.is_empty() {
+        return 0;
+    }
+    let cur_slot = current_body.get("id_slot").and_then(Value::as_i64);
+    let mut best_shared_bytes = 0usize;
+
+    for prev in prior_recorded.iter().chain(prior_prefills.iter()) {
+        if prev.path != "/v1/chat/completions" {
+            continue;
+        }
+        let prev_slot = prev.body.get("id_slot").and_then(Value::as_i64);
+        if let (Some(a), Some(b)) = (prev_slot, cur_slot) {
+            if a != b {
+                continue;
+            }
+        }
+        let Some(prev_msgs_raw) = prev.body.get("messages").and_then(Value::as_array) else {
+            continue;
+        };
+        let prev_msgs: Vec<(String, String)> = prev_msgs_raw
+            .iter()
+            .filter_map(chat_message_prefix_signature)
+            .collect();
+        let mut shared_bytes = 0usize;
+        for (a, b) in prev_msgs.iter().zip(cur_msgs.iter()) {
+            if a == b {
+                shared_bytes = shared_bytes.saturating_add(a.1.len());
+            } else {
+                break;
+            }
+        }
+        if shared_bytes > best_shared_bytes {
+            best_shared_bytes = shared_bytes;
+        }
+    }
+
+    if best_shared_bytes == 0 {
+        0
+    } else {
+        ((best_shared_bytes / 4).clamp(16, 1_000_000)) as u32
+    }
+}
+
 fn props_json(snap: &PropsSnapshot) -> Json<Value> {
-    Json(json!({
-        "default_generation_settings": {
-            "n_ctx": snap.n_ctx
-        },
-        "total_slots": snap.total_slots,
-        "modalities": {
+    let params = sampling_params_value(&snap.kv_sampling);
+    let mut kv_obj = serde_json::Map::new();
+    insert_kv_metadata(&mut kv_obj, &snap.kv_sampling);
+
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "default_generation_settings".into(),
+        json!({
+            "n_ctx": snap.n_ctx,
+            "params": params
+        }),
+    );
+    root.insert("total_slots".into(), json!(snap.total_slots));
+    root.insert(
+        "modalities".into(),
+        json!({
             "vision": snap.supports_vision,
             "audio": false
-        },
-        "chat_template_caps": {
+        }),
+    );
+    root.insert(
+        "chat_template_caps".into(),
+        json!({
             "supports_thinking": snap.supports_thinking
-        },
-        "model_alias": snap.model_name,
-        "model_path": snap.model_path
-    }))
+        }),
+    );
+    root.insert("model_alias".into(), json!(snap.model_name));
+    root.insert("model_path".into(), json!(snap.model_path));
+    insert_kv_metadata(&mut root, &snap.kv_sampling);
+    if !kv_obj.is_empty() {
+        root.insert("kv_cache".into(), Value::Object(kv_obj));
+    }
+    Json(Value::Object(root))
 }
 
 async fn handle_props(State(state): State<MockState>) -> Response {
@@ -523,13 +908,16 @@ async fn handle_props(State(state): State<MockState>) -> Response {
 }
 
 fn slots_json(snap: &PropsSnapshot) -> Json<Value> {
+    let params = sampling_params_value(&snap.kv_sampling);
     let slots: Vec<Value> = (0..snap.total_slots)
         .map(|i| {
-            json!({
-                "id": i,
-                "n_ctx": snap.n_ctx,
-                "is_processing": false
-            })
+            let mut slot = serde_json::Map::new();
+            slot.insert("id".into(), json!(i));
+            slot.insert("n_ctx".into(), json!(snap.n_ctx));
+            slot.insert("is_processing".into(), json!(false));
+            slot.insert("params".into(), params.clone());
+            insert_kv_metadata(&mut slot, &snap.kv_sampling);
+            Value::Object(slot)
         })
         .collect();
     Json(Value::Array(slots))
@@ -995,6 +1383,7 @@ async fn handle_chat_completions(
             .and_then(|v| v.as_str())
             .unwrap_or(&snap.model_name)
             .to_string();
+        let prefill_timings = state.resolve_chat_timings_json(&body, true);
         if body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
             let mut events = vec![Bytes::from(format!(
                 "data: {}\n\n",
@@ -1025,7 +1414,8 @@ async fn handle_chat_completions(
                             "prompt_tokens": 16,
                             "completion_tokens": 0,
                             "total_tokens": 16
-                        }
+                        },
+                        "timings": prefill_timings
                     })
                 )));
                 events.push(Bytes::from_static(b"data: [DONE]\n\n"));
@@ -1055,7 +1445,8 @@ async fn handle_chat_completions(
                 "prompt_tokens": 16,
                 "completion_tokens": 0,
                 "total_tokens": 16
-            }
+            },
+            "timings": prefill_timings
         }))
         .into_response();
     }
@@ -1079,6 +1470,7 @@ async fn handle_chat_completions(
     let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let plan = resolve_scripted_plan(snap.mode, snap.scripted, &body, snap.supports_thinking);
     let structured_reasoning = has_structured_reasoning_format(&body);
+    let timings = state.resolve_chat_timings_json(&body, false);
 
     if is_stream {
         if snap.mode == MockMode::IncompleteSse {
@@ -1223,7 +1615,8 @@ async fn handle_chat_completions(
                     "prompt_tokens": 16,
                     "completion_tokens": 12,
                     "total_tokens": 28
-                }
+                },
+                "timings": timings
             })
         )));
         events.push(Bytes::from_static(b"data: [DONE]\n\n"));
@@ -1292,7 +1685,8 @@ async fn handle_chat_completions(
             "prompt_tokens": 16,
             "completion_tokens": 12,
             "total_tokens": 28
-        }
+        },
+        "timings": timings
     }))
     .into_response()
 }
@@ -2026,8 +2420,12 @@ mod tests {
         let slots = response_json(handle_slots(State(state.clone())).await).await;
         let arr = slots.as_array().expect("slots array");
         assert_eq!(arr.len(), 4);
-        assert_eq!(arr[0], json!({"id": 0, "n_ctx": 16384, "is_processing": false}));
-        assert_eq!(arr[3], json!({"id": 3, "n_ctx": 16384, "is_processing": false}));
+        assert_eq!(arr[0]["id"], 0);
+        assert_eq!(arr[0]["n_ctx"], 16384);
+        assert_eq!(arr[0]["is_processing"], false);
+        assert_eq!(arr[3]["id"], 3);
+        assert_eq!(arr[3]["n_ctx"], 16384);
+        assert_eq!(arr[3]["is_processing"], false);
 
         state.set_props(32768, 2, false, false);
         state.set_model_path("/models/custom.gguf");
@@ -2426,5 +2824,243 @@ mod tests {
         )
         .await;
         assert_eq!(cmpl_json["model"], "custom-cmpl-model");
+    }
+
+    #[tokio::test]
+    async fn props_and_slots_expose_kv_sampling_defaults_and_overrides() {
+        let state = MockState::new();
+        let props = response_json(handle_props(State(state.clone())).await).await;
+        assert_eq!(props["default_generation_settings"]["n_ctx"], 16384);
+        assert_eq!(props["cache_type_k"], "q8_0");
+        assert_eq!(props["cache_type_v"], "q8_0");
+        assert_eq!(props["flash_attn"], true);
+        assert_eq!(props["kv_cache"]["cache_type_k"], "q8_0");
+        let params = &props["default_generation_settings"]["params"];
+        assert_eq!(params["n_keep"], 0);
+        assert_eq!(params["top_k"], 40);
+        assert_eq!(params["repeat_last_n"], 256);
+        assert_eq!(params["dry_penalty_last_n"], 4096);
+        assert_eq!(
+            params["samplers"],
+            json!([
+                "penalties",
+                "dry",
+                "top_k",
+                "typ_p",
+                "top_p",
+                "min_p",
+                "xtc",
+                "temperature"
+            ])
+        );
+        assert!((params["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-4);
+        assert!((params["dry_multiplier"].as_f64().unwrap() - 0.8).abs() < 1e-4);
+
+        let slots = response_json(handle_slots(State(state.clone())).await).await;
+        assert_eq!(slots[0]["cache_type_k"], "q8_0");
+        assert_eq!(slots[0]["flash_attn"], true);
+        assert_eq!(slots[0]["params"]["repeat_last_n"], 256);
+
+        let custom = MockKvSampling {
+            cache_type_k: Some("f16".into()),
+            cache_type_v: Some("q4_0".into()),
+            flash_attn: Some(false),
+            n_keep: 128,
+            temperature: 0.35,
+            top_k: 64,
+            top_p: 0.9,
+            min_p: 0.1,
+            repeat_penalty: 1.12,
+            repeat_last_n: 512,
+            presence_penalty: 0.25,
+            frequency_penalty: 0.15,
+            dry_multiplier: 1.1,
+            dry_base: 1.85,
+            dry_allowed_length: 3,
+            dry_penalty_last_n: 2048,
+            xtc_probability: 0.2,
+            xtc_threshold: 0.3,
+            samplers: vec!["top_k".into(), "temperature".into()],
+        };
+        state.set_mock_kv_sampling(custom.clone());
+        assert_eq!(state.mock_kv_sampling(), custom);
+
+        let props2 = response_json(handle_props(State(state.clone())).await).await;
+        assert_eq!(props2["cache_type_k"], "f16");
+        assert_eq!(props2["cache_type_v"], "q4_0");
+        assert_eq!(props2["flash_attn"], false);
+        assert_eq!(props2["kv_cache"]["cache_type_v"], "q4_0");
+        let params2 = &props2["default_generation_settings"]["params"];
+        assert_eq!(params2["n_keep"], 128);
+        assert_eq!(params2["top_k"], 64);
+        assert_eq!(params2["repeat_last_n"], 512);
+        assert_eq!(params2["dry_allowed_length"], 3);
+        assert_eq!(params2["dry_penalty_last_n"], 2048);
+        assert_eq!(params2["samplers"], json!(["top_k", "temperature"]));
+        assert!((params2["xtc_probability"].as_f64().unwrap() - 0.2).abs() < 1e-4);
+
+        let slots2 = response_json(handle_slots(State(state.clone())).await).await;
+        assert_eq!(slots2[0]["cache_type_k"], "f16");
+        assert_eq!(slots2[0]["params"]["n_keep"], 128);
+
+        state.set_kv_cache(None, None, None);
+        let props3 = response_json(handle_props(State(state)).await).await;
+        assert!(props3.get("cache_type_k").is_none());
+        assert!(props3.get("kv_cache").is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_completions_emit_timings_and_detect_shared_prefix_cache_n() {
+        let state = MockState::new();
+        let sys = json!({"role": "system", "content": "Static system prompt for prefix reuse testing across turns."});
+        let user1 = json!({"role": "user", "content": "Turn one greeting"});
+
+        // Turn 1 (cold): cache_n == 0, default tok/s rates, usage preserved
+        let turn1 = response_json(
+            handle_chat_completions(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(json!({
+                    "id_slot": 1,
+                    "messages": [sys.clone(), user1.clone()]
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(turn1["usage"]["prompt_tokens"], 16);
+        assert_eq!(turn1["usage"]["completion_tokens"], 12);
+        assert_eq!(turn1["usage"]["total_tokens"], 28);
+        assert_eq!(turn1["timings"]["predicted_per_second"], 118.4);
+        assert_eq!(turn1["timings"]["prompt_per_second"], 420.0);
+        assert_eq!(turn1["timings"]["predicted_ms"], 101.4);
+        assert_eq!(turn1["timings"]["prompt_ms"], 38.1);
+        assert_eq!(turn1["timings"]["predicted_n"], 12);
+        assert_eq!(turn1["timings"]["prompt_n"], 16);
+        assert_eq!(turn1["timings"]["cache_n"], 0);
+
+        // Turn 2 on same slot with identical prefix (streaming SSE final chunk) -> cache_n > 0
+        let sse = response_text(
+            handle_chat_completions(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(json!({
+                    "id_slot": 1,
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                    "messages": [
+                        sys.clone(),
+                        user1.clone(),
+                        {"role": "assistant", "content": "Hi"},
+                        {"role": "user", "content": "Turn two"}
+                    ]
+                })),
+            )
+            .await,
+        )
+        .await;
+        let data_lines: Vec<Value> = sse
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str::<Value>(payload).expect("valid sse chunk json"))
+            .collect();
+        let final_chunk = data_lines.last().expect("final sse chunk");
+        assert_eq!(final_chunk["usage"]["total_tokens"], 28);
+        assert_eq!(final_chunk["timings"]["predicted_per_second"], 118.4);
+        assert_eq!(final_chunk["timings"]["prompt_per_second"], 420.0);
+        assert!(final_chunk["timings"]["cache_n"].as_u64().unwrap() > 0);
+
+        // Different slot with no prior turn on slot 2 -> cache_n == 0
+        let other_slot = response_json(
+            handle_chat_completions(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(json!({
+                    "id_slot": 2,
+                    "messages": [sys.clone(), user1.clone()]
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(other_slot["timings"]["cache_n"], 0);
+
+        // Explicit MockTimings override + prefill response timings
+        let custom_timings = MockTimings {
+            predicted_per_second: 142.5,
+            prompt_per_second: 510.2,
+            predicted_ms: 210.0,
+            prompt_ms: 45.0,
+            predicted_n: 30,
+            prompt_n: 23,
+            cache_n: Some(333),
+        };
+        state.set_mock_timings(custom_timings.clone());
+        assert_eq!(state.mock_timings(), custom_timings);
+
+        let override_resp = response_json(
+            handle_chat_completions(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(json!({"messages": [sys.clone(), user1.clone()]})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(override_resp["timings"]["predicted_per_second"], 142.5);
+        assert_eq!(override_resp["timings"]["prompt_per_second"], 510.2);
+        assert_eq!(override_resp["timings"]["cache_n"], 333);
+
+        let prefill_resp = response_json(
+            handle_chat_completions(
+                State(state),
+                HeaderMap::new(),
+                Json(json!({
+                    "n_predict": 0,
+                    "messages": [sys, user1]
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(prefill_resp["timings"]["predicted_n"], 0);
+        assert_eq!(prefill_resp["timings"]["prompt_per_second"], 510.2);
+        assert_eq!(prefill_resp["timings"]["cache_n"], 333);
+    }
+
+    #[tokio::test]
+    async fn recorded_request_exposes_id_slot_stream_options_and_sampling_fields() {
+        let state = MockState::new();
+        let _ = handle_chat_completions(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(json!({
+                "model": "qwen-loaded",
+                "stream": true,
+                "id_slot": 3,
+                "stream_options": {"include_usage": true},
+                "temperature": 0.6,
+                "repeat_last_n": 256,
+                "dry_multiplier": 0.8,
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+        let reqs = state.recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        let rec = &reqs[0];
+        assert_eq!(rec.id_slot(), Some(3));
+        assert_eq!(
+            rec.stream_options(),
+            Some(&json!({"include_usage": true}))
+        );
+        assert!(rec.has_field("dry_multiplier"));
+        assert!(!rec.has_field("presence_penalty"));
+        let sampling = rec.sampling_fields();
+        assert_eq!(sampling.get("temperature"), Some(&json!(0.6)));
+        assert_eq!(sampling.get("repeat_last_n"), Some(&json!(256)));
+        assert_eq!(sampling.get("dry_multiplier"), Some(&json!(0.8)));
+        assert!(!sampling.contains_key("presence_penalty"));
     }
 }

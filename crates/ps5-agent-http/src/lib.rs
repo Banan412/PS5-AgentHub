@@ -23,7 +23,7 @@ pub use backend::{
     WorkspaceFilesResponse, WriteBrainFileRequest,
 };
 pub use error::{HttpError, HttpResult};
-pub use security::{is_allowed_lan_ip, SlidingWindowRateLimiter};
+pub use security::{is_allowed_lan_ip, SlidingWindowRateLimiter, BROWSER_PREVIEW_CSP_VALUE};
 pub use server::{serve, serve_with_listener, RecoveringTcpListener};
 
 use axum::extract::DefaultBodyLimit;
@@ -269,6 +269,10 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
             get(routes::list_browser_sessions),
         )
         .route(
+            "/sandbox/browser/preview",
+            get(routes::preview_browser_session),
+        )
+        .route(
             "/sandbox/browser/action",
             post(routes::execute_browser_action),
         )
@@ -302,6 +306,7 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
             "/inference/sync",
             post(routes::sync_inference_capabilities),
         )
+        .route("/inference/import-kv", post(routes::import_inference_kv))
         .route("/inference/systemone", post(routes::evaluate_systemone))
         .route("/system/checkpoint", post(routes::system_checkpoint))
         .route("/system/shutdown", post(routes::system_shutdown))

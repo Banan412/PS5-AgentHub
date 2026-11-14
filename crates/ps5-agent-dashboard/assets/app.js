@@ -184,6 +184,22 @@
     doctorReport: null,
     browserSessions: [],
     activeBrowserSessionId: '',
+    agenticSearchEnabled: false,
+    liveBrowserTabs: new Map(),
+    liveBrowserOrder: [],
+    activeLiveBrowserSessionId: '',
+    liveBrowserFeed: [],
+    liveBrowserRev: 0,
+    liveBrowserPreviewTimers: { chat: null, sandbox: null },
+    liveBrowserLastSrc: { chat: '', sandbox: '' },
+    liveBrowserLastSnapshotFetchMs: new Map(),
+    liveBrowserCursorTimers: new Set(),
+    liveOverlayResizeTimer: null,
+    chatLiveBrowserDismissed: false,
+    sandboxAgenticConversationId: '',
+    sandboxAgenticTaskIds: new Set(),
+    chatTimingsByTaskId: new Map(),
+    chatTimingsByMsgId: new Map(),
     brainFiles: [],
     activeBrainFile: '',
     brainDirty: false,
@@ -218,6 +234,33 @@
     if (node) {
       node.replaceChildren();
     }
+  }
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  function svgEl(tag, attrs, ...children) {
+    const node = document.createElementNS(SVG_NS, tag);
+    if (attrs) {
+      for (const [key, val] of Object.entries(attrs)) {
+        if (val === undefined || val === null || val === false) continue;
+        const lower = String(key).toLowerCase();
+        if (lower === 'style' || lower.startsWith('on')) continue;
+        if (key === 'className' || key === 'class') {
+          node.setAttribute('class', String(val));
+        } else {
+          node.setAttribute(key, String(val));
+        }
+      }
+    }
+    for (const child of children) {
+      if (child === undefined || child === null || child === false) continue;
+      if (typeof child === 'string' || typeof child === 'number') {
+        node.appendChild(document.createTextNode(String(child)));
+      } else {
+        node.appendChild(child);
+      }
+    }
+    return node;
   }
 
   function el(tag, attrs, ...children) {
@@ -388,9 +431,1128 @@
     }
   }
 
+  const MAX_LIVE_BROWSER_TABS = 12;
+  const MAX_LIVE_BROWSER_FEED = 100;
+  const MAX_CACHED_TIMINGS = 256;
+  const MAX_CHAT_STREAM_BUCKETS = 32;
+  const MAX_SVG_HOTSPOTS = 40;
+  const MAX_SVG_RIPPLES = 4;
+
+  function clampPct(val) {
+    if (typeof val !== 'number' || !Number.isFinite(val)) return null;
+    return Math.max(0, Math.min(100, val));
+  }
+
+  function clearAllStreamBuckets() {
+    if (state.chatStreamRafId) {
+      window.cancelAnimationFrame(state.chatStreamRafId);
+      state.chatStreamRafId = 0;
+    }
+    if (state.chatStreamTimerId) {
+      window.clearTimeout(state.chatStreamTimerId);
+      state.chatStreamTimerId = 0;
+    }
+    if (state.chatStreams) {
+      for (const bucket of state.chatStreams.values()) {
+        if (bucket && bucket.bubbleEl && bucket.bubbleEl.isConnected) {
+          bucket.bubbleEl.remove();
+        }
+      }
+      state.chatStreams.clear();
+    }
+    updateActiveStreamsBadge();
+  }
+
+  function pruneChatStreamBuckets() {
+    if (!state.chatStreams) return;
+    const now = Date.now();
+    for (const [tid, bucket] of [...state.chatStreams.entries()]) {
+      const ageMs = now - (bucket && bucket.updatedAtMs ? bucket.updatedAtMs : now);
+      if (bucket && bucket.completed && ageMs > 5000) {
+        if (bucket.bubbleEl && bucket.bubbleEl.isConnected) bucket.bubbleEl.remove();
+        state.chatStreams.delete(tid);
+      }
+    }
+    if (state.chatStreams.size <= MAX_CHAT_STREAM_BUCKETS) return;
+    const entries = [...state.chatStreams.entries()].sort((a, b) => {
+      const aDone = a[1] && a[1].completed ? 0 : 1;
+      const bDone = b[1] && b[1].completed ? 0 : 1;
+      if (aDone !== bDone) return aDone - bDone;
+      return (a[1]?.updatedAtMs || 0) - (b[1]?.updatedAtMs || 0);
+    });
+    const toRemove = entries.length - MAX_CHAT_STREAM_BUCKETS;
+    for (let i = 0; i < toRemove; i++) {
+      const [tid, bucket] = entries[i];
+      if (bucket && bucket.bubbleEl && bucket.bubbleEl.isConnected) bucket.bubbleEl.remove();
+      state.chatStreams.delete(tid);
+    }
+    updateActiveStreamsBadge();
+  }
+
+  function clearTimingsCaches() {
+    if (state.chatTimingsByTaskId) state.chatTimingsByTaskId.clear();
+    if (state.chatTimingsByMsgId) state.chatTimingsByMsgId.clear();
+  }
+
+  function setBoundedMapEntry(map, key, val, limit) {
+    if (!map || !key) return;
+    if (map.has(key)) {
+      map.delete(key);
+    } else if (map.size >= limit) {
+      const oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
+    }
+    map.set(key, val);
+  }
+
+  function cacheMessageTimings(msgId, taskId, convId, timings) {
+    if (!timings || typeof timings !== 'object') return;
+    const rec = { timings, convId: convId || '' };
+    if (msgId) setBoundedMapEntry(state.chatTimingsByMsgId, String(msgId), rec, MAX_CACHED_TIMINGS);
+    if (taskId) setBoundedMapEntry(state.chatTimingsByTaskId, String(taskId), rec, MAX_CACHED_TIMINGS);
+  }
+
+  function resolveMessageTimings(msg) {
+    if (!msg) return null;
+    if (msg.timings && typeof msg.timings === 'object') return msg.timings;
+    if (msg.id && state.chatTimingsByMsgId && state.chatTimingsByMsgId.has(String(msg.id))) {
+      const hit = state.chatTimingsByMsgId.get(String(msg.id));
+      return hit ? (hit.timings || hit) : null;
+    }
+    if (msg.task_id && state.chatTimingsByTaskId && state.chatTimingsByTaskId.has(String(msg.task_id))) {
+      const hit = state.chatTimingsByTaskId.get(String(msg.task_id));
+      return hit ? (hit.timings || hit) : null;
+    }
+    return null;
+  }
+
+  function buildTimingsPillEl(timings) {
+    if (!timings || typeof timings !== 'object') return null;
+    const pred = Number(timings.predicted_per_second);
+    const promptRate = Number(timings.prompt_per_second);
+    const cacheN = Number(timings.cache_n);
+    const hasPred = Number.isFinite(pred) && pred > 0;
+    const hasPrompt = Number.isFinite(promptRate) && promptRate > 0;
+    const hasCache = Number.isFinite(cacheN) && cacheN > 0;
+    if (!hasPred && !hasPrompt && !hasCache) return null;
+
+    const parts = [];
+    if (hasPred) {
+      parts.push(`${pred.toFixed(1)} tok/s`);
+    } else if (hasPrompt) {
+      parts.push(`${promptRate.toFixed(1)} pp tok/s`);
+    }
+    if (hasCache) {
+      parts.push(`KV ${Math.round(cacheN)}`);
+    }
+
+    const titleParts = [];
+    if (hasPred) titleParts.push(`Decode: ${pred.toFixed(1)} tok/s`);
+    if (hasPrompt) titleParts.push(`Prompt eval: ${promptRate.toFixed(1)} tok/s`);
+    const predN = Number(timings.predicted_n);
+    if (Number.isFinite(predN) && predN > 0) titleParts.push(`Decoded: ${Math.round(predN)} tokens`);
+    if (hasCache) titleParts.push(`KV cache hit: ${Math.round(cacheN)} tokens`);
+
+    return el('span', {
+      className: hasCache ? 'msg-timings-pill is-kv-hit' : 'msg-timings-pill',
+      title: titleParts.join(' | ')
+    }, parts.join(' \u00b7 '));
+  }
+
+  function removeLiveBrowserTab(sid) {
+    if (!sid) return;
+    if (state.liveBrowserTabs) state.liveBrowserTabs.delete(sid);
+    if (state.liveBrowserLastSnapshotFetchMs) state.liveBrowserLastSnapshotFetchMs.delete(sid);
+    state.liveBrowserOrder = state.liveBrowserOrder.filter((x) => x !== sid);
+    if (state.activeLiveBrowserSessionId === sid) {
+      state.activeLiveBrowserSessionId = state.liveBrowserOrder[0] || '';
+    }
+  }
+
+  function trimLiveBrowserTabs() {
+    while (state.liveBrowserOrder.length > MAX_LIVE_BROWSER_TABS) {
+      let victimIdx = -1;
+      for (let i = state.liveBrowserOrder.length - 1; i >= 0; i--) {
+        if (state.liveBrowserOrder[i] !== state.activeLiveBrowserSessionId) {
+          victimIdx = i;
+          break;
+        }
+      }
+      if (victimIdx < 0) victimIdx = state.liveBrowserOrder.length - 1;
+      const [evictedSid] = state.liveBrowserOrder.splice(victimIdx, 1);
+      if (evictedSid) {
+        if (state.liveBrowserTabs) state.liveBrowserTabs.delete(evictedSid);
+        if (state.liveBrowserLastSnapshotFetchMs) state.liveBrowserLastSnapshotFetchMs.delete(evictedSid);
+        if (state.activeLiveBrowserSessionId === evictedSid) {
+          state.activeLiveBrowserSessionId = state.liveBrowserOrder[0] || '';
+        }
+      }
+    }
+  }
+
+  function cleanupConversationClientState(convId) {
+    if (!convId) return;
+    if (state.chatTimingsByMsgId) {
+      for (const [k, rec] of [...state.chatTimingsByMsgId.entries()]) {
+        if (rec && rec.convId === convId) state.chatTimingsByMsgId.delete(k);
+      }
+    }
+    if (state.chatTimingsByTaskId) {
+      for (const [k, rec] of [...state.chatTimingsByTaskId.entries()]) {
+        if (rec && rec.convId === convId) state.chatTimingsByTaskId.delete(k);
+      }
+    }
+    if (state.sandboxAgenticConversationId === convId) {
+      state.sandboxAgenticConversationId = '';
+    }
+    if (state.liveBrowserTabs) {
+      for (const [sid, tab] of [...state.liveBrowserTabs.entries()]) {
+        if (tab && tab.conversation_id === convId && sid.startsWith('tool-')) {
+          removeLiveBrowserTab(sid);
+        }
+      }
+      renderAllLiveBrowserViewports({ refreshPreview: false });
+    }
+  }
+
+  function setAgenticSearchEnabled(enabled) {
+    state.agenticSearchEnabled = Boolean(enabled);
+    const btn = getEl('btn-agentic-search-toggle');
+    if (btn) {
+      btn.setAttribute('aria-pressed', state.agenticSearchEnabled ? 'true' : 'false');
+    }
+    if (state.agenticSearchEnabled) {
+      state.chatLiveBrowserDismissed = false;
+    }
+  }
+
+  function resetSvgOverlay(svgId) {
+    const svg = getEl(svgId);
+    if (!svg) return;
+    clearEl(svg);
+    svg._ps5Init = false;
+    svg._ps5Hotspots = null;
+    svg._ps5Ripples = null;
+    svg._ps5Cursor = null;
+    svg._ps5LabelWrap = null;
+    svg._ps5LabelBg = null;
+    svg._ps5LabelText = null;
+  }
+
+  function clearLiveBrowserTimers() {
+    if (state.liveBrowserPreviewTimers) {
+      for (const dockKey of ['chat', 'sandbox']) {
+        if (state.liveBrowserPreviewTimers[dockKey]) {
+          window.clearTimeout(state.liveBrowserPreviewTimers[dockKey]);
+          state.liveBrowserPreviewTimers[dockKey] = null;
+        }
+      }
+    }
+    if (state.liveBrowserCursorTimers) {
+      for (const tid of state.liveBrowserCursorTimers) {
+        window.clearTimeout(tid);
+      }
+      state.liveBrowserCursorTimers.clear();
+    }
+    if (state.liveOverlayResizeTimer) {
+      window.clearTimeout(state.liveOverlayResizeTimer);
+      state.liveOverlayResizeTimer = null;
+    }
+  }
+
+  function clearLiveIframeSrc(frameId, dockKey) {
+    const frame = getEl(frameId);
+    if (frame) frame.setAttribute('src', 'about:blank');
+    if (state.liveBrowserLastSrc && dockKey) state.liveBrowserLastSrc[dockKey] = '';
+  }
+
+  function resetLiveBrowserState() {
+    clearLiveBrowserTimers();
+    if (state.liveBrowserTabs) state.liveBrowserTabs.clear();
+    state.liveBrowserOrder = [];
+    state.activeLiveBrowserSessionId = '';
+    state.liveBrowserFeed = [];
+    state.liveBrowserRev = 0;
+    state.chatLiveBrowserDismissed = false;
+    if (state.liveBrowserLastSnapshotFetchMs) state.liveBrowserLastSnapshotFetchMs.clear();
+    if (state.sandboxAgenticTaskIds) state.sandboxAgenticTaskIds.clear();
+    state.sandboxAgenticConversationId = '';
+
+    clearLiveIframeSrc('chat-live-browser-frame', 'chat');
+    clearLiveIframeSrc('sandbox-live-browser-frame', 'sandbox');
+    resetSvgOverlay('chat-live-browser-overlay');
+    resetSvgOverlay('sandbox-live-browser-overlay');
+
+    for (const id of ['chat-live-browser-tabs', 'sandbox-live-browser-tabs', 'sandbox-live-browser-feed']) {
+      const node = getEl(id);
+      if (node) clearEl(node);
+    }
+    setText('chat-live-browser-url', 'about:blank');
+    setText('sandbox-live-browser-url', 'about:blank');
+    const chatSt = getEl('chat-live-browser-status');
+    if (chatSt) {
+      chatSt.className = 'pill pill-info';
+      chatSt.textContent = 'Idle';
+    }
+    const sbSt = getEl('sandbox-live-browser-status');
+    if (sbSt) {
+      sbSt.className = 'pill pill-muted';
+      sbSt.textContent = 'Idle';
+    }
+    const chatDock = getEl('chat-live-browser-dock');
+    if (chatDock) chatDock.hidden = true;
+    setAgenticSearchEnabled(false);
+  }
+
+  function openChatLiveBrowserDock(opts) {
+    if (state.chatLiveBrowserDismissed) return;
+    const dock = getEl('chat-live-browser-dock');
+    if (dock) dock.hidden = false;
+    if (!state.activeLiveBrowserSessionId && state.liveBrowserOrder.length > 0) {
+      state.activeLiveBrowserSessionId = state.liveBrowserOrder[0];
+    }
+    renderAllLiveBrowserViewports({ refreshPreview: true, immediatePreview: true });
+    if (opts && opts.statusText) {
+      const pill = getEl('chat-live-browser-status');
+      if (pill) {
+        pill.className = `pill ${opts.pillClass || 'pill-info'}`;
+        pill.textContent = opts.statusText;
+      }
+    }
+  }
+
+  function hideChatLiveBrowserDock() {
+    state.chatLiveBrowserDismissed = true;
+    const dock = getEl('chat-live-browser-dock');
+    if (dock) dock.hidden = true;
+  }
+
+  function syncChatLiveBrowserDockForConversation(convId) {
+    const dock = getEl('chat-live-browser-dock');
+    if (!dock) return;
+    const tabs = state.liveBrowserTabs ? [...state.liveBrowserTabs.values()] : [];
+    const hasMatch = Boolean(convId && tabs.some((t) => t && t.conversation_id === convId));
+    if (hasMatch && !state.chatLiveBrowserDismissed) {
+      dock.hidden = false;
+      const matchingTab = tabs.find((t) => t && t.conversation_id === convId);
+      if (matchingTab && (!state.activeLiveBrowserSessionId || !state.liveBrowserTabs.has(state.activeLiveBrowserSessionId))) {
+        state.activeLiveBrowserSessionId = matchingTab.session_id;
+      }
+      renderAllLiveBrowserViewports({ refreshPreview: true, immediatePreview: true });
+    } else if (!state.agenticSearchEnabled) {
+      dock.hidden = true;
+    }
+  }
+
+  function restoreChatLiveStatusFromSearching(convId, taskId) {
+    const isSandboxTask = Boolean(taskId && state.sandboxAgenticTaskIds && state.sandboxAgenticTaskIds.has(taskId));
+    if (isSandboxTask) return;
+    if (convId && convId !== state.activeConversationId) return;
+    const chatSt = getEl('chat-live-browser-status');
+    if (!chatSt || chatSt.textContent !== 'Searching...') return;
+    const activeTab = state.activeLiveBrowserSessionId ? state.liveBrowserTabs.get(state.activeLiveBrowserSessionId) : null;
+    const meta = activeTab ? formatBrowserPillMeta(activeTab.action, activeTab.status) : { text: 'Idle', cls: 'pill-info' };
+    chatSt.className = `pill ${meta.cls}`;
+    chatSt.textContent = meta.text;
+  }
+
+  function formatBrowserPillMeta(action, status) {
+    const st = String(status || '').trim().toLowerCase();
+    const act = String(action || '').trim().toLowerCase();
+    const labelRaw = status || action || 'Idle';
+    const label = labelRaw.charAt(0).toUpperCase() + labelRaw.slice(1);
+    if (st === 'error' || st === 'failed') return { text: label, cls: 'pill-danger' };
+    if (st === 'navigating' || st === 'running' || act === 'search' || act === 'web_search') {
+      return { text: label, cls: 'pill-info' };
+    }
+    if (st === 'closed' || st === 'idle') return { text: label, cls: 'pill-muted' };
+    return { text: label, cls: 'pill-success' };
+  }
+
+  function ensureLiveSvgOverlay(svgId) {
+    const svg = getEl(svgId);
+    if (!svg) return null;
+    if (svg._ps5Init && svg._ps5Cursor && svg._ps5Cursor.isConnected) {
+      return svg;
+    }
+    clearEl(svg);
+    const hotspotsG = svgEl('g', { className: 'vmouse-hotspots' });
+    const ripplesG = svgEl('g', { className: 'vmouse-ripples' });
+    const pointerPath = svgEl('path', {
+      className: 'vmouse-pointer',
+      d: 'M 0 0 L 0 17 L 4.8 12.5 L 8.6 19.8 L 11.4 18.3 L 7.6 11 L 13.8 10.6 Z',
+      fill: '#22d3ee',
+      stroke: '#0b0f17',
+      'stroke-width': '1.2',
+      'stroke-linejoin': 'round'
+    });
+    const labelBg = svgEl('rect', {
+      className: 'vmouse-label-bg',
+      x: '0',
+      y: '0',
+      width: '64',
+      height: '20',
+      rx: '5'
+    });
+    const labelText = svgEl('text', {
+      className: 'vmouse-label',
+      x: '7',
+      y: '13.8'
+    }, 'Browser');
+    const labelWrap = svgEl('g', {
+      className: 'vmouse-label-wrap',
+      transform: 'translate(14 14)'
+    }, labelBg, labelText);
+    const cursorG = svgEl('g', {
+      className: 'vmouse-cursor',
+      transform: 'translate(320 50)'
+    }, pointerPath, labelWrap);
+
+    svg.appendChild(hotspotsG);
+    svg.appendChild(ripplesG);
+    svg.appendChild(cursorG);
+
+    svg._ps5Init = true;
+    svg._ps5Hotspots = hotspotsG;
+    svg._ps5Ripples = ripplesG;
+    svg._ps5Cursor = cursorG;
+    svg._ps5LabelWrap = labelWrap;
+    svg._ps5LabelBg = labelBg;
+    svg._ps5LabelText = labelText;
+    return svg;
+  }
+
+  function renderLiveSvgOverlay(svgId, tab, opts) {
+    const options = opts || {};
+    if (!tab) {
+      resetSvgOverlay(svgId);
+      return;
+    }
+    const svg = ensureLiveSvgOverlay(svgId);
+    if (!svg) return;
+
+    const rect = svg.getBoundingClientRect();
+    const stageW = rect.width >= 40 ? Math.round(rect.width) : 640;
+    const stageH = rect.height >= 40 ? Math.round(rect.height) : 280;
+    svg.setAttribute('viewBox', `0 0 ${stageW} ${stageH}`);
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+    const x = clampPct(tab.x_pct) ?? 50;
+    const y = clampPct(tab.y_pct) ?? 18;
+    const px = (x / 100) * stageW;
+    const py = (y / 100) * stageH;
+    svg._ps5Cursor.setAttribute('transform', `translate(${px.toFixed(1)} ${py.toFixed(1)})`);
+    svg._ps5Cursor.setAttribute('data-x-pct', x.toFixed(2));
+    svg._ps5Cursor.setAttribute('data-y-pct', y.toFixed(2));
+
+    const rawAgent = tab.agent_id ? agentDisplayName(tab.agent_id) : 'Browser';
+    const badgeRaw = tab.status ? `${rawAgent} · ${tab.status}` : rawAgent;
+    const badgeText = badgeRaw.length > 26 ? `${badgeRaw.slice(0, 25)}\u2026` : badgeRaw;
+    const labelW = Math.max(54, Math.min(stageW - 24, Math.round(badgeText.length * 6.8 + 16)));
+    const labelX = (px + 16 + labelW > stageW - 6) ? Math.max(-px + 4, -(labelW + 6)) : 14;
+    const labelY = (py + 14 + 22 > stageH - 4) ? -22 : 14;
+    svg._ps5LabelText.textContent = badgeText;
+    svg._ps5LabelBg.setAttribute('width', String(labelW));
+    svg._ps5LabelWrap.setAttribute('transform', `translate(${labelX.toFixed(1)} ${labelY.toFixed(1)})`);
+
+    // Hotspots for interactive [ref=eN] elements
+    const hotspotsG = svg._ps5Hotspots;
+    clearEl(hotspotsG);
+    const activeSelector = tab.selector ? String(tab.selector) : '';
+    let renderedActive = false;
+    if (Array.isArray(tab.elements) && tab.elements.length > 0) {
+      const prioritized = activeSelector
+        ? [
+            ...tab.elements.filter((e) => e && e.ref === activeSelector),
+            ...tab.elements.filter((e) => e && e.ref !== activeSelector)
+          ]
+        : tab.elements;
+      const limit = Math.min(MAX_SVG_HOTSPOTS, prioritized.length);
+      for (let i = 0; i < limit; i++) {
+        const elItem = prioritized[i];
+        if (!elItem) continue;
+        const ex = clampPct(elItem.x_pct);
+        const ey = clampPct(elItem.y_pct);
+        const ew = clampPct(elItem.w_pct);
+        const eh = clampPct(elItem.h_pct);
+        if (ex === null || ey === null || ew === null || eh === null) continue;
+        const isMatch = Boolean(activeSelector && elItem.ref === activeSelector);
+        if (isMatch) renderedActive = true;
+        const hx = (ex / 100) * stageW;
+        const hy = (ey / 100) * stageH;
+        const hw = Math.max(8, (ew / 100) * stageW);
+        const hh = Math.max(8, (eh / 100) * stageH);
+        hotspotsG.appendChild(svgEl('rect', {
+          className: isMatch ? 'vmouse-hotspot is-active' : 'vmouse-hotspot',
+          x: hx.toFixed(1),
+          y: hy.toFixed(1),
+          width: hw.toFixed(1),
+          height: hh.toFixed(1),
+          rx: '4',
+          'data-ref': elItem.ref || ''
+        }));
+      }
+    }
+    if (!renderedActive && activeSelector && typeof tab.w_pct === 'number' && typeof tab.h_pct === 'number' && tab.w_pct > 0 && tab.h_pct > 0) {
+      const fxPct = Math.max(0, x - tab.w_pct / 2);
+      const fyPct = Math.max(0, y - tab.h_pct / 2);
+      const hx = (fxPct / 100) * stageW;
+      const hy = (fyPct / 100) * stageH;
+      const hw = Math.max(8, (tab.w_pct / 100) * stageW);
+      const hh = Math.max(8, (tab.h_pct / 100) * stageH);
+      hotspotsG.appendChild(svgEl('rect', {
+        className: 'vmouse-hotspot is-active',
+        x: hx.toFixed(1),
+        y: hy.toFixed(1),
+        width: hw.toFixed(1),
+        height: hh.toFixed(1),
+        rx: '4',
+        'data-ref': activeSelector
+      }));
+    }
+
+    if (options.ripple) {
+      svg._ps5Cursor.classList.add('is-clicking');
+      const clickTimerId = window.setTimeout(() => {
+        state.liveBrowserCursorTimers.delete(clickTimerId);
+        if (svg._ps5Cursor && svg._ps5Cursor.isConnected) {
+          svg._ps5Cursor.classList.remove('is-clicking');
+        }
+      }, 280);
+      state.liveBrowserCursorTimers.add(clickTimerId);
+
+      const ripplesG = svg._ps5Ripples;
+      while (ripplesG.childNodes.length >= MAX_SVG_RIPPLES) {
+        ripplesG.firstChild.remove();
+      }
+      const circle = svgEl('circle', {
+        className: 'vmouse-ripple',
+        cx: px.toFixed(1),
+        cy: py.toFixed(1),
+        r: '14'
+      });
+      const cleanupRipple = () => {
+        if (circle.isConnected) circle.remove();
+      };
+      circle.addEventListener('animationend', cleanupRipple, { once: true });
+      const rippleTimerId = window.setTimeout(() => {
+        state.liveBrowserCursorTimers.delete(rippleTimerId);
+        cleanupRipple();
+      }, 780);
+      state.liveBrowserCursorTimers.add(rippleTimerId);
+      ripplesG.appendChild(circle);
+    }
+  }
+
+  function scheduleLiveBrowserPreview(dockKey, frameId, sessionId, forceImmediate) {
+    const frame = getEl(frameId);
+    if (!frame) return;
+    if (!sessionId || String(sessionId).startsWith('tool-')) {
+      if (state.liveBrowserLastSrc[dockKey] !== 'about:blank') {
+        clearLiveIframeSrc(frameId, dockKey);
+        state.liveBrowserLastSrc[dockKey] = 'about:blank';
+      }
+      return;
+    }
+    const tab = state.liveBrowserTabs.get(sessionId);
+    const applySrc = () => {
+      if (state.liveBrowserPreviewTimers[dockKey]) {
+        state.liveBrowserPreviewTimers[dockKey] = null;
+      }
+      const latestTab = state.liveBrowserTabs.get(sessionId);
+      if (!latestTab && sessionId !== state.activeLiveBrowserSessionId) return;
+      state.liveBrowserRev += 1;
+      const previewUrl = `/api/v1/sandbox/browser/preview?session_id=${encodeURIComponent(sessionId)}&_t=${state.liveBrowserRev}`;
+      if (frame.isConnected) {
+        frame.setAttribute('src', previewUrl);
+        state.liveBrowserLastSrc[dockKey] = previewUrl;
+        if (latestTab) latestTab.hasLoadedPreview = true;
+      }
+    };
+
+    if (state.liveBrowserPreviewTimers[dockKey]) {
+      window.clearTimeout(state.liveBrowserPreviewTimers[dockKey]);
+      state.liveBrowserPreviewTimers[dockKey] = null;
+    }
+    if (forceImmediate || (tab && !tab.hasLoadedPreview)) {
+      applySrc();
+    } else {
+      state.liveBrowserPreviewTimers[dockKey] = window.setTimeout(applySrc, 150);
+    }
+  }
+
+  function renderLiveTabsStrip(containerId, activeSessionId) {
+    const strip = getEl(containerId);
+    if (!strip) return;
+    clearEl(strip);
+    const orderedIds = state.liveBrowserOrder.filter((id) => state.liveBrowserTabs.has(id));
+    if (orderedIds.length === 0) {
+      strip.appendChild(el('span', { className: 'text-xs text-muted' }, 'No active browser tabs'));
+      return;
+    }
+    for (const sid of orderedIds) {
+      const tab = state.liveBrowserTabs.get(sid);
+      if (!tab) continue;
+      const isActive = sid === activeSessionId;
+      let hostLabel = '';
+      if (tab.title) {
+        hostLabel = tab.title;
+      } else if (tab.url) {
+        hostLabel = tab.url.replace(/^[a-z]+:\/\//i, '').slice(0, 28);
+      } else {
+        hostLabel = sid;
+      }
+      const prefix = tab.agent_id ? `${agentDisplayName(tab.agent_id)}: ` : '';
+      const tabLabel = `${prefix}${hostLabel}`;
+      strip.appendChild(el('button', {
+        type: 'button',
+        className: isActive ? 'live-tab-btn active' : 'live-tab-btn',
+        role: 'tab',
+        'aria-selected': isActive ? 'true' : 'false',
+        title: `${tab.title ? `${tab.title} — ` : ''}${tab.url || sid}`,
+        onClick: () => selectLiveBrowserTab(sid)
+      }, tabLabel));
+    }
+  }
+
+  function renderLiveBrowserFeed() {
+    const feedEl = getEl('sandbox-live-browser-feed');
+    if (!feedEl) return;
+    clearEl(feedEl);
+    if (!state.liveBrowserFeed || state.liveBrowserFeed.length === 0) {
+      feedEl.appendChild(el('div', { className: 'text-xs text-muted' }, 'Live agent browser telemetry will stream here.'));
+      return;
+    }
+    for (const item of state.liveBrowserFeed) {
+      const who = item.agent_id ? agentDisplayName(item.agent_id) : 'Browser';
+      const coords = (typeof item.x_pct === 'number' && typeof item.y_pct === 'number')
+        ? ` (${Math.round(item.x_pct)}%, ${Math.round(item.y_pct)}%)`
+        : '';
+      const selPart = item.selector ? ` [${item.selector}]` : '';
+      const detail = `${item.action || item.status || 'event'}${selPart}${coords}${item.url ? ` · ${item.url}` : ''}`;
+      const pill = formatBrowserPillMeta(item.action, item.status);
+      feedEl.appendChild(el('div', { className: 'live-browser-feed-item' },
+        el('div', { className: 'min-w-0 truncate' },
+          el('strong', null, who),
+          ` — ${detail}`
+        ),
+        el('div', { className: 'toolbar-actions' },
+          el('span', { className: `pill ${pill.cls}` }, pill.text),
+          item.timestamp ? el('span', { className: 'text-xs text-muted mono' }, fmtTime(item.timestamp)) : null
+        )
+      ));
+    }
+  }
+
+  function renderAllLiveBrowserViewports(opts) {
+    const options = opts || {};
+    const activeId = state.activeLiveBrowserSessionId;
+    const activeTab = activeId ? (state.liveBrowserTabs.get(activeId) || null) : null;
+
+    renderLiveTabsStrip('chat-live-browser-tabs', activeId);
+    renderLiveTabsStrip('sandbox-live-browser-tabs', activeId);
+    renderLiveBrowserFeed();
+
+    const meta = activeTab
+      ? formatBrowserPillMeta(activeTab.action, activeTab.status)
+      : { text: 'Idle', cls: 'pill-muted' };
+    const displayUrl = activeTab && activeTab.url ? activeTab.url : 'about:blank';
+
+    const chatUrl = getEl('chat-live-browser-url');
+    if (chatUrl) chatUrl.textContent = displayUrl;
+    const chatSt = getEl('chat-live-browser-status');
+    if (chatSt) {
+      chatSt.className = `pill ${activeTab ? meta.cls : 'pill-info'}`;
+      chatSt.textContent = activeTab ? meta.text : 'Idle';
+    }
+    const sbUrl = getEl('sandbox-live-browser-url');
+    if (sbUrl) sbUrl.textContent = displayUrl;
+    const sbSt = getEl('sandbox-live-browser-status');
+    if (sbSt) {
+      sbSt.className = `pill ${meta.cls}`;
+      sbSt.textContent = meta.text;
+    }
+
+    renderLiveSvgOverlay('chat-live-browser-overlay', activeTab, { ripple: Boolean(options.ripple) });
+    renderLiveSvgOverlay('sandbox-live-browser-overlay', activeTab, { ripple: Boolean(options.ripple) });
+
+    if (options.refreshPreview) {
+      if (!activeTab) {
+        clearLiveIframeSrc('chat-live-browser-frame', 'chat');
+        clearLiveIframeSrc('sandbox-live-browser-frame', 'sandbox');
+      } else {
+        const chatDock = getEl('chat-live-browser-dock');
+        if (chatDock && !chatDock.hidden) {
+          scheduleLiveBrowserPreview('chat', 'chat-live-browser-frame', activeTab.session_id, Boolean(options.immediatePreview));
+        }
+        scheduleLiveBrowserPreview('sandbox', 'sandbox-live-browser-frame', activeTab.session_id, Boolean(options.immediatePreview));
+      }
+    }
+  }
+
+  function selectLiveBrowserTab(sessionId) {
+    if (!sessionId || !state.liveBrowserTabs.has(sessionId)) return;
+    state.activeLiveBrowserSessionId = sessionId;
+    if (state.browserSessions.some((s) => s.session_id === sessionId)) {
+      state.activeBrowserSessionId = sessionId;
+      const sel = getEl('browser-session-select');
+      if (sel) sel.value = sessionId;
+    }
+    const tab = state.liveBrowserTabs.get(sessionId);
+    if (tab && (!tab.elements || tab.elements.length === 0)) {
+      maybeRefreshLiveBrowserElements(sessionId, true);
+    }
+    renderAllLiveBrowserViewports({ refreshPreview: true, immediatePreview: true });
+  }
+
+  async function maybeRefreshLiveBrowserElements(sessionId, force) {
+    if (!sessionId || String(sessionId).startsWith('tool-')) return;
+    if (!state.liveBrowserTabs.has(sessionId)) return;
+    const now = Date.now();
+    const lastFetch = state.liveBrowserLastSnapshotFetchMs.get(sessionId) || 0;
+    if (!force && (now - lastFetch) < 1200) return;
+    state.liveBrowserLastSnapshotFetchMs.set(sessionId, now);
+    try {
+      const snap = await apiFetch('/api/v1/sandbox/browser/action', {
+        method: 'POST',
+        body: { action: 'snapshot', session_id: sessionId }
+      });
+      const tab = state.liveBrowserTabs.get(sessionId);
+      if (tab && snap && Array.isArray(snap.elements)) {
+        tab.elements = snap.elements;
+        if (snap.cursor && typeof snap.cursor.x_pct === 'number') {
+          tab.x_pct = clampPct(snap.cursor.x_pct);
+          tab.y_pct = clampPct(snap.cursor.y_pct);
+        }
+        if (state.activeLiveBrowserSessionId === sessionId) {
+          renderLiveSvgOverlay('chat-live-browser-overlay', tab, { ripple: false });
+          renderLiveSvgOverlay('sandbox-live-browser-overlay', tab, { ripple: false });
+        }
+        if (state.currentSection === 'sandbox' && state.activeBrowserSessionId === sessionId) {
+          renderBrowserSnapshot(snap, 'snapshot');
+        }
+      }
+    } catch (_) {
+      // Session may have closed concurrently; ignore gracefully.
+    }
+  }
+
+  function syncLiveTabsFromSessionsList(sessions) {
+    const serverIds = new Set();
+    for (const s of (sessions || [])) {
+      if (!s || !s.session_id) continue;
+      const sid = String(s.session_id);
+      serverIds.add(sid);
+      const existing = state.liveBrowserTabs.get(sid) || {
+        session_id: sid,
+        url: '',
+        title: '',
+        agent_id: '',
+        action: '',
+        status: 'opened',
+        x_pct: 50,
+        y_pct: 18,
+        w_pct: null,
+        h_pct: null,
+        scroll_y: 0,
+        selector: '',
+        elements: [],
+        conversation_id: '',
+        task_id: '',
+        hasLoadedPreview: false,
+        updatedAtMs: Date.now()
+      };
+      if (s.url) existing.url = s.url;
+      if (s.title) existing.title = s.title;
+      if (s.cursor && typeof s.cursor === 'object') {
+        const cx = clampPct(s.cursor.x_pct);
+        const cy = clampPct(s.cursor.y_pct);
+        if (cx !== null) existing.x_pct = cx;
+        if (cy !== null) existing.y_pct = cy;
+        if (typeof s.cursor.scroll_y === 'number') existing.scroll_y = s.cursor.scroll_y;
+        if (s.cursor.last_action) existing.action = s.cursor.last_action;
+        if (s.cursor.last_selector) existing.selector = s.cursor.last_selector;
+        if (s.cursor.agent_id) existing.agent_id = s.cursor.agent_id;
+      }
+      state.liveBrowserTabs.set(sid, existing);
+      if (!state.liveBrowserOrder.includes(sid)) {
+        state.liveBrowserOrder.push(sid);
+      }
+    }
+    for (const sid of [...state.liveBrowserTabs.keys()]) {
+      if (!String(sid).startsWith('tool-') && !serverIds.has(sid)) {
+        removeLiveBrowserTab(sid);
+      }
+    }
+    if (!state.activeLiveBrowserSessionId || !state.liveBrowserTabs.has(state.activeLiveBrowserSessionId)) {
+      state.activeLiveBrowserSessionId = state.liveBrowserOrder[0] || '';
+    }
+    trimLiveBrowserTabs();
+    renderAllLiveBrowserViewports({
+      refreshPreview: Boolean(state.activeLiveBrowserSessionId),
+      immediatePreview: false
+    });
+  }
+
+  function handleBrowserActivityEvent(ev) {
+    if (!ev || !ev.session_id) return;
+    const sid = String(ev.session_id).trim();
+    if (!sid) return;
+
+    const act = String(ev.action || '').trim().toLowerCase();
+    const st = String(ev.status || '').trim().toLowerCase();
+    const nowMs = Date.now();
+
+    state.liveBrowserFeed.unshift({
+      id: `${nowMs}-${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: ev.timestamp || new Date(nowMs).toISOString(),
+      session_id: sid,
+      agent_id: ev.agent_id || '',
+      action: ev.action || st || 'activity',
+      status: ev.status || ev.action || '',
+      url: ev.url || '',
+      title: ev.title || '',
+      selector: ev.selector || '',
+      x_pct: clampPct(ev.x_pct),
+      y_pct: clampPct(ev.y_pct)
+    });
+    if (state.liveBrowserFeed.length > MAX_LIVE_BROWSER_FEED) {
+      state.liveBrowserFeed.length = MAX_LIVE_BROWSER_FEED;
+    }
+
+    if (act === 'close' || act === 'closed' || st === 'closed') {
+      removeLiveBrowserTab(sid);
+      renderAllLiveBrowserViewports({ refreshPreview: true, immediatePreview: true });
+      return;
+    }
+
+    let tab = state.liveBrowserTabs.get(sid);
+    const isInitialTab = !tab;
+    if (!tab) {
+      tab = {
+        session_id: sid,
+        url: '',
+        title: '',
+        agent_id: '',
+        action: '',
+        status: '',
+        x_pct: 50,
+        y_pct: 18,
+        w_pct: null,
+        h_pct: null,
+        scroll_y: 0,
+        selector: '',
+        elements: [],
+        conversation_id: '',
+        task_id: '',
+        hasLoadedPreview: false,
+        updatedAtMs: nowMs
+      };
+      state.liveBrowserTabs.set(sid, tab);
+    }
+
+    if (ev.url) tab.url = String(ev.url);
+    if (ev.title) tab.title = String(ev.title);
+    if (ev.agent_id) tab.agent_id = String(ev.agent_id);
+    if (ev.action) tab.action = String(ev.action);
+    if (ev.status) tab.status = String(ev.status);
+    if (ev.selector !== undefined && ev.selector !== null) tab.selector = String(ev.selector);
+    if (ev.conversation_id) tab.conversation_id = String(ev.conversation_id);
+    if (ev.task_id) tab.task_id = String(ev.task_id);
+    const nx = clampPct(ev.x_pct);
+    const ny = clampPct(ev.y_pct);
+    if (nx !== null) tab.x_pct = nx;
+    if (ny !== null) tab.y_pct = ny;
+    if (typeof ev.w_pct === 'number' && Number.isFinite(ev.w_pct)) tab.w_pct = ev.w_pct;
+    if (typeof ev.h_pct === 'number' && Number.isFinite(ev.h_pct)) tab.h_pct = ev.h_pct;
+    if (typeof ev.scroll_y === 'number' && Number.isFinite(ev.scroll_y)) tab.scroll_y = ev.scroll_y;
+    tab.updatedAtMs = nowMs;
+
+    state.liveBrowserOrder = [sid, ...state.liveBrowserOrder.filter((x) => x !== sid)];
+    trimLiveBrowserTabs();
+
+    // Auto-open Main Chat Live Browser Viewport when browser activity belongs to active conversation/task
+    const trackedTask = tab.task_id ? state.activeChatTasks.get(tab.task_id) : null;
+    const trackedStream = tab.task_id ? state.chatStreams.get(tab.task_id) : null;
+    const effectiveConvId = tab.conversation_id || (trackedTask && trackedTask.conversation_id) || (trackedStream && trackedStream.conversationId) || '';
+    const isActiveConv = Boolean(effectiveConvId && state.activeConversationId && effectiveConvId === state.activeConversationId);
+    const isSandboxTask = Boolean(tab.task_id && state.sandboxAgenticTaskIds && state.sandboxAgenticTaskIds.has(tab.task_id));
+
+    if (isActiveConv && !isSandboxTask) {
+      openChatLiveBrowserDock();
+    }
+
+    if (
+      !state.activeLiveBrowserSessionId
+      || !state.liveBrowserTabs.has(state.activeLiveBrowserSessionId)
+      || act === 'open'
+      || act === 'opened'
+      || st === 'opened'
+      || isInitialTab
+    ) {
+      state.activeLiveBrowserSessionId = sid;
+    }
+
+    const previewTriggers = new Set(['open', 'opened', 'navigate', 'navigated', 'click', 'clicked', 'fill', 'filled', 'submit', 'submitted', 'back', 'snapshot']);
+    const shouldRefreshPreview = !sid.startsWith('tool-')
+      && st !== 'navigating'
+      && st !== 'error'
+      && (!tab.hasLoadedPreview || previewTriggers.has(act) || previewTriggers.has(st));
+
+    const isRipple = act === 'click' || act === 'clicked' || st === 'clicked' || act === 'submit' || act === 'submitted' || st === 'submitted';
+    const isActiveShown = sid === state.activeLiveBrowserSessionId;
+
+    if (
+      isActiveShown
+      && !sid.startsWith('tool-')
+      && st !== 'navigating'
+      && (!tab.elements || tab.elements.length === 0 || act === 'open' || act === 'opened' || st === 'opened' || act === 'click' || act === 'clicked' || act === 'submit' || act === 'submitted' || act === 'back')
+    ) {
+      maybeRefreshLiveBrowserElements(sid, isInitialTab);
+    }
+
+    renderAllLiveBrowserViewports({
+      refreshPreview: isActiveShown && shouldRefreshPreview,
+      immediatePreview: false,
+      ripple: isActiveShown && isRipple
+    });
+  }
+
+  function populateOptionalAgentSelect(selectId, defaultLabel) {
+    const sel = getEl(selectId);
+    if (!sel) return;
+    const prev = sel.value;
+    clearEl(sel);
+    sel.appendChild(el('option', { value: '' }, defaultLabel || 'Auto (Active Agent)'));
+    const enabledAgents = state.agents.filter((a) => a.enabled);
+    for (const ag of enabledAgents) {
+      sel.appendChild(el('option', { value: ag.id }, `${ag.name} (${ag.role})`));
+    }
+    if (prev && [...sel.options].some((o) => o.value === prev)) {
+      sel.value = prev;
+    }
+  }
+
+  async function ensureSandboxAgenticConversationId(preferredAgentId) {
+    if (
+      state.sandboxAgenticConversationId
+      && state.conversations.some((c) => c && c.id === state.sandboxAgenticConversationId)
+    ) {
+      return state.sandboxAgenticConversationId;
+    }
+    const existing = state.conversations.find((c) => c && c.title === 'Sandbox Browser Agentic Search');
+    if (existing && existing.id) {
+      state.sandboxAgenticConversationId = existing.id;
+      return existing.id;
+    }
+    const fallbackAgent = preferredAgentId
+      || (state.agents.find((a) => a.id === 'commander' && a.enabled) || {}).id
+      || (state.agents.find((a) => a.enabled) || {}).id
+      || 'commander';
+    const created = await apiFetch('/api/v1/conversations', {
+      method: 'POST',
+      body: { title: 'Sandbox Browser Agentic Search', mode: { kind: 'direct', agent_id: fallbackAgent } }
+    });
+    await loadConversations();
+    if (created && created.id) {
+      state.sandboxAgenticConversationId = created.id;
+      return created.id;
+    }
+    return null;
+  }
+
+  async function runSandboxAgenticSearch() {
+    const inputEl = getEl('sandbox-browser-agentic-input');
+    const btnEl = getEl('btn-sandbox-agentic-run');
+    const agentSel = getEl('sandbox-browser-agent-select');
+    const taskPrompt = inputEl ? String(inputEl.value || '').trim() : '';
+    if (!taskPrompt) {
+      showToast('Enter a task for Sandbox Agentic Search.', 'warning');
+      if (inputEl) inputEl.focus();
+      return;
+    }
+    const chosenAgent = agentSel ? String(agentSel.value || '').trim() : '';
+    if (btnEl) {
+      btnEl.disabled = true;
+      btnEl.textContent = 'Running...';
+    }
+    const sbDock = getEl('sandbox-live-browser-dock');
+    if (sbDock) {
+      sbDock.hidden = false;
+      if (typeof sbDock.scrollIntoView === 'function') {
+        sbDock.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    }
+    const sbSt = getEl('sandbox-live-browser-status');
+    if (sbSt) {
+      sbSt.className = 'pill pill-info';
+      sbSt.textContent = 'Starting Search...';
+    }
+    try {
+      const convId = await ensureSandboxAgenticConversationId(chosenAgent);
+      if (!convId) {
+        throw new Error('Could not create Sandbox Agentic Search conversation.');
+      }
+      const thinkingEl = getEl('thinking-level-select');
+      const thinkingLevel = thinkingEl ? thinkingEl.value : 'medium';
+      const promptWithHint = `[Agentic Search Mode — use the stateful browser tool (open/snapshot/click/fill) when inspecting web pages so live cursor telemetry and previews appear in the viewport]\n${taskPrompt}`;
+      const res = await apiFetch(`/api/v1/conversations/${encodeURIComponent(convId)}/messages`, {
+        method: 'POST',
+        body: {
+          content: promptWithHint,
+          agent_id: chosenAgent || null,
+          thinking_level: thinkingLevel,
+          attachments: [],
+          async_dispatch: true,
+          immediate: true
+        }
+      });
+      const dispatchedTaskId = (res && res.task && res.task.id)
+        ? String(res.task.id)
+        : ((res && res.task_id) ? String(res.task_id) : '');
+      if (dispatchedTaskId) {
+        if (state.sandboxAgenticTaskIds.size >= 32) {
+          const oldest = state.sandboxAgenticTaskIds.values().next().value;
+          if (oldest !== undefined) state.sandboxAgenticTaskIds.delete(oldest);
+        }
+        state.sandboxAgenticTaskIds.add(dispatchedTaskId);
+      }
+      state.liveBrowserFeed.unshift({
+        id: `sb-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        session_id: state.activeLiveBrowserSessionId || 'sandbox',
+        agent_id: chosenAgent || 'commander',
+        action: 'agentic_search',
+        status: 'running',
+        url: taskPrompt.slice(0, 80),
+        title: '',
+        selector: '',
+        x_pct: null,
+        y_pct: null
+      });
+      if (state.liveBrowserFeed.length > MAX_LIVE_BROWSER_FEED) {
+        state.liveBrowserFeed.length = MAX_LIVE_BROWSER_FEED;
+      }
+      renderLiveBrowserFeed();
+      if (inputEl) inputEl.value = '';
+      showToast('Sandbox Agentic Search dispatched.', 'success');
+    } catch (err) {
+      if (sbSt) {
+        sbSt.className = 'pill pill-danger';
+        sbSt.textContent = 'Error';
+      }
+      showToast(`Sandbox Agentic Search failed: ${err.message}`, 'danger');
+    } finally {
+      if (btnEl) {
+        btnEl.disabled = false;
+        btnEl.textContent = 'Run Agentic Search';
+      }
+    }
+  }
+
+  function applyImportedKvFields(res) {
+    const imported = (res && typeof res.imported === 'object' && res.imported) ? res.imported : {};
+    const applied = (res && typeof res.applied === 'object' && res.applied) ? res.applied : {};
+    const merged = Object.assign({}, imported, applied);
+
+    const setSelectIfValid = (id, raw) => {
+      if (raw === undefined || raw === null) return '';
+      const norm = String(raw).trim().toLowerCase();
+      const sel = getEl(id);
+      if (!sel) return norm;
+      const valid = [...sel.options].some((o) => o.value === norm);
+      sel.value = valid ? norm : '';
+      return sel.value;
+    };
+
+    const kVal = setSelectIfValid('set-inf-cache-type-k', merged.cache_type_k);
+    const vVal = setSelectIfValid('set-inf-cache-type-v', merged.cache_type_v);
+    const faEl = getEl('set-inf-flash-attn');
+    if (faEl && merged.flash_attn !== undefined && merged.flash_attn !== null) {
+      faEl.checked = Boolean(merged.flash_attn);
+    }
+    const smartEl = getEl('set-inf-smart-tool-routing');
+    if (smartEl && merged.smart_tool_routing !== undefined && merged.smart_tool_routing !== null) {
+      smartEl.checked = Boolean(merged.smart_tool_routing);
+    }
+
+    const nCtx = merged.n_ctx ?? merged.ctx_size ?? merged.context_limit;
+    if (nCtx !== undefined && nCtx !== null) setInputValue('cfg-context-limit', nCtx);
+    if (merged.max_tokens !== undefined && merged.max_tokens !== null) setInputValue('cfg-max-output-tokens', merged.max_tokens);
+    if (merged.n_keep !== undefined && merged.n_keep !== null) setInputValue('cfg-n-keep', merged.n_keep);
+    if (merged.temperature !== undefined && merged.temperature !== null) setInputValue('cfg-temperature', merged.temperature);
+    if (merged.top_k !== undefined && merged.top_k !== null) setInputValue('cfg-top-k', merged.top_k);
+    if (merged.top_p !== undefined && merged.top_p !== null) setInputValue('cfg-top-p', merged.top_p);
+    if (merged.min_p !== undefined && merged.min_p !== null) setInputValue('cfg-min-p', merged.min_p);
+    if (merged.repeat_penalty !== undefined && merged.repeat_penalty !== null) setInputValue('cfg-repeat-penalty', merged.repeat_penalty);
+    if (merged.repeat_last_n !== undefined && merged.repeat_last_n !== null) setInputValue('cfg-repeat-last-n', merged.repeat_last_n);
+    if (merged.presence_penalty !== undefined && merged.presence_penalty !== null) setInputValue('cfg-presence-penalty', merged.presence_penalty);
+    if (merged.frequency_penalty !== undefined && merged.frequency_penalty !== null) setInputValue('cfg-frequency-penalty', merged.frequency_penalty);
+    if (merged.dry_multiplier !== undefined && merged.dry_multiplier !== null) setInputValue('cfg-dry-multiplier', merged.dry_multiplier);
+    if (merged.dry_base !== undefined && merged.dry_base !== null) setInputValue('cfg-dry-base', merged.dry_base);
+    if (merged.dry_allowed_length !== undefined && merged.dry_allowed_length !== null) setInputValue('cfg-dry-allowed-length', merged.dry_allowed_length);
+    if (merged.dry_penalty_last_n !== undefined && merged.dry_penalty_last_n !== null) setInputValue('cfg-dry-penalty-last-n', merged.dry_penalty_last_n);
+    if (merged.xtc_probability !== undefined && merged.xtc_probability !== null) setInputValue('cfg-xtc-probability', merged.xtc_probability);
+    if (merged.xtc_threshold !== undefined && merged.xtc_threshold !== null) setInputValue('cfg-xtc-threshold', merged.xtc_threshold);
+    if (Array.isArray(merged.samplers)) {
+      setInputValue('cfg-samplers', merged.samplers.join(', '));
+    } else if (typeof merged.samplers === 'string') {
+      setInputValue('cfg-samplers', merged.samplers);
+    }
+
+    return {
+      k: kVal || (merged.cache_type_k ? String(merged.cache_type_k) : ''),
+      v: vVal || (merged.cache_type_v ? String(merged.cache_type_v) : ''),
+      fa: faEl ? faEl.checked : Boolean(merged.flash_attn),
+      nCtx
+    };
+  }
+
+  async function onImportLlamaCppKv() {
+    const btn = getEl('btn-import-llamacpp-kv');
+    const statusEl = getEl('import-kv-status');
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+    }
+    if (statusEl) {
+      statusEl.className = 'pill text-sm is-loading';
+      statusEl.textContent = 'Importing from llama.cpp / PS5LM...';
+    }
+    try {
+      const res = await apiFetch('/api/v1/inference/import-kv', { method: 'POST', body: {} });
+      const summary = applyImportedKvFields(res);
+      const parts = [];
+      parts.push(`K:${summary.k || 'auto'}`);
+      parts.push(`V:${summary.v || 'auto'}`);
+      parts.push(`FA:${summary.fa ? 'on' : 'off'}`);
+      if (summary.nCtx) parts.push(`ctx ${summary.nCtx}`);
+      if (res && res.total_slots) parts.push(`${res.total_slots} slots`);
+      const text = parts.join(' \u00b7 ');
+      if (statusEl) {
+        statusEl.className = 'pill text-sm is-success';
+        statusEl.textContent = text;
+      }
+      showToast(`Imported KV & sampling settings (${text}).`, 'success');
+    } catch (err) {
+      if (statusEl) {
+        statusEl.className = 'pill text-sm is-error';
+        statusEl.textContent = err && err.message ? err.message : 'Import failed';
+      }
+      showToast(`KV import failed: ${err.message}`, 'danger');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.classList.remove('is-loading');
+      }
+    }
+  }
+
   function resetSessionUiState() {
     state.chatMessages = [];
-    if (state.chatStreams) state.chatStreams.clear();
+    clearAllStreamBuckets();
+    clearTimingsCaches();
+    resetLiveBrowserState();
     if (state.activeChatTasks) state.activeChatTasks.clear();
     if (state.completedChatTaskIds) state.completedChatTaskIds.clear();
     if (state.chatErrors) state.chatErrors.clear();
@@ -734,6 +1896,9 @@
               rehydrateActiveChatTasks(state.activeConversationId)
             ]);
           }
+          if (state.activeLiveBrowserSessionId) {
+            renderAllLiveBrowserViewports({ refreshPreview: true, immediatePreview: false });
+          }
           break;
         case 'agents':
           await Promise.all([loadTools(), loadAgents()]);
@@ -761,6 +1926,9 @@
           break;
         case 'sandbox':
           await loadSandboxTab();
+          if (state.activeLiveBrowserSessionId) {
+            renderAllLiveBrowserViewports({ refreshPreview: true, immediatePreview: false });
+          }
           break;
         case 'logs':
           if (state.logsTab === 'audit') {
@@ -2976,6 +4144,8 @@
     const attachBtn = getEl('btn-chat-attach');
     const agentSelect = getEl('chat-agent-select');
     const thinkingSelect = getEl('thinking-level-select');
+    const agenticToggleBtn = getEl('btn-agentic-search-toggle');
+    const agenticAgentSelect = getEl('chat-agentic-agent-select');
     if (input) input.disabled = dis;
     if (sendBtn) sendBtn.disabled = dis;
     if (sendImmediateBtn) sendImmediateBtn.disabled = dis;
@@ -2983,11 +4153,14 @@
     if (attachBtn) attachBtn.disabled = dis;
     if (agentSelect) agentSelect.disabled = dis;
     if (thinkingSelect) thinkingSelect.disabled = dis;
+    if (agenticToggleBtn) agenticToggleBtn.disabled = dis;
+    if (agenticAgentSelect) agenticAgentSelect.disabled = dis;
   }
 
   async function selectConversation(convId) {
     const seq = ++state.convLoadSeq;
     state.activeConversationId = convId;
+    state.chatLiveBrowserDismissed = false;
     for (const bucket of state.chatStreams.values()) {
       bucket.bubbleEl = null;
       bucket._refs = null;
@@ -2998,6 +4171,7 @@
     renderConversationList();
     updateChatHeader();
     renderChatTaskBar();
+    syncChatLiveBrowserDockForConversation(convId);
     try {
       await Promise.all([
         loadChatMessages(convId, { expectedSeq: seq }),
@@ -3330,6 +4504,7 @@
     if (msg.created_at) headerMeta.push(fmtTime(msg.created_at));
     if (msg.token_count) headerMeta.push(`${msg.token_count} tok`);
     if (msg.latency_ms) headerMeta.push(`${msg.latency_ms} ms`);
+    const timingsPill = role !== 'user' ? buildTimingsPillEl(resolveMessageTimings(msg)) : null;
 
     const nodes = [
       el('div', { className: 'msg-header' },
@@ -3338,7 +4513,10 @@
           isLive ? ' ' : null,
           isLive ? el('span', { className: 'streaming-dot', 'aria-label': 'Streaming response' }) : null
         ),
-        el('span', { className: 'mono' }, headerMeta.join(' \u00b7 '))
+        el('span', { className: 'toolbar-actions' },
+          timingsPill,
+          headerMeta.length > 0 ? el('span', { className: 'mono' }, headerMeta.join(' \u00b7 ')) : null
+        )
       )
     ];
 
@@ -4640,12 +5818,28 @@
       }
     }
 
+    const agenticBtn = getEl('btn-agentic-search-toggle');
+    const agenticActive = Boolean(
+      state.agenticSearchEnabled
+      || (agenticBtn && agenticBtn.getAttribute('aria-pressed') === 'true')
+    );
+    const agenticAgentSel = getEl('chat-agentic-agent-select');
+    const agenticAgentId = agenticAgentSel ? String(agenticAgentSel.value || '').trim() : '';
+    const dispatchAgentId = agenticActive ? (agenticAgentId || selectedAgent || null) : (selectedAgent || null);
+    const agenticHint = '[Agentic Search Mode — use browser / web_search tools when needed and show live viewport progress]';
+    const dispatchContent = (agenticActive && !content.startsWith('/') && !content.includes('[Agentic Search Mode'))
+      ? `${agenticHint}\n${content}`
+      : content;
+    if (agenticActive) {
+      state.chatLiveBrowserDismissed = false;
+      openChatLiveBrowserDock({ statusText: 'Searching...', pillClass: 'pill-info' });
+    }
     try {
       const res = await apiFetch(`/api/v1/conversations/${encodeURIComponent(targetConvId)}/messages`, {
         method: 'POST',
         body: {
-          content,
-          agent_id: selectedAgent || null,
+          content: dispatchContent,
+          agent_id: dispatchAgentId,
           thinking_level: thinkingLevel,
           attachments: attachmentsToSend,
           async_dispatch: true,
@@ -4741,7 +5935,10 @@
           });
           closeModal();
           await loadConversations();
-          if (conv && conv.id) await selectConversation(conv.id);
+          if (conv && conv.id) {
+            setAgenticSearchEnabled(false);
+            await selectConversation(conv.id);
+          }
         } catch (err) {
           showToast(`Create chat failed: ${err.message}`, 'danger');
         }
@@ -4792,7 +5989,10 @@
           });
           closeModal();
           await loadConversations();
-          if (conv && conv.id) await selectConversation(conv.id);
+          if (conv && conv.id) {
+            setAgenticSearchEnabled(false);
+            await selectConversation(conv.id);
+          }
         } catch (err) {
           showToast(`Create group chat failed: ${err.message}`, 'danger');
         }
@@ -4825,6 +6025,7 @@
         onClick: async () => {
           try {
             await apiFetch(`/api/v1/conversations/${encodeURIComponent(conv.id)}`, { method: 'DELETE' });
+            cleanupConversationClientState(conv.id);
             const deletedActive = state.activeConversationId === conv.id;
             for (const [tid, t] of [...state.activeChatTasks.entries()]) {
               if (t && t.conversation_id === conv.id) {
@@ -4897,6 +6098,8 @@
         chatAgentSel.value = prev;
       }
     }
+    populateOptionalAgentSelect('chat-agentic-agent-select', 'Auto (Active Agent)');
+    populateOptionalAgentSelect('sandbox-browser-agent-select', 'Auto (Active Agent)');
     populateScheduleAgentSelects();
     populateWebhookAgentSelect();
   }
@@ -6152,7 +7355,7 @@
 
     const prompt = ((promptInput && promptInput.value) || '').trim();
     if (!prompt) {
-      showToast('Describe a schedule in Polish or English first.', 'warning');
+      showToast('Describe a schedule in plain English first.', 'warning');
       return;
     }
 
@@ -7286,6 +8489,7 @@
       const data = await apiFetch('/api/v1/sandbox/browser/sessions');
       state.browserSessions = unwrapList(data, ['sessions']);
       renderBrowserSessionSelect();
+      syncLiveTabsFromSessionsList(state.browserSessions);
       const statusBar = getEl('browser-status-bar');
       if (statusBar && state.browserSessions.length === 0 && !options.keepStatus) {
         statusBar.textContent = 'Idle \u2014 open a URL to start a sandboxed browser session.';
@@ -7307,6 +8511,51 @@
       if (sel && [...sel.options].some((o) => o.value === res.session_id)) {
         sel.value = res.session_id;
       }
+      const sid = String(res.session_id);
+      const curTab = state.liveBrowserTabs.get(sid) || {
+        session_id: sid,
+        url: '',
+        title: '',
+        agent_id: '',
+        action: actionName || '',
+        status: 'opened',
+        x_pct: 50,
+        y_pct: 18,
+        w_pct: null,
+        h_pct: null,
+        scroll_y: 0,
+        selector: '',
+        elements: [],
+        conversation_id: '',
+        task_id: '',
+        hasLoadedPreview: false,
+        updatedAtMs: Date.now()
+      };
+      if (res.url) curTab.url = String(res.url);
+      if (res.title) curTab.title = String(res.title);
+      if (Array.isArray(res.elements)) curTab.elements = res.elements;
+      if (res.cursor && typeof res.cursor === 'object') {
+        const cx = clampPct(res.cursor.x_pct);
+        const cy = clampPct(res.cursor.y_pct);
+        if (cx !== null) curTab.x_pct = cx;
+        if (cy !== null) curTab.y_pct = cy;
+        if (typeof res.cursor.scroll_y === 'number') curTab.scroll_y = res.cursor.scroll_y;
+        if (res.cursor.last_action) curTab.action = res.cursor.last_action;
+        if (res.cursor.last_selector) curTab.selector = res.cursor.last_selector;
+        if (res.cursor.agent_id) curTab.agent_id = res.cursor.agent_id;
+      }
+      if (actionName) curTab.action = actionName;
+      curTab.updatedAtMs = Date.now();
+      state.liveBrowserTabs.set(sid, curTab);
+      if (!state.liveBrowserOrder.includes(sid)) {
+        state.liveBrowserOrder.unshift(sid);
+      }
+      state.activeLiveBrowserSessionId = sid;
+      renderAllLiveBrowserViewports({
+        refreshPreview: actionName !== 'links' && actionName !== 'text',
+        immediatePreview: actionName === 'open' || actionName === 'back' || actionName === 'snapshot',
+        ripple: actionName === 'click' || actionName === 'submit'
+      });
     }
     if (res.url) {
       const urlIn = getEl('browser-url-input');
@@ -7468,6 +8717,12 @@
       if (state.activeBrowserSessionId === sid) {
         state.activeBrowserSessionId = '';
       }
+      handleBrowserActivityEvent({
+        session_id: sid,
+        action: 'close',
+        status: 'closed',
+        timestamp: new Date().toISOString()
+      });
       const elsList = getEl('browser-elements-list');
       if (elsList) clearEl(elsList);
       setText('browser-snapshot-meta', 'Session closed.');
@@ -7926,6 +9181,13 @@
 
     setInputValue('cfg-prefill-kv-cache', inf.prefill_kv_cache === false ? 'false' : 'true');
     setInputValue('cfg-cache-prompt', inf.cache_prompt === false ? 'false' : 'true');
+    const normKv = (v) => String(v || '').trim().toLowerCase();
+    setInputValue('set-inf-cache-type-k', normKv(inf.cache_type_k));
+    setInputValue('set-inf-cache-type-v', normKv(inf.cache_type_v));
+    const flashAttnEl = getEl('set-inf-flash-attn');
+    if (flashAttnEl) flashAttnEl.checked = Boolean(inf.flash_attn);
+    const smartRoutingEl = getEl('set-inf-smart-tool-routing');
+    if (smartRoutingEl) smartRoutingEl.checked = inf.smart_tool_routing !== false;
     setInputValue('cfg-temperature', inf.temperature ?? 0.4);
     setInputValue('cfg-dynatemp-range', inf.dynatemp_range ?? 0);
     setInputValue('cfg-dynatemp-exponent', inf.dynatemp_exponent ?? 1);
@@ -7937,10 +9199,10 @@
     setInputValue('cfg-xtc-threshold', inf.xtc_threshold ?? 0.1);
     setInputValue('cfg-top-n-sigma', inf.top_n_sigma ?? -1);
     setInputValue('cfg-repeat-penalty', inf.repeat_penalty ?? 1.05);
-    setInputValue('cfg-repeat-last-n', inf.repeat_last_n ?? 64);
+    setInputValue('cfg-repeat-last-n', inf.repeat_last_n ?? 256);
     setInputValue('cfg-presence-penalty', inf.presence_penalty ?? 0);
     setInputValue('cfg-frequency-penalty', inf.frequency_penalty ?? 0);
-    setInputValue('cfg-dry-multiplier', inf.dry_multiplier ?? 0);
+    setInputValue('cfg-dry-multiplier', inf.dry_multiplier ?? 0.8);
     setInputValue('cfg-dry-base', inf.dry_base ?? 1.75);
     setInputValue('cfg-dry-allowed-length', inf.dry_allowed_length ?? 2);
     setInputValue('cfg-dry-penalty-last-n', inf.dry_penalty_last_n ?? -1);
@@ -8161,6 +9423,10 @@
         max_output_tokens: maxOutputTokens,
         prefill_kv_cache: $('cfg-prefill-kv-cache').value !== 'false',
         cache_prompt: $('cfg-cache-prompt').value !== 'false',
+        cache_type_k: String((getEl('set-inf-cache-type-k') || {}).value || '').trim().toLowerCase(),
+        cache_type_v: String((getEl('set-inf-cache-type-v') || {}).value || '').trim().toLowerCase(),
+        flash_attn: Boolean((getEl('set-inf-flash-attn') || {}).checked),
+        smart_tool_routing: (getEl('set-inf-smart-tool-routing') || { checked: true }).checked !== false,
         temperature: readFloatInRange('cfg-temperature', 'Temperature', 0, 2),
         dynatemp_range: readFloatInRange('cfg-dynatemp-range', 'Dynamic Temp Range', 0, 2),
         dynatemp_exponent: readFloatInRange('cfg-dynatemp-exponent', 'Dynamic Temp Exponent', 0, 10),
@@ -8423,7 +9689,7 @@
       'agent_message_sent', 'approval_requested', 'approval_resolved',
       'agent_updated', 'system_alert', 'schedule_updated',
       'files_changed', 'ps5_lm_synced', 'ps5lm_synced', 'continuation_triggered',
-      'sandbox_updated', 'webhook_triggered'
+      'sandbox_updated', 'webhook_triggered', 'browser_activity'
     ];
     for (const evtName of namedEvents) {
       es.addEventListener(evtName, (ev) => {
@@ -8520,6 +9786,7 @@
     const taskId = rawTaskId || `${convId}:${agentId || 'assistant'}`;
     let bucket = state.chatStreams.get(taskId);
     if (!bucket) {
+      pruneChatStreamBuckets();
       bucket = {
         taskId,
         conversationId: (ev && ev.conversation_id) || state.activeConversationId,
@@ -8529,11 +9796,14 @@
         toolCalls: [],
         bubbleEl: null,
         dirty: false,
+        completed: false,
+        updatedAtMs: Date.now(),
         createdAt: new Date().toISOString()
       };
       state.chatStreams.set(taskId, bucket);
       updateActiveStreamsBadge();
     } else {
+      bucket.updatedAtMs = Date.now();
       if (ev && ev.conversation_id && (!bucket.conversationId || bucket.conversationId !== ev.conversation_id)) {
         bucket.conversationId = ev.conversation_id;
       }
@@ -8604,14 +9874,36 @@
         scheduleStreamFlush();
         break;
       }
+      case 'browser_activity': {
+        handleBrowserActivityEvent(ev);
+        break;
+      }
       case 'chat_completed': {
         const tid = ev.task_id ? String(ev.task_id).trim() : '';
         const bucket = tid ? (state.chatStreams.get(tid) || state.chatStreams.get(String(ev.task_id))) : null;
+        if (bucket) {
+          bucket.completed = true;
+          bucket.updatedAtMs = Date.now();
+        }
+        if (ev.timings) {
+          cacheMessageTimings(ev.message_id, tid, ev.conversation_id, ev.timings);
+        }
         const cachedReasoning = bucket && bucket.reasoning ? bucket.reasoning : '';
         const finalReasoning = (typeof ev.reasoning === 'string' && ev.reasoning) ? ev.reasoning : cachedReasoning;
         if (tid) {
           markChatTaskTerminal(tid);
+          if (state.sandboxAgenticTaskIds && state.sandboxAgenticTaskIds.has(tid)) {
+            const sbSt = getEl('sandbox-live-browser-status');
+            if (sbSt) {
+              sbSt.className = 'pill pill-success';
+              sbSt.textContent = 'Completed';
+            }
+            if (state.currentSection === 'sandbox') {
+              loadBrowserSessions({ silent: true, keepStatus: true }).catch(() => {});
+            }
+          }
         }
+        restoreChatLiveStatusFromSearching(ev.conversation_id, tid);
         renderChatTaskBar();
         if (state.currentSection === 'chat' && ev.conversation_id === state.activeConversationId) {
           loadChatMessages(ev.conversation_id, {
@@ -8664,8 +9956,8 @@
           || (existingTask && existingTask.conversation_id)
           || (streamBucket && streamBucket.conversationId)
           || '';
-        if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(st)) {
-          if (st === 'FAILED') {
+        if (['COMPLETED', 'FAILED', 'CANCELLED', 'BLOCKED_LOOP'].includes(st)) {
+          if (st === 'FAILED' || st === 'BLOCKED_LOOP') {
             const detail = ev.error || ev.message || ev.error_info || ev.progress_note || '';
             if (detail) {
               showChatErrorBanner(convId || state.activeConversationId, 'Task Failed', detail);
@@ -8674,7 +9966,19 @@
           }
           if (tid) {
             markChatTaskTerminal(tid);
+            if (state.sandboxAgenticTaskIds && state.sandboxAgenticTaskIds.has(tid)) {
+              const sbSt = getEl('sandbox-live-browser-status');
+              if (sbSt) {
+                const isOk = st === 'COMPLETED';
+                sbSt.className = isOk ? 'pill pill-success' : 'pill pill-danger';
+                sbSt.textContent = isOk ? 'Completed' : (st === 'CANCELLED' ? 'Cancelled' : 'Failed');
+              }
+              if (state.currentSection === 'sandbox') {
+                loadBrowserSessions({ silent: true, keepStatus: true }).catch(() => {});
+              }
+            }
           }
+          restoreChatLiveStatusFromSearching(convId, tid);
           renderChatTaskBar();
           if (st === 'COMPLETED' && streamBucket && state.currentSection === 'chat' && convId === state.activeConversationId) {
             loadChatMessages(convId).catch(() => {});
@@ -8700,7 +10004,15 @@
         if (tid) {
           markChatTaskTerminal(tid);
           renderChatTaskBar();
+          if (state.sandboxAgenticTaskIds && state.sandboxAgenticTaskIds.has(tid)) {
+            const sbSt = getEl('sandbox-live-browser-status');
+            if (sbSt) {
+              sbSt.className = 'pill pill-danger';
+              sbSt.textContent = 'Failed';
+            }
+          }
         }
+        restoreChatLiveStatusFromSearching(convId, tid);
         showChatErrorBanner(convId || state.activeConversationId, 'Task Failed', detail);
         showDeduplicatedErrorToast(`Task failed: ${detail}`);
         if (state.currentSection === 'tasks') {
@@ -9226,6 +10538,9 @@
       browserSessionSel.addEventListener('change', () => {
         state.activeBrowserSessionId = browserSessionSel.value;
         if (state.activeBrowserSessionId) {
+          if (state.liveBrowserTabs && state.liveBrowserTabs.has(state.activeBrowserSessionId)) {
+            selectLiveBrowserTab(state.activeBrowserSessionId);
+          }
           runBrowserAction('snapshot', { sessionId: state.activeBrowserSessionId, silentEmpty: true });
         }
       });
@@ -9308,7 +10623,35 @@
     // Settings & PS5LM Sync
     const btnSyncPs5Lm = getEl('btn-sync-ps5lm');
     if (btnSyncPs5Lm) btnSyncPs5Lm.addEventListener('click', onSyncPs5Lm);
+    const btnImportKv = getEl('btn-import-llamacpp-kv');
+    if (btnImportKv) btnImportKv.addEventListener('click', onImportLlamaCppKv);
     $('settings-form').addEventListener('submit', onSaveSettings);
+
+    // Agentic Search & Live Browser Viewport controls
+    const btnAgenticToggle = getEl('btn-agentic-search-toggle');
+    if (btnAgenticToggle) {
+      btnAgenticToggle.addEventListener('click', () => {
+        const next = !state.agenticSearchEnabled;
+        setAgenticSearchEnabled(next);
+        if (next && state.liveBrowserTabs && state.liveBrowserTabs.size > 0) {
+          openChatLiveBrowserDock();
+        }
+      });
+    }
+    const btnCloseLiveDock = getEl('btn-chat-live-browser-close');
+    if (btnCloseLiveDock) btnCloseLiveDock.addEventListener('click', hideChatLiveBrowserDock);
+
+    const btnSandboxAgenticRun = getEl('btn-sandbox-agentic-run');
+    if (btnSandboxAgenticRun) btnSandboxAgenticRun.addEventListener('click', runSandboxAgenticSearch);
+    const sandboxAgenticInput = getEl('sandbox-browser-agentic-input');
+    if (sandboxAgenticInput) {
+      sandboxAgenticInput.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' && !ev.shiftKey) {
+          ev.preventDefault();
+          runSandboxAgenticSearch();
+        }
+      });
+    }
     $('checkpoint-db-btn').addEventListener('click', onCheckpointDb);
     $('change-password-form').addEventListener('submit', onChangePassword);
     $('shutdown-btn').addEventListener('click', confirmGracefulShutdown);
@@ -9389,6 +10732,22 @@
         hideSlashCommandPalette();
         setMobileDrawer(false);
       }
+    });
+
+    window.addEventListener('resize', () => {
+      if (!state.activeLiveBrowserSessionId) return;
+      if (state.liveOverlayResizeTimer) {
+        window.clearTimeout(state.liveOverlayResizeTimer);
+      }
+      state.liveOverlayResizeTimer = window.setTimeout(() => {
+        state.liveOverlayResizeTimer = null;
+        const activeTab = state.activeLiveBrowserSessionId
+          ? (state.liveBrowserTabs.get(state.activeLiveBrowserSessionId) || null)
+          : null;
+        if (!activeTab) return;
+        renderLiveSvgOverlay('chat-live-browser-overlay', activeTab, { ripple: false });
+        renderLiveSvgOverlay('sandbox-live-browser-overlay', activeTab, { ripple: false });
+      }, 120);
     });
   }
 

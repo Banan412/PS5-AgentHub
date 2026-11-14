@@ -1,4 +1,4 @@
-use crate::models::ScheduleRecord;
+use crate::models::{InferenceTimings, ScheduleRecord};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +24,8 @@ pub enum StreamEvent {
         content: String,
         #[serde(default)]
         reasoning: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timings: Option<InferenceTimings>,
     },
     ToolCallStarted {
         task_id: String,
@@ -103,6 +105,34 @@ pub enum StreamEvent {
         task_id: String,
         conversation_id: String,
     },
+    BrowserActivity {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        session_id: String,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x_pct: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y_pct: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        w_pct: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        h_pct: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scroll_y: Option<f32>,
+        status: String,
+        timestamp: String,
+    },
 }
 
 impl StreamEvent {
@@ -125,6 +155,56 @@ impl StreamEvent {
             Self::ScheduleUpdated { .. } => "schedule_updated",
             Self::SandboxUpdated { .. } => "sandbox_updated",
             Self::WebhookTriggered { .. } => "webhook_triggered",
+            Self::BrowserActivity { .. } => "browser_activity",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_activity_and_chat_completed_timings_roundtrip() {
+        let ev = StreamEvent::BrowserActivity {
+            conversation_id: None,
+            task_id: None,
+            agent_id: None,
+            session_id: "sess-1".to_string(),
+            action: "click".to_string(),
+            url: Some("https://example.com".to_string()),
+            title: None,
+            selector: Some("#submit".to_string()),
+            x_pct: Some(50.0),
+            y_pct: Some(25.0),
+            w_pct: None,
+            h_pct: None,
+            scroll_y: None,
+            status: "ok".to_string(),
+            timestamp: "2026-11-14T11:00:00Z".to_string(),
+        };
+        assert_eq!(ev.event_name(), "browser_activity");
+
+        let val = serde_json::to_value(&ev).unwrap();
+        assert_eq!(val["type"], "browser_activity");
+        assert!(val.get("conversation_id").is_none());
+        assert!(val.get("w_pct").is_none());
+        assert_eq!(val["session_id"], "sess-1");
+
+        let legacy_completed: StreamEvent = serde_json::from_str(
+            r#"{
+                "type": "chat_completed",
+                "conversation_id": "c1",
+                "task_id": "t1",
+                "agent_id": "a1",
+                "message_id": "m1",
+                "content": "hi"
+            }"#,
+        )
+        .unwrap();
+        match legacy_completed {
+            StreamEvent::ChatCompleted { timings, .. } => assert!(timings.is_none()),
+            other => panic!("unexpected variant: {:?}", other),
         }
     }
 }

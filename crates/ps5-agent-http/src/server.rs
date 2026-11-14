@@ -15,6 +15,22 @@ pub fn is_sony_rest_mode_error(err: &io::Error) -> bool {
     err.raw_os_error() == Some(163)
 }
 
+/// Returns `true` for bind errors caused by invalid config or missing OS privileges
+/// where retrying with backoff will never succeed.
+pub fn is_permanent_bind_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::PermissionDenied
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::Unsupported
+    )
+}
+
+fn configure_accepted_stream(stream: &TcpStream) {
+    // Disable Nagle's algorithm so small HTTP responses and SSE token chunks flush immediately.
+    let _ = stream.set_nodelay(true);
+}
+
 pub fn should_rebind_on_accept_error(err: &io::Error, consecutive_errors: u32) -> bool {
     if is_sony_rest_mode_error(err) {
         return true;
@@ -59,7 +75,18 @@ pub async fn bind_reusable_listener(bind_addr: &str) -> io::Result<TcpListener> 
         ));
     }
 
-    let mut last_err = None;
+    let mut last_err: Option<io::Error> = None;
+    let mut record_err = |err: io::Error| {
+        // Never overwrite a transient boot/port error (e.g. AddrNotAvailable) with a sibling
+        // permanent address-family error (e.g. IPv6 Unsupported) when binding multi-addr hosts.
+        let replace = match &last_err {
+            None => true,
+            Some(prev) => is_permanent_bind_error(prev) && !is_permanent_bind_error(&err),
+        };
+        if replace {
+            last_err = Some(err);
+        }
+    };
     for addr in addrs {
         let socket = match addr {
             SocketAddr::V4(_) => TcpSocket::new_v4(),
@@ -68,7 +95,7 @@ pub async fn bind_reusable_listener(bind_addr: &str) -> io::Result<TcpListener> 
         let socket = match socket {
             Ok(s) => s,
             Err(e) => {
-                last_err = Some(e);
+                record_err(e);
                 continue;
             }
         };
@@ -78,12 +105,12 @@ pub async fn bind_reusable_listener(bind_addr: &str) -> io::Result<TcpListener> 
             let _ = socket.set_reuseport(true);
         }
         if let Err(e) = socket.bind(addr) {
-            last_err = Some(e);
+            record_err(e);
             continue;
         }
         match socket.listen(1024) {
             Ok(listener) => return Ok(listener),
-            Err(e) => last_err = Some(e),
+            Err(e) => record_err(e),
         }
     }
 
@@ -95,17 +122,18 @@ pub async fn bind_reusable_listener(bind_addr: &str) -> io::Result<TcpListener> 
     }))
 }
 
-/// Bind `TcpListener` with exponential backoff until bound or `shutdown.is_cancelled()`.
-pub async fn bind_with_recovery(
+async fn bind_with_recovery_result(
     bind_addr: &str,
     state: &Arc<HttpState>,
     initial_backoff: Duration,
     max_backoff: Duration,
-) -> Option<TcpListener> {
-    let mut backoff = initial_backoff;
+) -> io::Result<Option<TcpListener>> {
+    let mut backoff = initial_backoff.max(Duration::from_millis(1));
+    let max_backoff = max_backoff.max(backoff);
+    let mut attempt = 0u64;
     loop {
         if state.shutdown.is_cancelled() {
-            return None;
+            return Ok(None);
         }
         match bind_reusable_listener(bind_addr).await {
             Ok(listener) => {
@@ -120,33 +148,72 @@ pub async fn bind_with_recovery(
                         message: format!("HTTP listener recovered on {bind_addr}"),
                     });
                 }
-                return Some(listener);
+                return Ok(Some(listener));
             }
             Err(err) => {
-                let was_degraded = state.set_network_degraded(true);
-                if !was_degraded {
+                if is_permanent_bind_error(&err) {
+                    state.set_network_degraded(true);
                     state.logger.error(
                         "http.server",
-                        format!("Failed to bind {bind_addr}: {err}; entering degraded retry loop"),
+                        format!(
+                            "Permanent bind error on {bind_addr} (kind={}): {err}; aborting listener startup",
+                            err.kind()
+                        ),
                     );
                     let _ = state.events_tx.send(StreamEvent::SystemAlert {
                         level: "error".to_string(),
-                        message: format!("HTTP listener degraded ({bind_addr}): {err}"),
+                        message: format!("HTTP listener failed permanently ({bind_addr}): {err}"),
                     });
-                } else {
-                    state
-                        .logger
-                        .warn("http.server", format!("Retry bind {bind_addr} failed: {err}"));
+                    return Err(err);
+                }
+
+                attempt = attempt.saturating_add(1);
+                let was_degraded = state.set_network_degraded(true);
+                if !was_degraded {
+                    state.logger.warn(
+                        "http.server",
+                        format!(
+                            "Transient bind error on {bind_addr} (kind={}): {err}; retrying with backoff",
+                            err.kind()
+                        ),
+                    );
+                    let _ = state.events_tx.send(StreamEvent::SystemAlert {
+                        level: "warn".to_string(),
+                        message: format!("HTTP listener waiting to bind ({bind_addr}): {err}"),
+                    });
+                } else if attempt <= 5 || attempt % 12 == 0 {
+                    state.logger.warn(
+                        "http.server",
+                        format!(
+                            "Retry #{attempt} bind {bind_addr} failed (kind={}): {err}; next retry in {}ms",
+                            err.kind(),
+                            backoff.as_millis()
+                        ),
+                    );
                 }
 
                 tokio::select! {
-                    _ = state.shutdown.cancelled() => return None,
+                    _ = state.shutdown.cancelled() => return Ok(None),
                     _ = sleep(backoff) => {}
                 }
-                backoff = (backoff * 2).min(max_backoff);
+                backoff = (backoff.saturating_mul(2)).min(max_backoff);
             }
         }
     }
+}
+
+/// Bind `TcpListener` with exponential backoff until bound, `shutdown.is_cancelled()`,
+/// or a permanent configuration/permission error occurs.
+pub async fn bind_with_recovery(
+    bind_addr: &str,
+    state: &Arc<HttpState>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) -> Option<TcpListener> {
+    bind_with_recovery_result(bind_addr, state, initial_backoff, max_backoff)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// `axum::serve::Listener` wrapper that survives PS5 rest-mode socket invalidation
@@ -179,6 +246,29 @@ impl RecoveringTcpListener {
         self
     }
 
+    async fn try_rebind(&mut self) {
+        match bind_with_recovery_result(
+            &self.bind_addr,
+            &self.state,
+            self.initial_backoff,
+            self.max_backoff,
+        )
+        .await
+        {
+            Ok(Some(new_listener)) => {
+                if let Ok(addr) = new_listener.local_addr() {
+                    self.local_addr = addr;
+                }
+                self.listener = Some(new_listener);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                // Permanent bind errors cannot recover; cancel shutdown so axum::serve exits cleanly.
+                self.state.shutdown.cancel();
+            }
+        }
+    }
+
     pub async fn handle_accept_result(
         &mut self,
         res: io::Result<(TcpStream, SocketAddr)>,
@@ -186,6 +276,7 @@ impl RecoveringTcpListener {
     ) -> Option<(TcpStream, SocketAddr)> {
         match res {
             Ok((stream, addr)) => {
+                configure_accepted_stream(&stream);
                 *consecutive_errors = 0;
                 if self.state.is_network_degraded() {
                     self.state.set_network_degraded(false);
@@ -224,19 +315,7 @@ impl RecoveringTcpListener {
                     }
                     self.listener = None;
                     *consecutive_errors = 0;
-                    if let Some(new_listener) = bind_with_recovery(
-                        &self.bind_addr,
-                        &self.state,
-                        self.initial_backoff,
-                        self.max_backoff,
-                    )
-                    .await
-                    {
-                        if let Ok(addr) = new_listener.local_addr() {
-                            self.local_addr = addr;
-                        }
-                        self.listener = Some(new_listener);
-                    }
+                    self.try_rebind().await;
                 } else {
                     tokio::select! {
                         _ = self.state.shutdown.cancelled() => {}
@@ -257,20 +336,9 @@ impl Listener for RecoveringTcpListener {
         let mut consecutive_errors = 0u32;
         loop {
             if self.listener.is_none() {
-                if let Some(new_listener) = bind_with_recovery(
-                    &self.bind_addr,
-                    &self.state,
-                    self.initial_backoff,
-                    self.max_backoff,
-                )
-                .await
-                {
-                    if let Ok(addr) = new_listener.local_addr() {
-                        self.local_addr = addr;
-                    }
-                    self.listener = Some(new_listener);
-                } else {
-                    // Shutdown was cancelled; park until axum's graceful shutdown exits.
+                self.try_rebind().await;
+                if self.listener.is_none() {
+                    // Shutdown was cancelled (or permanent bind error triggered shutdown); park until axum exits.
                     self.state.shutdown.cancelled().await;
                     std::future::pending::<()>().await;
                 }
@@ -300,17 +368,18 @@ impl Listener for RecoveringTcpListener {
 }
 
 /// Serves the PS5 Agent HTTP server on `config.server.bind_host:config.server.port`
-/// with automatic rest-mode listener recovery until `state.shutdown` is cancelled.
+/// with automatic rest-mode listener recovery until `state.shutdown` is cancelled
+/// or a permanent bind error occurs.
 pub async fn serve(state: Arc<HttpState>) -> io::Result<()> {
     let cfg = state.effective_config();
     let bind_addr = format_bind_addr(&cfg.server.bind_host, cfg.server.port);
-    let Some(listener) = bind_with_recovery(
+    let Some(listener) = bind_with_recovery_result(
         &bind_addr,
         &state,
         DEFAULT_BACKOFF_INITIAL,
         DEFAULT_BACKOFF_MAX,
     )
-    .await
+    .await?
     else {
         return Ok(());
     };
@@ -330,7 +399,10 @@ pub async fn serve_with_listener(
         .logger
         .info("http.server", format!("HTTP server listening on http://{local}"));
 
-    let recovering = RecoveringTcpListener::new(bind_addr, listener, state.clone())?.tap_io(|_| {});
+    let recovering = RecoveringTcpListener::new(bind_addr, listener, state.clone())?
+        .tap_io(|stream| {
+            configure_accepted_stream(stream);
+        });
     let router = build_router(state.clone());
     let shutdown = state.shutdown.clone();
 
@@ -342,4 +414,70 @@ pub async fn serve_with_listener(
         shutdown.cancelled().await;
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permanent_vs_transient_bind_error_classification() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Unsupported,
+        ] {
+            let err = io::Error::new(kind, "permanent");
+            assert!(is_permanent_bind_error(&err), "expected permanent for {kind:?}");
+        }
+
+        for kind in [
+            io::ErrorKind::AddrNotAvailable,
+            io::ErrorKind::AddrInUse,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+        ] {
+            let err = io::Error::new(kind, "transient");
+            assert!(!is_permanent_bind_error(&err), "expected transient for {kind:?}");
+        }
+
+        let sony_163 = io::Error::from_raw_os_error(163);
+        assert!(!is_permanent_bind_error(&sony_163));
+    }
+
+    #[tokio::test]
+    async fn bind_reusable_listener_distinguishes_invalid_and_unassigned_addrs() {
+        let invalid = bind_reusable_listener("invalid-without-port")
+            .await
+            .expect_err("malformed address should fail");
+        assert_eq!(invalid.kind(), io::ErrorKind::InvalidInput);
+        assert!(is_permanent_bind_error(&invalid));
+
+        // 192.0.2.1 (TEST-NET-1) simulates early PS5 boot before LAN interface IP assignment.
+        let unavailable = bind_reusable_listener("192.0.2.1:0")
+            .await
+            .expect_err("unassigned local IP should fail transiently");
+        assert!(!is_permanent_bind_error(&unavailable));
+
+        let ok = bind_reusable_listener("127.0.0.1:0")
+            .await
+            .expect("loopback ephemeral bind should succeed");
+        assert!(ok.local_addr().unwrap().port() > 0);
+    }
+
+    #[tokio::test]
+    async fn configure_accepted_stream_enables_tcp_nodelay() {
+        let listener = bind_reusable_listener("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_fut = TcpStream::connect(addr);
+        let accept_fut = listener.accept();
+        let (client_res, accept_res) = tokio::join!(connect_fut, accept_fut);
+        let _client = client_res.unwrap();
+        let (server_stream, _) = accept_res.unwrap();
+
+        configure_accepted_stream(&server_stream);
+        assert!(server_stream.nodelay().unwrap());
+    }
 }

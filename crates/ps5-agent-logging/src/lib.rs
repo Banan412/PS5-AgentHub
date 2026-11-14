@@ -92,12 +92,18 @@ fn format_entry_line(entry: &LogEntry) -> String {
     )
 }
 
-fn write_stderr_line(line: &str) {
-    let _ = writeln!(std::io::stderr(), "{line}");
+fn format_entry_line_nl(entry: &LogEntry) -> String {
+    format!(
+        "{} [{}] [{}] {}\n",
+        entry.timestamp,
+        entry.level.as_str(),
+        entry.target,
+        entry.message
+    )
 }
 
-fn write_stdout_line(line: &str) {
-    let _ = writeln!(std::io::stdout(), "{line}");
+fn write_stderr_line(line: &str) {
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 struct RingState {
@@ -138,6 +144,7 @@ struct FileSinkState {
     file: Option<File>,
     last_io_error_diag: Option<Instant>,
     last_reopen_attempt: Option<Instant>,
+    last_rotate_failure: Option<Instant>,
     suppressed_io_errors: u64,
 }
 
@@ -206,29 +213,41 @@ impl FileSinkState {
                 }
                 if let Ok(meta) = f.metadata() {
                     if meta.len() > self.max_file_bytes as u64 {
-                        rotate_now = true;
+                        let cooldown_active = self
+                            .last_rotate_failure
+                            .is_some_and(|t| t.elapsed() < REOPEN_RETRY_INTERVAL);
+                        if !cooldown_active {
+                            rotate_now = true;
+                        }
                     }
                 }
             }
         }
 
         if rotate_now {
+            let mut rotate_failed = false;
             let rotated = self.log_file_path.with_extension("log.1");
             if let Err(e) = fs::remove_file(&rotated) {
-                if e.kind() != ErrorKind::NotFound && diag.is_none() {
-                    diag = self.note_io_error(
-                        &format!("failed to remove rotated log {}", rotated.display()),
-                        e,
-                    );
+                if e.kind() != ErrorKind::NotFound {
+                    rotate_failed = true;
+                    if diag.is_none() {
+                        diag = self.note_io_error(
+                            &format!("failed to remove rotated log {}", rotated.display()),
+                            e,
+                        );
+                    }
                 }
             }
             drop(self.file.take());
-            if let Err(e) = fs::rename(&self.log_file_path, &rotated) {
-                if diag.is_none() {
-                    diag = self.note_io_error(
-                        &format!("failed to rotate log to {}", rotated.display()),
-                        e,
-                    );
+            if !rotate_failed {
+                if let Err(e) = fs::rename(&self.log_file_path, &rotated) {
+                    rotate_failed = true;
+                    if diag.is_none() {
+                        diag = self.note_io_error(
+                            &format!("failed to rotate log to {}", rotated.display()),
+                            e,
+                        );
+                    }
                 }
             }
             match OpenOptions::new()
@@ -238,6 +257,7 @@ impl FileSinkState {
             {
                 Ok(new_file) => self.file = Some(new_file),
                 Err(e) => {
+                    rotate_failed = true;
                     if diag.is_none() {
                         diag = self.note_io_error(
                             &format!("failed to reopen log file {}", self.log_file_path.display()),
@@ -246,6 +266,11 @@ impl FileSinkState {
                     }
                 }
             }
+            self.last_rotate_failure = if rotate_failed {
+                Some(Instant::now())
+            } else {
+                None
+            };
         }
 
         diag
@@ -321,6 +346,7 @@ impl AppLogger {
                 file,
                 last_io_error_diag: initial_diag,
                 last_reopen_attempt: None,
+                last_rotate_failure: None,
                 suppressed_io_errors: 0,
             })),
         };
@@ -353,10 +379,16 @@ impl AppLogger {
 
         {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_capacity = g.capacity;
             g.level = level;
             g.capacity = clamped_cap;
+            let mut evicted = false;
             while g.ring.len() > clamped_cap {
                 g.ring.pop_front();
+                evicted = true;
+            }
+            if evicted || clamped_cap < prev_capacity {
+                g.ring.shrink_to_fit();
             }
             g.enable_klog = enable_klog;
             g.enable_toast = enable_toast;
@@ -379,12 +411,11 @@ impl AppLogger {
             (entry, g.enable_klog)
         };
 
-        let formatted = format_entry_line(&entry);
-        let formatted_with_nl = format!("{formatted}\n");
+        let line_with_nl = format_entry_line_nl(&entry);
 
         let sink_diag = {
             let mut s = self.sink.lock().unwrap_or_else(|e| e.into_inner());
-            s.write_and_rotate(&formatted_with_nl, level == LogLevel::Error)
+            s.write_and_rotate(&line_with_nl, level == LogLevel::Error)
         };
 
         if let Some(diag) = sink_diag {
@@ -396,7 +427,7 @@ impl AppLogger {
         }
 
         // BrokenPipe-safe stdout write (elfldr binds fd 1 to sender socket)
-        write_stdout_line(&formatted);
+        let _ = std::io::stdout().write_all(line_with_nl.as_bytes());
 
         #[cfg(target_vendor = "sie")]
         if enable_klog {
@@ -461,6 +492,9 @@ impl AppLogger {
     }
 
     pub fn recent(&self, level_filter: Option<&str>, limit: usize) -> Vec<LogEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
         let min_level = level_filter.map(LogLevel::parse);
         let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         g.ring
@@ -760,6 +794,56 @@ mod tests {
         let recent = logger.recent(Some("error"), 5);
         assert_eq!(recent[0].target, "panic");
         assert!(recent[0].message.contains("unlocked panic"));
+    }
+
+    #[test]
+    fn apply_config_shrinks_ring_capacity_and_preserves_latest() {
+        let dir = TempDirGuard::new("shrink");
+        let mut cfg = test_config(dir.0.clone());
+        cfg.ring_buffer_capacity = 4096;
+        let logger = AppLogger::init(&cfg);
+
+        for i in 0..2000 {
+            logger.info("shrink", format!("m-{i:04}"));
+        }
+        let cap_before = {
+            let g = logger.state.lock().unwrap();
+            assert_eq!(g.ring.len(), 2000);
+            g.ring.capacity()
+        };
+        assert!(cap_before >= 4096);
+
+        logger.apply_config(LogLevel::Info, 64 * 1024, 8, false, false);
+        let cap_after = {
+            let g = logger.state.lock().unwrap();
+            assert_eq!(g.ring.len(), 8);
+            g.ring.capacity()
+        };
+        assert!(
+            cap_after <= 64 && cap_after < cap_before,
+            "ring capacity must shrink after downsizing: before={cap_before}, after={cap_after}"
+        );
+        let kept = logger.recent(None, 20);
+        assert_eq!(kept.len(), 8);
+        assert_eq!(kept[0].message, "m-1999");
+        assert_eq!(kept[7].message, "m-1992");
+
+        // Also verify pre-allocated unused capacity shrinks when capacity is reduced without eviction
+        let dir_sparse = TempDirGuard::new("shrink_sparse");
+        let mut cfg_sparse = test_config(dir_sparse.0.clone());
+        cfg_sparse.ring_buffer_capacity = 4096;
+        let sparse_logger = AppLogger::init(&cfg_sparse);
+        sparse_logger.info("shrink", "only-entry");
+        sparse_logger.apply_config(LogLevel::Info, 64 * 1024, 64, false, false);
+        let sparse_cap = {
+            let g = sparse_logger.state.lock().unwrap();
+            assert_eq!(g.ring.len(), 1);
+            g.ring.capacity()
+        };
+        assert!(
+            sparse_cap <= 64,
+            "sparse ring capacity must shrink when ring_capacity drops: cap={sparse_cap}"
+        );
     }
 
     #[test]

@@ -58,3 +58,39 @@ pub fn set_process_name(name: &str) -> i32 {
         0
     }
 }
+
+/// Returns the kernel boot time in Unix epoch seconds (`CTL_KERN` / `KERN_BOOTTIME`),
+/// or `None` if unavailable or unsupported.
+pub fn kernel_boot_time_secs() -> Option<i64> {
+    #[cfg(target_vendor = "sie")]
+    {
+        let mib: [core::ffi::c_int; 2] = [
+            ps5_sys::CTL_KERN as core::ffi::c_int,
+            ps5_sys::KERN_BOOTTIME as core::ffi::c_int,
+        ];
+        let mut tv: ps5_sys::timeval = unsafe { core::mem::zeroed() };
+        let expected = core::mem::size_of::<ps5_sys::timeval>();
+        let mut len = expected;
+        // Safety: `mib` has 2 `c_int` entries and `tv` is sized for `struct timeval`.
+        let ret = unsafe {
+            ps5_sys::sysctl(
+                mib.as_ptr(),
+                mib.len() as _,
+                (&mut tv as *mut ps5_sys::timeval).cast(),
+                &mut len,
+                core::ptr::null(),
+                0,
+            )
+        };
+        if ret == 0 && len == expected && (tv.tv_sec as i64) > 0 {
+            Some(tv.tv_sec as i64)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(target_vendor = "sie"))]
+    {
+        None
+    }
+}

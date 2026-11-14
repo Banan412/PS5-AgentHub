@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ps5_agent_core::{InferenceMessage, ToolCallRequest};
 use serde_json::Value;
 
@@ -71,8 +73,12 @@ fn append_message_content(dst: &mut InferenceMessage, src: InferenceMessage) {
     if !src.image_urls.is_empty() {
         dst.image_urls.extend(src.image_urls);
     }
-    if dst.name.is_none() {
-        dst.name = src.name;
+    if dst.role.trim().eq_ignore_ascii_case("tool") {
+        if dst.name.is_none() {
+            dst.name = src.name;
+        }
+    } else {
+        dst.name = None;
     }
 }
 
@@ -106,6 +112,9 @@ pub fn normalize_conversation_messages(
         let role_lower = msg.role.trim().to_ascii_lowercase();
         if msg.role != role_lower {
             msg.role = role_lower.clone();
+        }
+        if role_lower != "tool" {
+            msg.name = None;
         }
 
         if !seen_non_system_anchor {
@@ -181,8 +190,9 @@ pub fn parse_model_output(
 
     // Tier 1: structured API tool calls
     if !api_tool_calls.is_empty() {
+        let cleaned = truncate_verbatim_prose_loops(&without_think);
         return ParsedModelOutput {
-            content: without_think.trim().to_string(),
+            content: cleaned.trim().to_string(),
             reasoning: join_non_empty(reasoning_parts),
             tool_calls: api_tool_calls,
         };
@@ -191,8 +201,9 @@ pub fn parse_model_output(
     // Tier 2: Qwen <tool_call>...</tool_call> XML blocks
     let (without_xml_tools, xml_calls) = extract_qwen_tool_calls(&without_think);
     if !xml_calls.is_empty() {
+        let cleaned = truncate_verbatim_prose_loops(&without_xml_tools);
         return ParsedModelOutput {
-            content: without_xml_tools.trim().to_string(),
+            content: cleaned.trim().to_string(),
             reasoning: join_non_empty(reasoning_parts),
             tool_calls: xml_calls,
         };
@@ -207,15 +218,17 @@ pub fn parse_model_output(
                 reasoning_parts.push(t);
             }
         }
+        let cleaned = truncate_verbatim_prose_loops(&final_answer);
         return ParsedModelOutput {
-            content: final_answer.trim().to_string(),
+            content: cleaned.trim().to_string(),
             reasoning: join_non_empty(reasoning_parts),
             tool_calls: json_calls,
         };
     }
 
+    let cleaned = truncate_verbatim_prose_loops(&without_xml_tools);
     ParsedModelOutput {
-        content: without_xml_tools.trim().to_string(),
+        content: cleaned.trim().to_string(),
         reasoning: join_non_empty(reasoning_parts),
         tool_calls: Vec::new(),
     }
@@ -661,6 +674,1491 @@ fn max_partial_tag_suffix_len(s: &str, tags: &[&str]) -> usize {
         .map(|tag| partial_tag_suffix_len(s, tag))
         .max()
         .unwrap_or(0)
+}
+
+const STREAM_GUARD_TAG_OPENS: [&str; 3] = ["<seed:think>", "<think>", "<tool_call>"];
+const MAX_REPETITION_WINDOW_BYTES: usize = 4096;
+const PROSE_BOUNDARY_MARKER: char = '\x1e';
+
+const KNOWN_AGENT_ROLES: [&str; 12] = [
+    "commander",
+    "researcher",
+    "programmer",
+    "analyst",
+    "executor",
+    "assistant",
+    "coordinator",
+    "reviewer",
+    "verifier",
+    "planner",
+    "architect",
+    "operator",
+];
+
+const KNOWN_LOOP_FILLERS: [&str; 12] = [
+    "doing it again:",
+    "hearing you:",
+    "running it again:",
+    "trying again:",
+    "here we go again:",
+    "here it is again:",
+    "repeating:",
+    "again:",
+    "on it:",
+    "copy that:",
+    "acknowledged:",
+    "got it:",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardTagKind {
+    Think(ThinkVariant),
+    ToolCall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSegment<'a> {
+    Protected(&'a str),
+    Prose(&'a str),
+}
+
+fn parse_fence_open(line: &str) -> Option<(u8, usize)> {
+    let line_no_eol = line.trim_end_matches(['\r', '\n']);
+    let trimmed_start = line_no_eol.trim_start_matches([' ', '\t']);
+    let first = trimmed_start.as_bytes().first().copied()?;
+    if first != b'`' && first != b'~' {
+        return None;
+    }
+    let len = trimmed_start.bytes().take_while(|&b| b == first).count();
+    if len < 3 {
+        return None;
+    }
+    let rest = &trimmed_start[len..];
+    if first == b'`' && rest.as_bytes().contains(&b'`') {
+        return None;
+    }
+    if first == b'~' && rest.trim_end().ends_with("~~~") {
+        return None;
+    }
+    Some((first, len))
+}
+
+fn is_fence_close(line: &str, fence_char: u8, open_len: usize) -> bool {
+    let trimmed = line.trim();
+    let len = trimmed.bytes().take_while(|&b| b == fence_char).count();
+    len >= open_len && len == trimmed.len()
+}
+
+fn could_be_fence_open_prefix(line_no_eol: &str) -> bool {
+    let ts = line_no_eol.trim_start_matches([' ', '\t']);
+    if ts.is_empty() {
+        return true;
+    }
+    if ts.starts_with("```") {
+        return !ts[3..].as_bytes().contains(&b'`');
+    }
+    if ts.starts_with("~~~") {
+        let all_tildes = ts.bytes().take_while(|&b| b == b'~').count() == ts.len();
+        return all_tildes || !ts.trim_end().ends_with("~~~");
+    }
+    let first = ts.as_bytes()[0];
+    (first == b'`' || first == b'~') && ts.bytes().all(|b| b == first)
+}
+
+fn is_backtick_wrapped_tag(s: &str, tag_start: usize, tag_len: usize) -> bool {
+    tag_start > 0
+        && s.as_bytes()[tag_start - 1] == b'`'
+        && s.get(tag_start + tag_len..)
+            .is_some_and(|after| after.starts_with('`'))
+}
+
+fn find_earliest_protected_open_tag(
+    s: &str,
+    from: usize,
+    limit: usize,
+) -> Option<(usize, usize, GuardTagKind, &'static str)> {
+    let slice = &s[..limit];
+    let candidates: [(&str, GuardTagKind, &str); 3] = [
+        ("<seed:think>", GuardTagKind::Think(ThinkVariant::Seed), "</seed:think>"),
+        ("<think>", GuardTagKind::Think(ThinkVariant::Standard), "</think>"),
+        ("<tool_call>", GuardTagKind::ToolCall, "</tool_call>"),
+    ];
+    let mut best: Option<(usize, usize, GuardTagKind, &'static str)> = None;
+    for (open, kind, close) in candidates {
+        let mut search = from;
+        while let Some(pos) = find_ci(slice, open, search) {
+            if is_backtick_wrapped_tag(slice, pos, open.len()) {
+                search = pos + 1;
+                continue;
+            }
+            if best.is_none_or(|(b_pos, _, _, _)| pos < b_pos) {
+                best = Some((pos, open.len(), kind, close));
+            }
+            break;
+        }
+    }
+    best
+}
+
+fn flush_prose_segment<'a>(
+    input: &'a str,
+    end: usize,
+    ps: &mut Option<usize>,
+    out: &mut Vec<OutputSegment<'a>>,
+) {
+    if let Some(start) = ps.take() {
+        if start < end {
+            out.push(OutputSegment::Prose(&input[start..end]));
+        }
+    }
+}
+
+fn split_protected_segments(input: &str) -> Vec<OutputSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut cursor = 0usize;
+    let mut prose_start: Option<usize> = None;
+
+    while cursor < input.len() {
+        let at_line_start = cursor == 0 || input.as_bytes()[cursor - 1] == b'\n';
+        let line_end = input[cursor..]
+            .find('\n')
+            .map_or(input.len(), |i| cursor + i + 1);
+        let line = &input[cursor..line_end];
+
+        if at_line_start {
+            if let Some((fence_char, open_len)) = parse_fence_open(line) {
+                flush_prose_segment(input, cursor, &mut prose_start, &mut segments);
+                let mut scan = line_end;
+                while scan < input.len() {
+                    let next_end = input[scan..]
+                        .find('\n')
+                        .map_or(input.len(), |i| scan + i + 1);
+                    let next_line = &input[scan..next_end];
+                    scan = next_end;
+                    if is_fence_close(next_line, fence_char, open_len) {
+                        break;
+                    }
+                }
+                segments.push(OutputSegment::Protected(&input[cursor..scan]));
+                cursor = scan;
+                continue;
+            }
+        }
+
+        if let Some((tag_pos, open_len, _, close_tag)) =
+            find_earliest_protected_open_tag(input, cursor, line_end)
+        {
+            if tag_pos > cursor {
+                prose_start.get_or_insert(cursor);
+            }
+            flush_prose_segment(input, tag_pos, &mut prose_start, &mut segments);
+            let body_start = tag_pos + open_len;
+            let block_end = find_ci(input, close_tag, body_start)
+                .map_or(input.len(), |end| end + close_tag.len());
+            segments.push(OutputSegment::Protected(&input[tag_pos..block_end]));
+            cursor = block_end;
+            continue;
+        }
+
+        prose_start.get_or_insert(cursor);
+        cursor = line_end;
+    }
+
+    flush_prose_segment(input, input.len(), &mut prose_start, &mut segments);
+    segments
+}
+
+fn starts_with_ascii_ci(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Matches a leaked self-addressed agent greeting prefix such as
+/// `"Got it, Commander! Doing it again: "` or `"Got it, Commander! Hearing you:"`
+/// at the start of `s`, returning the prefix byte length to strip.
+fn match_spurious_greeting_prefix(s: &str) -> Option<usize> {
+    let intro_len = if starts_with_ascii_ci(s, "got it, ") {
+        8
+    } else if starts_with_ascii_ci(s, "understood, ") {
+        12
+    } else {
+        return None;
+    };
+
+    let after_intro = &s[intro_len..];
+    let (sep_byte, sep_ch) = after_intro
+        .char_indices()
+        .take_while(|&(idx, ch)| idx <= 32 && ch != '\n' && ch != '\r')
+        .find(|&(_, ch)| matches!(ch, '!' | '.' | ',' | ':'))?;
+
+    let agent_raw = after_intro[..sep_byte].trim();
+    if agent_raw.is_empty()
+        || agent_raw.chars().count() > 24
+        || agent_raw.split_whitespace().count() > 2
+        || !agent_raw
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+    {
+        return None;
+    }
+
+    let is_known_role = KNOWN_AGENT_ROLES
+        .iter()
+        .any(|role| agent_raw.eq_ignore_ascii_case(role));
+    let after_sep = &after_intro[sep_byte + sep_ch.len_utf8()..];
+    let trimmed_tail = after_sep.trim_start_matches([' ', '\t']);
+    let ws_after_sep = after_sep.len() - trimmed_tail.len();
+    let base_strip = intro_len + sep_byte + sep_ch.len_utf8() + ws_after_sep;
+
+    for filler in KNOWN_LOOP_FILLERS {
+        if starts_with_ascii_ci(trimmed_tail, filler) {
+            let after_filler = &trimmed_tail[filler.len()..];
+            let ws2 = after_filler.len() - after_filler.trim_start_matches([' ', '\t']).len();
+            return Some(base_strip + filler.len() + ws2);
+        }
+    }
+
+    if !is_known_role {
+        return None;
+    }
+
+    if trimmed_tail.is_empty() {
+        return Some(s.len());
+    }
+
+    // Standalone greeting + short loop intro ending with `:` at EOL, e.g. "Got it, Commander! Here it goes:"
+    if trimmed_tail.ends_with(':') && trimmed_tail.len() <= 40 && !trimmed_tail.contains('/') {
+        return Some(s.len());
+    }
+
+    if matches!(sep_ch, '!' | ':') {
+        return Some(base_strip);
+    }
+
+    None
+}
+
+fn strip_spurious_greeting_segments_from_line(line: &str) -> (Vec<(String, bool)>, bool) {
+    let mut cur = line.to_string();
+    let mut prefix_stripped = false;
+
+    loop {
+        let trimmed = cur.trim_start_matches([' ', '\t']);
+        let leading_ws = cur.len() - trimmed.len();
+        if let Some(strip_len) = match_spurious_greeting_prefix(trimmed) {
+            let remainder = trimmed[strip_len..].to_string();
+            cur = if leading_ws > 0 && !remainder.is_empty() {
+                format!("{}{}", &cur[..leading_ws], remainder)
+            } else {
+                remainder
+            };
+            prefix_stripped = true;
+            continue;
+        }
+        break;
+    }
+
+    // Also split & strip leaked greeting headers appearing inline right after sentence punctuation.
+    let mut segments: Vec<(String, bool)> = Vec::new();
+    let mut seg_start = 0usize;
+    let mut seg_had_header = prefix_stripped;
+    let mut search_from = 0usize;
+    let mut any_inline_stripped = false;
+
+    while search_from < cur.len() {
+        let mut found: Option<(usize, usize, usize)> = None;
+        for (idx, ch) in cur[search_from..].char_indices() {
+            let abs = search_from + idx;
+            if matches!(ch, '.' | '!' | '?') {
+                let after_punct = abs + ch.len_utf8();
+                if let Some(rest) = cur.get(after_punct..) {
+                    let ws_len = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+                    if ws_len > 0 {
+                        let cand_start = after_punct + ws_len;
+                        if let Some(strip_len) = match_spurious_greeting_prefix(&cur[cand_start..]) {
+                            found = Some((after_punct, cand_start, cand_start + strip_len));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        match found {
+            Some((after_punct, _rm_start, rm_end)) => {
+                let head = cur[seg_start..after_punct]
+                    .trim_end_matches([' ', '\t'])
+                    .to_string();
+                if !head.trim().is_empty() {
+                    segments.push((head, seg_had_header));
+                }
+                any_inline_stripped = true;
+                seg_had_header = true;
+                seg_start = rm_end;
+                search_from = rm_end;
+            }
+            None => break,
+        }
+    }
+
+    let tail = cur[seg_start..].trim_end_matches([' ', '\t']).to_string();
+    if !tail.trim().is_empty() {
+        segments.push((tail, seg_had_header));
+    }
+
+    (segments, prefix_stripped || any_inline_stripped)
+}
+
+fn strip_spurious_headers_in_paragraph(para: &str) -> (String, bool) {
+    let mut lines_out = Vec::new();
+    let mut any_stripped = false;
+    for raw_line in para.lines() {
+        let clean_raw = raw_line.trim_end_matches('\r');
+        let (segments, stripped) = strip_spurious_greeting_segments_from_line(clean_raw);
+        if stripped {
+            any_stripped = true;
+        }
+        let line_joined = segments
+            .into_iter()
+            .map(|(s, _)| s)
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !line_joined.trim().is_empty() {
+            lines_out.push(line_joined);
+        }
+    }
+    (lines_out.join("\n"), any_stripped)
+}
+
+fn normalize_prose_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_ws = true;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_ws {
+                out.push(' ');
+                last_ws = true;
+            }
+        } else {
+            let norm_ch = match ch {
+                '\u{2018}' | '\u{2019}' => '\'',
+                '\u{201C}' | '\u{201D}' => '"',
+                '\u{2013}' | '\u{2014}' => '-',
+                other => other,
+            };
+            for lc in norm_ch.to_lowercase() {
+                out.push(lc);
+            }
+            last_ws = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+fn is_pure_number_or_divider(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_punctuation() || c.is_whitespace())
+}
+
+fn starts_with_list_marker(s: &str) -> bool {
+    let t = s.trim_start();
+    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
+        return true;
+    }
+    let digits = t.bytes().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0
+        && digits <= 4
+        && t.as_bytes()
+            .get(digits..)
+            .is_some_and(|rest| rest.starts_with(b". ") || rest.starts_with(b") "))
+}
+
+fn is_markdown_table_row(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('|') && t.ends_with('|') && t.len() >= 3
+}
+
+fn is_protected_boilerplate_short_item(s: &str, norm_chars: usize) -> bool {
+    is_pure_number_or_divider(s)
+        || is_markdown_table_row(s)
+        || (starts_with_list_marker(s) && norm_chars < 35)
+}
+
+fn split_blank_line_blocks(prose: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut offset = 0usize;
+    let mut block_start: Option<usize> = None;
+    let mut block_end = 0usize;
+
+    for raw_line in prose.split_inclusive('\n') {
+        let line_len = raw_line.len();
+        let line_trimmed = raw_line.trim();
+        if line_trimmed.is_empty() {
+            if let Some(st) = block_start.take() {
+                let slice = prose[st..block_end].trim_end_matches(['\r', '\n']);
+                if !slice.trim().is_empty() {
+                    blocks.push(slice);
+                }
+            }
+        } else {
+            block_start.get_or_insert(offset);
+            block_end = offset + line_len;
+        }
+        offset += line_len;
+    }
+
+    if let Some(st) = block_start {
+        let slice = prose[st..block_end].trim_end_matches(['\r', '\n']);
+        if !slice.trim().is_empty() {
+            blocks.push(slice);
+        }
+    }
+
+    blocks
+}
+
+fn extract_digit_runs(s: &str) -> Vec<&str> {
+    let mut nums = Vec::new();
+    let mut start: Option<usize> = None;
+    for (idx, ch) in s.char_indices() {
+        if ch.is_ascii_digit() {
+            start.get_or_insert(idx);
+        } else if let Some(st) = start.take() {
+            nums.push(&s[st..idx]);
+        }
+    }
+    if let Some(st) = start {
+        nums.push(&s[st..]);
+    }
+    nums
+}
+
+fn are_near_identical_paragraphs(prev_norm: &str, curr_norm: &str) -> bool {
+    if prev_norm == curr_norm {
+        return true;
+    }
+    let min_l = prev_norm.len().min(curr_norm.len());
+    let max_l = prev_norm.len().max(curr_norm.len());
+    if min_l < 80 || min_l * 10 < max_l * 8 {
+        return false;
+    }
+    if extract_digit_runs(prev_norm) != extract_digit_runs(curr_norm) {
+        return false;
+    }
+    let words_a: Vec<&str> = prev_norm.split_whitespace().collect();
+    let words_b: Vec<&str> = curr_norm.split_whitespace().collect();
+    if words_a.len() < 12 || words_b.len() < 12 || words_a[..3] != words_b[..3] {
+        return false;
+    }
+    let mut used = vec![false; words_b.len()];
+    let mut matched = 0usize;
+    for wa in &words_a {
+        if let Some(pos) = words_b
+            .iter()
+            .enumerate()
+            .position(|(idx, wb)| !used[idx] && wb == wa)
+        {
+            used[pos] = true;
+            matched += 1;
+        }
+    }
+    let total = words_a.len().max(words_b.len());
+    matched * 100 >= total * 85
+}
+
+fn is_abbreviation_before_dot(s: &str, dot_idx: usize) -> bool {
+    let prefix = &s[..dot_idx];
+    let token = prefix
+        .rsplit(|c: char| c.is_whitespace() || matches!(c, '(' | '[' | '"' | '\''))
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if token.is_empty() {
+        return false;
+    }
+    if token.len() <= 2
+        && (token.chars().all(|c| c.is_ascii_digit()) || token == "e.g" || token == "i.e")
+    {
+        return true;
+    }
+    matches!(
+        token.as_str(),
+        "e.g" | "i.e" | "etc" | "vs" | "mr" | "mrs" | "ms" | "dr" | "prof" | "fig" | "no" | "vol"
+            | "approx"
+    )
+}
+
+fn split_sentence_spans(line: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    let bytes = line.as_bytes();
+    for (idx, ch) in line.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            let end = idx + ch.len_utf8();
+            let next_is_ws = bytes.get(end).is_some_and(u8::is_ascii_whitespace);
+            let at_end = end == line.len();
+            if (next_is_ws || at_end)
+                && (ch != '.' || !is_abbreviation_before_dot(line, idx))
+            {
+                let span = &line[start..end];
+                if !span.trim().is_empty() {
+                    let trim_start = start + (span.len() - span.trim_start().len());
+                    spans.push((trim_start, end));
+                }
+                start = end;
+                while start < line.len() && bytes[start].is_ascii_whitespace() {
+                    start += 1;
+                }
+            }
+        }
+    }
+    if start < line.len() && !line[start..].trim().is_empty() {
+        let span = &line[start..];
+        let trim_start = start + (span.len() - span.trim_start().len());
+        spans.push((trim_start, line.len()));
+    }
+    spans
+}
+
+fn find_contiguous_suffix_repeat(text: &str, min_unit_chars: usize) -> Option<usize> {
+    let trimmed = text.trim_end();
+    if trimmed.chars().count() < min_unit_chars * 2 {
+        return None;
+    }
+
+    let mut win_start = trimmed.len().saturating_sub(MAX_REPETITION_WINDOW_BYTES);
+    while !trimmed.is_char_boundary(win_start) {
+        win_start += 1;
+    }
+    let win = &trimmed[win_start..];
+    let anchor_chars = 24.min(min_unit_chars).max(8);
+    let anchor_byte_start = win
+        .char_indices()
+        .rev()
+        .nth(anchor_chars - 1)
+        .map(|(idx, _)| idx)?;
+    let anchor = &win[anchor_byte_start..];
+
+    let mut search_end = anchor_byte_start;
+    let mut hits = 0usize;
+    while hits < 16 {
+        let Some(pos) = win[..search_end].rfind(anchor) else {
+            break;
+        };
+        hits += 1;
+        let first_end = pos + anchor.len();
+        let after_first = &win[first_end..];
+        let ws_len = after_first.len() - after_first.trim_start().len();
+        let second_x = &after_first[ws_len..];
+        if !second_x.is_empty()
+            && first_end >= second_x.len()
+            && win.is_char_boundary(first_end - second_x.len())
+            && &win[first_end - second_x.len()..first_end] == second_x
+        {
+            let first_start = first_end - second_x.len();
+            let clean_boundary = first_start == 0
+                || !win[..first_start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphanumeric);
+            let unit_chars = second_x.trim().chars().count();
+            if clean_boundary
+                && unit_chars >= min_unit_chars
+                && !is_pure_number_or_divider(second_x)
+            {
+                return Some(win_start + first_end);
+            }
+        }
+        if pos == 0 {
+            break;
+        }
+        search_end = pos;
+    }
+    None
+}
+
+fn trim_contiguous_phrase_repeats(line: &str) -> (String, bool) {
+    let mut cur = line.to_string();
+    let mut changed = false;
+    for _ in 0..8 {
+        if let Some(cut_idx) = find_contiguous_suffix_repeat(&cur, 40) {
+            cur.truncate(cut_idx);
+            cur = cur.trim_end().to_string();
+            changed = true;
+        } else {
+            break;
+        }
+    }
+    (cur, changed)
+}
+
+fn collapse_contiguous_cycles<T>(
+    items: &[T],
+    keys: &[String],
+    min_k1_chars: usize,
+    min_cycle_chars: usize,
+    allow_k1_short_repeat_at_3: usize,
+    skip_fn: impl Fn(&T, usize) -> bool,
+) -> (Vec<usize>, bool) {
+    let mut keep = Vec::with_capacity(items.len());
+    let mut changed = false;
+    let mut i = 0usize;
+
+    while i < items.len() {
+        let mut matched_cycle: Option<(usize, usize)> = None;
+        let max_k = (items.len() - i) / 2;
+        for k in 1..=max_k {
+            if keys[i..i + k] != keys[i + k..i + 2 * k] {
+                continue;
+            }
+            let valid = if k == 1 {
+                let len = keys[i].chars().count();
+                if skip_fn(&items[i], len) {
+                    false
+                } else if len >= min_k1_chars {
+                    true
+                } else if allow_k1_short_repeat_at_3 > 0 && len >= allow_k1_short_repeat_at_3 {
+                    i + 2 < items.len() && keys[i] == keys[i + 2]
+                } else {
+                    false
+                }
+            } else {
+                let total_chars: usize = keys[i..i + k].iter().map(|s| s.chars().count()).sum();
+                total_chars >= min_cycle_chars
+            };
+            if valid {
+                let mut rep_end = i + 2 * k;
+                while rep_end + k <= items.len() && keys[i..i + k] == keys[rep_end..rep_end + k] {
+                    rep_end += k;
+                }
+                matched_cycle = Some((k, rep_end));
+                break;
+            }
+        }
+
+        if let Some((k, rep_end)) = matched_cycle {
+            for idx in i..i + k {
+                keep.push(idx);
+            }
+            i = rep_end;
+            changed = true;
+        } else {
+            keep.push(i);
+            i += 1;
+        }
+    }
+
+    (keep, changed)
+}
+
+fn deduplicate_line_sentences(line: &str) -> (String, bool) {
+    let spans = split_sentence_spans(line);
+    if spans.len() < 2 {
+        return trim_contiguous_phrase_repeats(line);
+    }
+
+    let sentences: Vec<&str> = spans.iter().map(|&(s, e)| &line[s..e]).collect();
+    let keys: Vec<String> = sentences.iter().map(|s| normalize_prose_key(s)).collect();
+
+    let (cycle_kept_idxs, mut changed) = collapse_contiguous_cycles(
+        &sentences,
+        &keys,
+        40,
+        40,
+        15,
+        |s, c| is_protected_boilerplate_short_item(s, c),
+    );
+
+    let mut seen_substantial: HashSet<String> = HashSet::new();
+    let mut kept_texts: Vec<String> = Vec::with_capacity(cycle_kept_idxs.len());
+    for idx in cycle_kept_idxs {
+        let key = &keys[idx];
+        let chars = key.chars().count();
+        if chars >= 50 && !is_protected_boilerplate_short_item(sentences[idx], chars) {
+            if !seen_substantial.insert(key.clone()) {
+                changed = true;
+                continue;
+            }
+        }
+        kept_texts.push(sentences[idx].to_string());
+    }
+
+    // Drop trailing partial sentence repetition if it starts an earlier kept sentence.
+    if kept_texts.len() >= 2 {
+        let last_key = normalize_prose_key(kept_texts.last().unwrap());
+        let last_chars = last_key.chars().count();
+        let min_prefix_chars = if changed { 25 } else { 40 };
+        if last_chars >= min_prefix_chars
+            && kept_texts[..kept_texts.len() - 1]
+                .iter()
+                .any(|prev| normalize_prose_key(prev).starts_with(&last_key))
+        {
+            kept_texts.pop();
+            changed = true;
+        }
+    }
+
+    let joined = if changed {
+        kept_texts.join(" ")
+    } else {
+        line.to_string()
+    };
+    let (final_line, phrase_changed) = trim_contiguous_phrase_repeats(&joined);
+    (final_line, changed || phrase_changed)
+}
+
+fn deduplicate_paragraph_lines(para: &str) -> (String, bool) {
+    let raw_lines: Vec<&str> = para.lines().map(|l| l.trim_end_matches('\r')).collect();
+    let mut changed = false;
+
+    let keys: Vec<String> = raw_lines.iter().map(|l| normalize_prose_key(l)).collect();
+    let (cycle_idxs, cycle_changed) = collapse_contiguous_cycles(
+        &raw_lines,
+        &keys,
+        40,
+        40,
+        20,
+        |l, c| is_protected_boilerplate_short_item(l, c),
+    );
+    if cycle_changed {
+        changed = true;
+    }
+
+    let mut seen_substantial: HashSet<String> = HashSet::new();
+    let mut cleaned_lines: Vec<String> = Vec::with_capacity(cycle_idxs.len());
+    for idx in cycle_idxs {
+        let line = raw_lines[idx];
+        let key = &keys[idx];
+        let chars = key.chars().count();
+        let is_indented_code_like = line.starts_with("    ") || line.starts_with('\t');
+        if chars >= 50
+            && !is_indented_code_like
+            && !is_protected_boilerplate_short_item(line, chars)
+        {
+            if !seen_substantial.insert(key.clone()) {
+                changed = true;
+                continue;
+            }
+        }
+        if !is_indented_code_like && !is_markdown_table_row(line) {
+            let (deduped_line, line_changed) = deduplicate_line_sentences(line);
+            if line_changed {
+                changed = true;
+            }
+            if !deduped_line.trim().is_empty() || line.trim().is_empty() {
+                cleaned_lines.push(deduped_line);
+            }
+        } else {
+            cleaned_lines.push(line.to_string());
+        }
+    }
+
+    if cleaned_lines.len() >= 2 {
+        let last_key = normalize_prose_key(cleaned_lines.last().unwrap());
+        let last_chars = last_key.chars().count();
+        let min_prefix_chars = if changed { 25 } else { 40 };
+        if last_chars >= min_prefix_chars
+            && cleaned_lines[..cleaned_lines.len() - 1]
+                .iter()
+                .any(|prev| normalize_prose_key(prev).starts_with(&last_key))
+        {
+            cleaned_lines.pop();
+            changed = true;
+        }
+    }
+
+    if changed {
+        (cleaned_lines.join("\n"), true)
+    } else {
+        (para.to_string(), false)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProseBlock {
+    text: String,
+    preceded_by_spurious_header: bool,
+}
+
+fn split_paragraph_on_spurious_headers(para: &str) -> (Vec<(String, bool)>, bool) {
+    let mut subblocks: Vec<(Vec<String>, bool)> = Vec::new();
+    let mut cur_lines: Vec<String> = Vec::new();
+    let mut cur_header = false;
+    let mut any_stripped = false;
+
+    for raw_line in para.lines() {
+        let clean_raw = raw_line.trim_end_matches('\r');
+        let (segments, stripped) = strip_spurious_greeting_segments_from_line(clean_raw);
+        if stripped {
+            any_stripped = true;
+        }
+        if segments.is_empty() && stripped {
+            if !cur_lines.is_empty() {
+                subblocks.push((std::mem::take(&mut cur_lines), cur_header));
+            }
+            cur_header = true;
+            continue;
+        }
+        for (seg_text, seg_had_header) in segments {
+            if seg_had_header {
+                if !cur_lines.is_empty() {
+                    subblocks.push((std::mem::take(&mut cur_lines), cur_header));
+                }
+                cur_header = true;
+            }
+            if !seg_text.trim().is_empty() {
+                cur_lines.push(seg_text);
+            }
+        }
+    }
+    if !cur_lines.is_empty() {
+        subblocks.push((cur_lines, cur_header));
+    }
+
+    let out = subblocks
+        .into_iter()
+        .map(|(lines, header)| (lines.join("\n"), header))
+        .collect();
+    (out, any_stripped)
+}
+
+fn collect_prose_blocks(prose: &str) -> (Vec<ProseBlock>, bool) {
+    let raw_blocks = split_blank_line_blocks(prose);
+    let mut blocks = Vec::with_capacity(raw_blocks.len());
+    let mut pending_header = false;
+    let mut any_changed = false;
+
+    for raw in raw_blocks {
+        let (subblocks, had_any_header) = split_paragraph_on_spurious_headers(raw);
+        if had_any_header {
+            any_changed = true;
+        }
+        if subblocks.is_empty() {
+            if had_any_header {
+                pending_header = true;
+            }
+            continue;
+        }
+        for (idx, (stripped, sub_header)) in subblocks.into_iter().enumerate() {
+            let (cleaned, line_changed) = deduplicate_paragraph_lines(&stripped);
+            if line_changed {
+                any_changed = true;
+            }
+            if !cleaned.trim().is_empty() {
+                let header_flag = sub_header || (idx == 0 && pending_header);
+                blocks.push(ProseBlock {
+                    text: cleaned,
+                    preceded_by_spurious_header: header_flag,
+                });
+                pending_header = false;
+            } else if sub_header {
+                pending_header = true;
+            }
+        }
+    }
+
+    (blocks, any_changed)
+}
+
+fn deduplicate_prose_segment(
+    prose: &str,
+    seen_counts: &mut HashSet<(String, bool)>,
+    seen_all_keys: &mut Vec<String>,
+    seen_substantial_keys: &mut Vec<String>,
+    had_global_dup: &mut bool,
+    has_prev_segment: bool,
+    has_next_segment: bool,
+) -> (String, bool) {
+    let (blocks, mut any_changed) = collect_prose_blocks(prose);
+    if blocks.is_empty() {
+        if any_changed {
+            return (String::new(), true);
+        }
+        return (prose.to_string(), false);
+    }
+
+    let keys: Vec<String> = blocks.iter().map(|b| normalize_prose_key(&b.text)).collect();
+    let (cycle_idxs, cycle_changed) = collapse_contiguous_cycles(
+        &blocks,
+        &keys,
+        15,
+        40,
+        8,
+        |b, c| !b.preceded_by_spurious_header && is_protected_boilerplate_short_item(&b.text, c),
+    );
+    if cycle_changed {
+        any_changed = true;
+        *had_global_dup = true;
+    }
+
+    let mut kept_blocks: Vec<ProseBlock> = Vec::with_capacity(cycle_idxs.len());
+    for idx in cycle_idxs {
+        let b = &blocks[idx];
+        let key = &keys[idx];
+        let chars = key.chars().count();
+        let is_short_boilerplate =
+            !b.preceded_by_spurious_header && is_protected_boilerplate_short_item(&b.text, chars);
+
+        let dup_due_to_header = b.preceded_by_spurious_header && seen_all_keys.contains(key);
+        let dup_first_repeat = !is_short_boilerplate && chars >= 40 && seen_all_keys.contains(key);
+        let dup_third_repeat =
+            !is_short_boilerplate && chars >= 20 && seen_counts.contains(&(key.clone(), true));
+        let dup_near = !is_short_boilerplate
+            && seen_substantial_keys
+                .iter()
+                .any(|prev| are_near_identical_paragraphs(prev, key));
+
+        if dup_due_to_header || dup_first_repeat || dup_third_repeat || dup_near {
+            any_changed = true;
+            *had_global_dup = true;
+            continue;
+        }
+
+        if !seen_counts.insert((key.clone(), false)) {
+            seen_counts.insert((key.clone(), true));
+        }
+        seen_all_keys.push(key.clone());
+        if chars >= 80 && !is_short_boilerplate {
+            seen_substantial_keys.push(key.clone());
+        }
+        kept_blocks.push(b.clone());
+    }
+
+    if !kept_blocks.is_empty() && !has_next_segment {
+        let last_key = normalize_prose_key(&kept_blocks.last().unwrap().text);
+        let last_chars = last_key.chars().count();
+        let last_spurious = kept_blocks.last().unwrap().preceded_by_spurious_header;
+        let min_prefix_chars = if *had_global_dup || last_spurious {
+            25
+        } else {
+            40
+        };
+        let is_bullet = is_protected_boilerplate_short_item(
+            &kept_blocks.last().unwrap().text,
+            last_chars,
+        );
+        if !is_bullet && last_chars >= min_prefix_chars {
+            let earlier_match = seen_all_keys[..seen_all_keys.len().saturating_sub(1)]
+                .iter()
+                .any(|prev| prev.starts_with(&last_key));
+            if earlier_match {
+                kept_blocks.pop();
+                any_changed = true;
+                *had_global_dup = true;
+            }
+        }
+    }
+
+    if !any_changed {
+        return (prose.to_string(), false);
+    }
+
+    let joined: String = kept_blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if joined.is_empty() {
+        return (String::new(), true);
+    }
+
+    let mut out = String::new();
+    if has_prev_segment && prose.starts_with('\n') {
+        if prose.starts_with("\n\n") || prose.starts_with("\r\n\r\n") {
+            out.push_str("\n\n");
+        } else {
+            out.push('\n');
+        }
+    }
+    out.push_str(&joined);
+    if has_next_segment && prose.ends_with('\n') {
+        if prose.ends_with("\n\n") || prose.ends_with("\r\n\r\n") {
+            out.push_str("\n\n");
+        } else {
+            out.push('\n');
+        }
+    }
+    (out, true)
+}
+
+/// Removes verbatim repeated prose loops and leaked self-addressed agent greeting
+/// headers (such as `"Got it, Commander! Doing it again:"`) while preserving
+/// `<think>...</think>`, `<seed:think>...</seed:think>`, `<tool_call>...</tool_call>`,
+/// and fenced code blocks (` ``` ` / `~~~`) verbatim untouched.
+pub fn truncate_verbatim_prose_loops(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let segments = split_protected_segments(input);
+    let has_protected = segments
+        .iter()
+        .any(|seg| matches!(seg, OutputSegment::Protected(_)));
+
+    let mut seen_counts: HashSet<(String, bool)> = HashSet::new();
+    let mut seen_all_keys: Vec<String> = Vec::new();
+    let mut seen_substantial_keys: Vec<String> = Vec::new();
+    let mut had_global_dup = false;
+
+    let mut rendered: Vec<(bool, String)> = Vec::with_capacity(segments.len());
+    let mut any_changed = false;
+
+    for (idx, seg) in segments.iter().enumerate() {
+        match seg {
+            OutputSegment::Protected(raw) => {
+                rendered.push((true, (*raw).to_string()));
+            }
+            OutputSegment::Prose(raw) => {
+                let has_prev = idx > 0;
+                let has_next = idx + 1 < segments.len();
+                let (cleaned, changed) = deduplicate_prose_segment(
+                    raw,
+                    &mut seen_counts,
+                    &mut seen_all_keys,
+                    &mut seen_substantial_keys,
+                    &mut had_global_dup,
+                    has_prev,
+                    has_next,
+                );
+                if changed {
+                    any_changed = true;
+                }
+                rendered.push((false, cleaned));
+            }
+        }
+    }
+
+    if !any_changed {
+        return input.to_string();
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut prev_emitted_non_empty = false;
+    for (idx, (is_protected, text)) in rendered.iter().enumerate() {
+        if text.is_empty() {
+            // If all prose between two protected segments was stripped, keep a blank line separator.
+            if prev_emitted_non_empty
+                && idx + 1 < rendered.len()
+                && rendered[idx + 1].0
+                && !out.ends_with("\n\n")
+            {
+                if out.ends_with('\n') {
+                    out.push('\n');
+                } else {
+                    out.push_str("\n\n");
+                }
+            }
+            continue;
+        }
+        if *is_protected && prev_emitted_non_empty && !out.ends_with('\n') && !text.starts_with('\n')
+        {
+            out.push_str("\n\n");
+        }
+        out.push_str(text);
+        prev_emitted_non_empty = true;
+    }
+
+    if rendered
+        .last()
+        .is_some_and(|(is_prot, text)| !is_prot && text.is_empty())
+    {
+        while out.ends_with(['\r', '\n']) {
+            out.pop();
+        }
+    }
+
+    if !has_protected && out.trim().is_empty() {
+        return input.to_string();
+    }
+
+    out
+}
+
+/// Alias for [`truncate_verbatim_prose_loops`].
+pub fn deduplicate_repeated_prose_blocks(input: &str) -> String {
+    truncate_verbatim_prose_loops(input)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamingLoopDecision {
+    Continue,
+    AbortRepeatedLoop { truncated_clean_visible: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GuardTagMode {
+    #[default]
+    Normal,
+    InThink(ThinkVariant),
+    InToolCall,
+}
+
+/// Incremental SSE prose loop detector that monitors visible non-thinking,
+/// non-`<tool_call>`, outside-fenced-code-block text across streamed deltas
+/// and aborts verbatim repetition loops early with clean pre-loop visible text.
+#[derive(Debug, Clone, Default)]
+pub struct StreamingRepetitionGuard {
+    visible_acc: String,
+    prose_acc: String,
+    tag_pending: String,
+    tag_mode: GuardTagMode,
+    line_buf: String,
+    line_flushed_len: usize,
+    in_fence: Option<(u8, usize)>,
+    aborted_clean: Option<String>,
+}
+
+impl StreamingRepetitionGuard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn visible_so_far(&self) -> &str {
+        &self.visible_acc
+    }
+
+    pub fn push_delta(&mut self, delta: &str) -> StreamingLoopDecision {
+        if let Some(ref clean) = self.aborted_clean {
+            return StreamingLoopDecision::AbortRepeatedLoop {
+                truncated_clean_visible: clean.clone(),
+            };
+        }
+        if delta.is_empty() {
+            return StreamingLoopDecision::Continue;
+        }
+
+        self.tag_pending.push_str(delta);
+        self.drain_tag_pending(false);
+
+        self.evaluate_repetition()
+    }
+
+    pub fn finish(&mut self) -> StreamingLoopDecision {
+        if let Some(ref clean) = self.aborted_clean {
+            return StreamingLoopDecision::AbortRepeatedLoop {
+                truncated_clean_visible: clean.clone(),
+            };
+        }
+        self.drain_tag_pending(true);
+        self.flush_line_buf_eof();
+        self.evaluate_repetition()
+    }
+
+    fn evaluate_repetition(&mut self) -> StreamingLoopDecision {
+        if let Some(ref clean) = self.aborted_clean {
+            return StreamingLoopDecision::AbortRepeatedLoop {
+                truncated_clean_visible: clean.clone(),
+            };
+        }
+        if self.detect_prose_repetition() {
+            let truncated = truncate_verbatim_prose_loops(&self.visible_acc)
+                .trim()
+                .to_string();
+            self.aborted_clean = Some(truncated.clone());
+            return StreamingLoopDecision::AbortRepeatedLoop {
+                truncated_clean_visible: truncated,
+            };
+        }
+        StreamingLoopDecision::Continue
+    }
+
+    fn drain_tag_pending(&mut self, flush_all: bool) {
+        loop {
+            match self.tag_mode {
+                GuardTagMode::InThink(variant) => {
+                    let close_tag = variant.close_tag();
+                    if let Some(idx) = find_ci(&self.tag_pending, close_tag, 0) {
+                        self.tag_pending.drain(..idx + close_tag.len());
+                        self.tag_mode = GuardTagMode::Normal;
+                        continue;
+                    }
+                    if flush_all {
+                        self.tag_pending.clear();
+                        self.tag_mode = GuardTagMode::Normal;
+                    } else {
+                        let hold = partial_tag_suffix_len(&self.tag_pending, close_tag);
+                        let drop_len = self.tag_pending.len() - hold;
+                        if drop_len > 0 {
+                            self.tag_pending.drain(..drop_len);
+                        }
+                    }
+                    break;
+                }
+                GuardTagMode::InToolCall => {
+                    let close_tag = "</tool_call>";
+                    if let Some(idx) = find_ci(&self.tag_pending, close_tag, 0) {
+                        let end = idx + close_tag.len();
+                        self.visible_acc.push_str(&self.tag_pending[..end]);
+                        self.tag_pending.drain(..end);
+                        self.tag_mode = GuardTagMode::Normal;
+                        self.push_prose_boundary();
+                        continue;
+                    }
+                    if flush_all {
+                        self.visible_acc.push_str(&self.tag_pending);
+                        self.tag_pending.clear();
+                        self.tag_mode = GuardTagMode::Normal;
+                        self.push_prose_boundary();
+                    } else {
+                        let hold = partial_tag_suffix_len(&self.tag_pending, close_tag);
+                        let emit_len = self.tag_pending.len() - hold;
+                        if emit_len > 0 {
+                            self.visible_acc.push_str(&self.tag_pending[..emit_len]);
+                            self.tag_pending.drain(..emit_len);
+                        }
+                    }
+                    break;
+                }
+                GuardTagMode::Normal => {
+                    if let Some((idx, open_len, kind, _)) = find_earliest_protected_open_tag(
+                        &self.tag_pending,
+                        0,
+                        self.tag_pending.len(),
+                    ) {
+                        if idx > 0 {
+                            let vis = self.tag_pending[..idx].to_string();
+                            self.visible_acc.push_str(&vis);
+                            self.push_visible_chunk(&vis);
+                        }
+                        match kind {
+                            GuardTagKind::Think(variant) => {
+                                self.tag_pending.drain(..idx + open_len);
+                                self.tag_mode = GuardTagMode::InThink(variant);
+                            }
+                            GuardTagKind::ToolCall => {
+                                self.visible_acc
+                                    .push_str(&self.tag_pending[idx..idx + open_len]);
+                                self.tag_pending.drain(..idx + open_len);
+                                self.tag_mode = GuardTagMode::InToolCall;
+                                self.push_prose_boundary();
+                            }
+                        }
+                        continue;
+                    }
+
+                    let hold = if flush_all {
+                        0
+                    } else {
+                        max_partial_tag_suffix_len(&self.tag_pending, &STREAM_GUARD_TAG_OPENS)
+                    };
+                    let emit_len = self.tag_pending.len() - hold;
+                    if emit_len > 0 {
+                        let vis = self.tag_pending[..emit_len].to_string();
+                        self.tag_pending.drain(..emit_len);
+                        self.visible_acc.push_str(&vis);
+                        self.push_visible_chunk(&vis);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn push_prose_boundary(&mut self) {
+        if self.in_fence.is_none() && self.line_flushed_len < self.line_buf.len() {
+            if !could_be_fence_open_prefix(&self.line_buf) {
+                self.prose_acc
+                    .push_str(&self.line_buf[self.line_flushed_len..]);
+            }
+            self.line_buf.clear();
+            self.line_flushed_len = 0;
+        }
+        if !self.prose_acc.is_empty() && !self.prose_acc.ends_with(PROSE_BOUNDARY_MARKER) {
+            self.prose_acc.push(PROSE_BOUNDARY_MARKER);
+        }
+    }
+
+    fn flush_line_buf_eof(&mut self) {
+        if self.in_fence.is_none() && self.line_flushed_len < self.line_buf.len() {
+            if !could_be_fence_open_prefix(&self.line_buf) {
+                self.prose_acc
+                    .push_str(&self.line_buf[self.line_flushed_len..]);
+            }
+        }
+        self.line_buf.clear();
+        self.line_flushed_len = 0;
+    }
+
+    fn push_visible_chunk(&mut self, chunk: &str) {
+        for piece in chunk.split_inclusive('\n') {
+            let ends_nl = piece.ends_with('\n');
+            let body = if ends_nl {
+                &piece[..piece.len() - 1]
+            } else {
+                piece
+            };
+            self.line_buf.push_str(body);
+
+            if ends_nl {
+                if let Some((fchar, open_len)) = self.in_fence {
+                    if is_fence_close(&self.line_buf, fchar, open_len) {
+                        self.in_fence = None;
+                        self.push_prose_boundary();
+                    }
+                } else if let Some((fchar, open_len)) = parse_fence_open(&self.line_buf) {
+                    self.in_fence = Some((fchar, open_len));
+                    self.push_prose_boundary();
+                } else {
+                    self.prose_acc
+                        .push_str(&self.line_buf[self.line_flushed_len..]);
+                    self.prose_acc.push('\n');
+                }
+                self.line_buf.clear();
+                self.line_flushed_len = 0;
+            } else if self.in_fence.is_none() && !could_be_fence_open_prefix(&self.line_buf) {
+                self.prose_acc
+                    .push_str(&self.line_buf[self.line_flushed_len..]);
+                self.line_flushed_len = self.line_buf.len();
+            }
+        }
+    }
+
+    fn detect_prose_repetition(&self) -> bool {
+        let runs: Vec<&str> = self
+            .prose_acc
+            .split(PROSE_BOUNDARY_MARKER)
+            .filter(|r| !r.trim().is_empty())
+            .collect();
+        if runs.is_empty() {
+            return false;
+        }
+
+        // 1. Consecutive repeated non-empty lines (>= 3 consecutive repeats of >= 20 chars)
+        let mut non_empty_lines: Vec<String> = Vec::new();
+        for run in &runs {
+            for line in run.lines() {
+                let key = normalize_prose_key(line);
+                if !key.is_empty() {
+                    non_empty_lines.push(key);
+                }
+            }
+        }
+        if has_consecutive_repeated_keys(&non_empty_lines, 3, 20) {
+            return true;
+        }
+
+        // 2. Substantial repeated paragraph / multi-paragraph cycle (>= 2 repeats of >= 40 chars)
+        let mut raw_paras: Vec<(String, bool)> = Vec::new();
+        let mut cleaned_paras: Vec<(String, bool)> = Vec::new();
+        for (r_idx, run) in runs.iter().enumerate() {
+            let is_last_run = r_idx + 1 == runs.len();
+            let ends_blank = run.ends_with("\n\n") || run.ends_with("\r\n\r\n");
+            let blocks = split_blank_line_blocks(run);
+            for (b_idx, block) in blocks.iter().enumerate() {
+                let is_complete = !(is_last_run && b_idx + 1 == blocks.len() && !ends_blank);
+                let raw_key = normalize_prose_key(block);
+                if !raw_key.is_empty() && !is_protected_boilerplate_short_item(block, raw_key.chars().count()) {
+                    raw_paras.push((raw_key, is_complete));
+                }
+                let (stripped, _) = strip_spurious_headers_in_paragraph(block);
+                let clean_key = normalize_prose_key(&stripped);
+                if !clean_key.is_empty()
+                    && !is_protected_boilerplate_short_item(&stripped, clean_key.chars().count())
+                {
+                    cleaned_paras.push((clean_key, is_complete));
+                }
+            }
+        }
+        if has_repeated_substantial_units(&raw_paras, 40)
+            || has_repeated_substantial_units(&cleaned_paras, 40)
+        {
+            return true;
+        }
+
+        // 3. Repeated complete sentences (>= 2 repeats of >= 40 chars, or >= 3 consecutive >= 20)
+        let mut all_sentences: Vec<(String, bool)> = Vec::new();
+        for run in &runs {
+            for raw_line in run.lines() {
+                let line = raw_line.trim_end_matches('\r');
+                if is_markdown_table_row(line) {
+                    continue;
+                }
+                let spans = split_sentence_spans(line);
+                for (s_idx, &(st, en)) in spans.iter().enumerate() {
+                    let s = &line[st..en];
+                    let terminated = s.ends_with(['.', '!', '?']) || s_idx + 1 < spans.len();
+                    let key = normalize_prose_key(s);
+                    if !key.is_empty() && !is_protected_boilerplate_short_item(s, key.chars().count()) {
+                        all_sentences.push((key, terminated));
+                    }
+                }
+            }
+        }
+        let sentence_keys: Vec<String> = all_sentences.iter().map(|(k, _)| k.clone()).collect();
+        if has_consecutive_repeated_keys(&sentence_keys, 3, 20)
+            || has_repeated_substantial_units(&all_sentences, 40)
+        {
+            return true;
+        }
+
+        // 4. Contiguous verbatim suffix repeat (catches run-on/same-line loops >= 40 chars immediately)
+        if let Some(last_run) = runs.last() {
+            if find_contiguous_suffix_repeat(last_run, 40).is_some() {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+fn has_consecutive_repeated_keys(keys: &[String], required_repeats: usize, min_chars: usize) -> bool {
+    if keys.len() < required_repeats {
+        return false;
+    }
+    let mut streak = 1usize;
+    for i in 1..keys.len() {
+        if !keys[i].is_empty() && keys[i] == keys[i - 1] {
+            streak += 1;
+            if streak >= required_repeats
+                && keys[i].chars().count() >= min_chars
+                && !is_pure_number_or_divider(&keys[i])
+            {
+                return true;
+            }
+        } else {
+            streak = 1;
+        }
+    }
+    false
+}
+
+fn has_repeated_substantial_units(units: &[(String, bool)], min_chars: usize) -> bool {
+    if units.len() < 2 {
+        return false;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (key, is_complete) in units {
+        let chars = key.chars().count();
+        if chars >= min_chars && !is_pure_number_or_divider(key) {
+            if seen.contains(key.as_str()) {
+                return true;
+            }
+            if *is_complete {
+                seen.insert(key.as_str());
+            }
+        }
+    }
+
+    let keys: Vec<&str> = units.iter().map(|(k, _)| k.as_str()).collect();
+    for i in 0..keys.len() {
+        let max_k = (keys.len() - i) / 2;
+        for k in 2..=max_k {
+            if keys[i..i + k] == keys[i + k..i + 2 * k] {
+                let total_chars: usize = keys[i..i + k].iter().map(|s| s.chars().count()).sum();
+                if total_chars >= min_chars {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1225,5 +2723,288 @@ mod tests {
         assert_eq!(norm[0].role, "system");
         assert_eq!(norm[1].role, "user");
         assert_eq!(norm[1].content, "first real user");
+    }
+
+    #[test]
+    fn normalize_conversation_messages_strips_non_tool_names_and_preserves_tool_name() {
+        let tc = ToolCallRequest {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "src/lib.rs"}),
+        };
+        let msgs = vec![
+            InferenceMessage {
+                role: "user".into(),
+                content: "u1".into(),
+                name: Some("commander".into()),
+                ..Default::default()
+            },
+            InferenceMessage {
+                role: "user".into(),
+                content: "u2".into(),
+                name: Some("commander".into()),
+                ..Default::default()
+            },
+            InferenceMessage {
+                role: "assistant".into(),
+                content: "Checking now.".into(),
+                name: Some("commander".into()),
+                tool_calls: Some(vec![tc]),
+                ..Default::default()
+            },
+            InferenceMessage {
+                role: "tool".into(),
+                content: "ok".into(),
+                tool_call_id: Some("call_1".into()),
+                name: Some("read_file".into()),
+                ..Default::default()
+            },
+            InferenceMessage {
+                role: "assistant".into(),
+                content: "part 1".into(),
+                name: Some("commander".into()),
+                ..Default::default()
+            },
+            InferenceMessage {
+                role: "assistant".into(),
+                content: "part 2".into(),
+                name: Some("analyst".into()),
+                ..Default::default()
+            },
+        ];
+
+        let norm = normalize_conversation_messages(&msgs, false);
+        assert_eq!(norm.len(), 4);
+        assert_eq!(norm[0].role, "user");
+        assert!(norm[0].name.is_none());
+        assert_eq!(norm[1].role, "assistant");
+        assert!(norm[1].name.is_none());
+        assert_eq!(norm[2].role, "tool");
+        assert_eq!(norm[2].name.as_deref(), Some("read_file"));
+        assert_eq!(norm[3].role, "assistant");
+        assert!(norm[3].name.is_none());
+        assert_eq!(norm[3].content, "part 1\n\npart 2");
+    }
+
+    #[test]
+    fn truncate_verbatim_prose_loops_collapses_doing_it_again_commander_loop() {
+        let body = "I checked crates/ps5-agent-inference/src/parser.rs and fixed the normalization path.";
+        let looped_all = format!(
+            "Got it, Commander! Doing it again:\n\n{body}\n\n\
+             Got it, Commander! Doing it again:\n\n{body}\n\n\
+             Got it, Commander! Doing it again:\n\n{body}"
+        );
+        assert_eq!(truncate_verbatim_prose_loops(&looped_all), body);
+        assert_eq!(deduplicate_repeated_prose_blocks(&looped_all), body);
+
+        // Also test via parse_model_output with leading <think>
+        let with_think = format!("<think>checking</think>\n{looped_all}");
+        let parsed = parse_model_output(&with_think, None, vec![]);
+        assert_eq!(parsed.reasoning.as_deref(), Some("checking"));
+        assert_eq!(parsed.content, body);
+
+        // First copy clean, subsequent loops prefixed by leaked header
+        let looped_tail = format!(
+            "{body}\n\nGot it, Commander! Doing it again:\n\n{body}\n\n\
+             Got it, Commander! Doing it again:\n\n{body}"
+        );
+        assert_eq!(truncate_verbatim_prose_loops(&looped_tail), body);
+    }
+
+    #[test]
+    fn truncate_verbatim_prose_loops_collapses_hearing_you_commander_loop() {
+        let spaced = "Got it, Commander! Hearing you:\nHey there! How can I help you today?\n\n\
+             Got it, Commander! Hearing you:\nHey there! How can I help you today?\n\n\
+             Got it, Commander! Hearing you:\nHey there! How can I help you today?";
+        assert_eq!(
+            truncate_verbatim_prose_loops(spaced),
+            "Hey there! How can I help you today?"
+        );
+
+        let tight = "Got it, Commander! Hearing you:\nHey there! How can I help you today?\n\
+             Got it, Commander! Hearing you:\nHey there! How can I help you today?\n\
+             Got it, Commander! Hearing you:\nHey there! How can I help you today?";
+        assert_eq!(
+            truncate_verbatim_prose_loops(tight),
+            "Hey there! How can I help you today?"
+        );
+    }
+
+    #[test]
+    fn truncate_verbatim_prose_loops_preserves_fenced_code_think_tool_call_and_short_items() {
+        let code_and_tags = "<think>step one\nstep one\nstep one</think>\n\n\
+Here are the assertions:\n\n\
+```rust\n\
+assert_eq!(tick(), 1);\n\
+assert_eq!(tick(), 1);\n\
+assert_eq!(tick(), 1);\n\
+assert_eq!(tick(), 1);\n\
+```\n\n\
+~~~python\n\
+print(\"ping\")\n\
+print(\"ping\")\n\
+print(\"ping\")\n\
+~~~\n\n\
+- OK\n\
+- OK\n\n\
+<tool_call>\n{\"name\":\"echo\",\"arguments\":{\"msg\":\"repeat repeat\"}}\n</tool_call>";
+        assert_eq!(truncate_verbatim_prose_loops(code_and_tags), code_and_tags);
+
+        // Normal conversational greetings and numeric variants must stay intact
+        let normal_conv = "Got it! Here is your script.\n\n\
+Got it, thanks!\n\n\
+Option A listens on port 8080 with local HTTP proxy enabled and caches requests safely.\n\n\
+Option A listens on port 9090 with local HTTP proxy enabled and caches requests safely.";
+        assert_eq!(truncate_verbatim_prose_loops(normal_conv), normal_conv);
+
+        // Standalone greeting without body must not erase into emptiness
+        assert_eq!(
+            truncate_verbatim_prose_loops("Got it, Commander!"),
+            "Got it, Commander!"
+        );
+    }
+
+    #[test]
+    fn truncate_verbatim_prose_loops_handles_repeated_lines_and_polish_utf8() {
+        let polish_lines = "Sprawdzam konfigurację serwera w mieście łódź!\n\
+                            Sprawdzam konfigurację serwera w mieście łódź!\n\
+                            Sprawdzam konfigurację serwera w mieście łódź!";
+        assert_eq!(
+            truncate_verbatim_prose_loops(polish_lines),
+            "Sprawdzam konfigurację serwera w mieście łódź!"
+        );
+
+        // Two short 22-char lines without spurious header stay intact (< 3 lines and < 40 chars)
+        let two_short = "Krótka linia testowa 1\nKrótka linia testowa 1";
+        assert_eq!(truncate_verbatim_prose_loops(two_short), two_short);
+
+        // Repeated substantial block wrapped around a fenced code block cleans the duplicate prose
+        let mixed = "Got it, Commander! Doing it again:\n\nUse this config:\n\n\
+```toml\nline = 1\nline = 1\nline = 1\n```\n\n\
+Got it, Commander! Doing it again:\n\nUse this config:";
+        let expected = "Use this config:\n\n```toml\nline = 1\nline = 1\nline = 1\n```";
+        assert_eq!(truncate_verbatim_prose_loops(mixed), expected);
+    }
+
+    #[test]
+    fn streaming_repetition_guard_triggers_incrementally_and_skips_code_fences() {
+        // 1. Incremental trigger across small chunks with <think> and fenced code block intact
+        let stream_payload = concat!(
+            "<thi",
+            "nk>hidden loop phrase hidden loop phrase\n",
+            "hidden loop phrase hidden loop phrase</th",
+            "ink>",
+            "Here is the working handler:\n\n",
+            "```ru",
+            "st\n",
+            "tick(); // repeated line inside code fence >= 40 chars here\n",
+            "tick(); // repeated line inside code fence >= 40 chars here\n",
+            "tick(); // repeated line inside code fence >= 40 chars here\n",
+            "```\n\n",
+            "Got it, Commander! Doing it again:\n\n",
+            "The diagnostic summary for PS5LM is ready with Polish łódź verification.\n\n",
+            "Got it, Commander! Doing it again:\n\n",
+            "The diagnostic summary for PS5LM is ready with Polish łódź verification."
+        );
+
+        let mut guard = StreamingRepetitionGuard::new();
+        let mut aborted: Option<String> = None;
+        for ch in stream_payload.chars() {
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            if let StreamingLoopDecision::AbortRepeatedLoop {
+                truncated_clean_visible,
+            } = guard.push_delta(s)
+            {
+                aborted = Some(truncated_clean_visible);
+                break;
+            }
+        }
+        let cleaned = aborted.expect("repetition guard should abort on repeated visible block");
+        assert!(!cleaned.contains("<think>"));
+        assert!(!cleaned.contains("hidden loop phrase"));
+        assert!(cleaned.contains("```rust\ntick();"));
+        assert_eq!(
+            cleaned.matches("The diagnostic summary for PS5LM is ready with Polish łódź verification.").count(),
+            1
+        );
+
+        // 2. Repeated lines inside a fenced code block ONLY must never abort
+        let mut fence_guard = StreamingRepetitionGuard::new();
+        let code_only = "Summary:\n\n```rust\n\
+            println!(\"This repeated code line is well over forty characters long\");\n\
+            println!(\"This repeated code line is well over forty characters long\");\n\
+            println!(\"This repeated code line is well over forty characters long\");\n\
+            println!(\"This repeated code line is well over forty characters long\");\n\
+            ```\nDone.";
+        for ch in code_only.chars() {
+            let mut buf = [0u8; 4];
+            assert_eq!(
+                fence_guard.push_delta(ch.encode_utf8(&mut buf)),
+                StreamingLoopDecision::Continue
+            );
+        }
+        assert_eq!(fence_guard.finish(), StreamingLoopDecision::Continue);
+
+        // 3. 3 consecutive repeated visible lines >= 20 chars triggers, while 2 does not
+        let mut line_guard = StreamingRepetitionGuard::new();
+        assert_eq!(
+            line_guard.push_delta("Checking status line A\nChecking status line A\n"),
+            StreamingLoopDecision::Continue
+        );
+        match line_guard.push_delta("Checking status line A\n") {
+            StreamingLoopDecision::AbortRepeatedLoop {
+                truncated_clean_visible,
+            } => {
+                assert_eq!(truncated_clean_visible, "Checking status line A");
+            }
+            StreamingLoopDecision::Continue => panic!("expected 3rd repeated line to abort"),
+        }
+
+        // 4. <tool_call> and <seed:think> across split chunks stay untouched and do not false-trigger
+        let mut tool_guard = StreamingRepetitionGuard::new();
+        let tool_stream = [
+            "<seed:th",
+            "ink>plan repeat plan repeat\nplan repeat plan repeat</seed:th",
+            "ink><tool_",
+            "call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>",
+            "Checking now.",
+        ];
+        for chunk in tool_stream {
+            assert_eq!(tool_guard.push_delta(chunk), StreamingLoopDecision::Continue);
+        }
+        assert_eq!(tool_guard.finish(), StreamingLoopDecision::Continue);
+        assert_eq!(
+            tool_guard.visible_so_far(),
+            "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>Checking now."
+        );
+    }
+
+    #[test]
+    fn truncate_verbatim_prose_loops_handles_cycles_inline_and_near_identical() {
+        // Inline leaked header after sentence punctuation
+        let inline = "Got it, Commander! Doing it again: The system check succeeded. \
+                      Got it, Commander! Doing it again: The system check succeeded.";
+        assert_eq!(
+            truncate_verbatim_prose_loops(inline),
+            "The system check succeeded."
+        );
+
+        // Two-paragraph A-B-A-B cycle
+        let abab = "Paragraph Alpha explains the first requirement cleanly.\n\n\
+                    Paragraph Beta explains the second requirement cleanly.\n\n\
+                    Paragraph Alpha explains the first requirement cleanly.\n\n\
+                    Paragraph Beta explains the second requirement cleanly.";
+        assert_eq!(
+            truncate_verbatim_prose_loops(abab),
+            "Paragraph Alpha explains the first requirement cleanly.\n\n\
+             Paragraph Beta explains the second requirement cleanly."
+        );
+
+        // Near-identical multi-sentence paragraph (>= 12 words, >= 80 chars, same numbers & opening)
+        let p1 = "The verification suite inspected all twelve modules across the workspace and confirmed every check passed cleanly today.";
+        let p2 = "The verification suite inspected all twelve modules across the workspace and confirmed each check passed cleanly now.";
+        let near = format!("{p1}\n\n{p2}");
+        assert_eq!(truncate_verbatim_prose_loops(&near), p1);
     }
 }

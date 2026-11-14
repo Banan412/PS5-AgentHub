@@ -98,11 +98,20 @@ pub fn spawn_signal_handler(system: &AppSystem) {
     }
 }
 
-pub fn cleanup_pid_file(data_dir: &Path) {
+pub fn cleanup_pid_file_for_pid(data_dir: &Path, expected_pid: u32) {
     let pid_path = data_dir.join("ps5-agent.pid");
-    if pid_path.exists() {
-        let _ = std::fs::remove_file(&pid_path);
+    let Ok(raw) = std::fs::read_to_string(&pid_path) else {
+        return;
+    };
+    if let Some((file_pid, _boot_secs)) = crate::startup::parse_pid_file_record(&raw) {
+        if file_pid == expected_pid {
+            let _ = std::fs::remove_file(&pid_path);
+        }
     }
+}
+
+pub fn cleanup_pid_file(data_dir: &Path) {
+    cleanup_pid_file_for_pid(data_dir, std::process::id());
 }
 
 pub fn finalize_shutdown(system: &AppSystem) {
@@ -136,4 +145,39 @@ pub fn finalize_shutdown(system: &AppSystem) {
 
     system.logger.info("shutdown", "PS5 Agent stopped cleanly");
     system.logger.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cleanup_pid_file, cleanup_pid_file_for_pid};
+    use crate::startup::format_pid_file_record;
+    use std::fs;
+
+    #[test]
+    fn cleanup_pid_file_only_unlinks_when_owned_by_current_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = dir.path().join("ps5-agent.pid");
+        let my_pid = std::process::id();
+
+        fs::write(&pid_path, format_pid_file_record(my_pid, Some(1_700_000_500))).expect("write");
+        cleanup_pid_file(dir.path());
+        assert!(!pid_path.exists());
+
+        fs::write(&pid_path, format_pid_file_record(my_pid, None)).expect("write bare");
+        cleanup_pid_file(dir.path());
+        assert!(!pid_path.exists());
+
+        let other_pid = my_pid.saturating_add(1);
+        fs::write(&pid_path, format_pid_file_record(other_pid, Some(1_700_000_500)))
+            .expect("write other");
+        cleanup_pid_file(dir.path());
+        assert!(pid_path.exists());
+
+        cleanup_pid_file_for_pid(dir.path(), other_pid);
+        assert!(!pid_path.exists());
+
+        fs::write(&pid_path, "corrupt-pid\n").expect("write corrupt");
+        cleanup_pid_file(dir.path());
+        assert!(pid_path.exists());
+    }
 }

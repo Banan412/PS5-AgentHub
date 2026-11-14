@@ -30,7 +30,7 @@ fn report_fatal_startup_error(stage: &str, err: &dyn std::fmt::Display) {
         let _ = writeln!(f, "{} [FATAL] [{stage}] {err}", now_iso());
     }
 
-    eprintln!("{stage}: {err}");
+    let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{stage}: {err}\n"));
     log_error("startup", format!("Fatal startup error ({stage}): {err}"));
 
     #[cfg(target_vendor = "sie")]
@@ -57,7 +57,14 @@ fn main() -> ExitCode {
         Ok(res) => res,
         Err(err) => {
             report_fatal_startup_error("config", &err);
-            return ExitCode::from(2);
+            #[cfg(target_vendor = "sie")]
+            {
+                ps5::payload::exit(2)
+            }
+            #[cfg(not(target_vendor = "sie"))]
+            {
+                return ExitCode::from(2);
+            }
         }
     };
 
@@ -70,7 +77,14 @@ fn main() -> ExitCode {
         Ok(r) => r,
         Err(err) => {
             report_fatal_startup_error("tokio_runtime", &err);
-            return ExitCode::from(3);
+            #[cfg(target_vendor = "sie")]
+            {
+                ps5::payload::exit(3)
+            }
+            #[cfg(not(target_vendor = "sie"))]
+            {
+                return ExitCode::from(3);
+            }
         }
     };
 
