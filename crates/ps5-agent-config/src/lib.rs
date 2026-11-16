@@ -105,6 +105,8 @@ pub struct InferenceConfig {
     #[serde(default = "default_reasoning_format")]
     pub reasoning_format: String,
     #[serde(default)]
+    pub reasoning_mode: String,
+    #[serde(default)]
     pub timings_per_token: bool,
     #[serde(default, alias = "extra_request_body_json")]
     pub custom_extra_body_json: String,
@@ -1181,6 +1183,7 @@ impl AppConfig {
                 samplers: String::new(),
                 grammar: String::new(),
                 reasoning_format: default_reasoning_format(),
+                reasoning_mode: String::new(),
                 timings_per_token: false,
                 custom_extra_body_json: String::new(),
                 smart_tool_routing: true,
@@ -1503,7 +1506,7 @@ impl AppConfig {
         let thinking_lower = self.inference.thinking_level.trim().to_ascii_lowercase();
         if matches!(
             thinking_lower.as_str(),
-            "off" | "low" | "medium" | "high" | "max"
+            "off" | "low" | "medium" | "high" | "xhigh" | "max"
         ) {
             self.inference.thinking_level = thinking_lower;
         } else {
@@ -1676,7 +1679,7 @@ impl AppConfig {
             let thinking_lower = cfg.inference.thinking_level.trim().to_ascii_lowercase();
             if matches!(
                 thinking_lower.as_str(),
-                "off" | "low" | "medium" | "high" | "max"
+                "off" | "low" | "medium" | "high" | "xhigh" | "max"
             ) {
                 cfg.inference.thinking_level = thinking_lower;
             }
@@ -1839,10 +1842,10 @@ impl AppConfig {
                 .trim()
                 .to_ascii_lowercase()
                 .as_str(),
-            "off" | "low" | "medium" | "high" | "max"
+            "off" | "low" | "medium" | "high" | "xhigh" | "max"
         ) {
             return Err(AgentError::InvalidInput(
-                "inference.thinking_level must be off, low, medium, high, or max".into(),
+                "inference.thinking_level must be off, low, medium, high, xhigh, or max".into(),
             ));
         }
         if self.server.port == 0 {

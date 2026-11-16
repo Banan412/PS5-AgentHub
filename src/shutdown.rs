@@ -16,8 +16,8 @@ pub fn spawn_signal_handler(system: &AppSystem) {
     {
         TERM_SIGNAL_RECEIVED.store(false, Ordering::SeqCst);
         unsafe {
-            libc::signal(libc::SIGTERM, on_term_signal as usize);
-            libc::signal(libc::SIGINT, on_term_signal as usize);
+            libc::signal(libc::SIGTERM, on_term_signal as *const () as usize);
+            libc::signal(libc::SIGINT, on_term_signal as *const () as usize);
         }
         let shutdown = system.shutdown.clone();
         let logger = system.logger.clone();

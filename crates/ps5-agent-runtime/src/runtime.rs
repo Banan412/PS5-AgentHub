@@ -1534,6 +1534,8 @@ impl AgentRuntime {
                 .await_task_slot_or_expedite(&bg_task_id, false, expedite, &cancel)
                 .await
             else {
+                rt.evict_pending_for_task(&bg_task_id);
+                rt.task_manager.release_token(&bg_task_id);
                 return;
             };
 
@@ -1790,17 +1792,18 @@ impl AgentRuntime {
     ) -> Result<Vec<InferenceMessage>> {
         let cfg = self.config();
         let is_group_conv = self.is_group_conversation(conversation_id);
-        let mem_ctx = self
-            .memory_provider
-            .build_context_for_agent(agent, Some(conversation_id), None, "")
-            .await
-            .unwrap_or_default();
-        let mut system_parts = vec![self.build_system_prompt(agent, &mem_ctx, true, None)?];
         let history = self.storage.list_chat_messages(
             conversation_id,
             false,
-            cfg.memory.keep_recent_messages.max(100),
+            cfg.memory.keep_recent_messages.max(4),
         )?;
+        let last_user_prompt = history
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::User)
+            .map(|m| m.content.as_str());
+        let mut system_parts =
+            vec![self.build_system_prompt(agent, "", true, last_user_prompt)?];
 
         let mut rest = Vec::with_capacity(history.len());
         for m in history {
@@ -2673,17 +2676,34 @@ impl AgentRuntime {
             },
         ];
 
-        let synth_resp = self
+        let mut synth_resp = self
             .run_inference_call(
                 &commander,
                 Some(conversation_id),
                 &parent_task_id,
-                synth_msgs,
+                synth_msgs.clone(),
                 Vec::new(),
                 thinking_level,
-                task_cancel,
+                task_cancel.clone(),
             )
             .await;
+
+        if let Ok(ref r) = synth_resp {
+            let eff_thinking = thinking_level.unwrap_or(commander.model_config.thinking_level);
+            if Self::is_empty_aborted_or_reasoning_only(r) && eff_thinking != ThinkingLevel::Off {
+                synth_resp = self
+                    .run_inference_call(
+                        &commander,
+                        Some(conversation_id),
+                        &parent_task_id,
+                        synth_msgs,
+                        Vec::new(),
+                        Some(ThinkingLevel::Off),
+                        task_cancel,
+                    )
+                    .await;
+            }
+        }
 
         match synth_resp {
             Ok(resp) => {
@@ -2735,7 +2755,10 @@ impl AgentRuntime {
         attachments: &[ChatAttachment],
         cancel: &CancellationToken,
     ) -> Result<Vec<String>> {
-        if attachments.is_empty() && is_casual_greeting_or_ping(user_content) {
+        if attachments.is_empty()
+            && !Self::is_coding_or_script_creation_request(user_content)
+            && is_casual_greeting_or_ping(user_content)
+        {
             return Ok(Vec::new());
         }
 
@@ -2753,6 +2776,7 @@ impl AgentRuntime {
 
         let coordinator_sys = format!(
             "You are routing a group chat turn. Default to {{\"selected_agents\": []}} so Commander handles the message directly.\n\
+             Any request to create, write, build, or generate a script, code, program, HTML/webpage, app, or game MUST select [\"programmer\"] (when `programmer` is listed in Available participants).\n\
              Select participant agent IDs ONLY when their specialized tools or domain are strictly required. Do NOT select irrelevant agents for greetings, small talk, clarification, or general questions.\n\
              Available participants:\n{participant_desc}\n\
              Reply ONLY with valid JSON: {{\"selected_agents\": []}} or {{\"selected_agents\": [\"agent_id\"]}}."
@@ -2781,7 +2805,7 @@ impl AgentRuntime {
             ],
             tools: Vec::new(),
             temperature: 0.0,
-            max_output_tokens: 128,
+            max_output_tokens: 256,
             context_limit: commander.model_config.context_limit,
             slot_id: None,
             stream: false,
@@ -2799,18 +2823,29 @@ impl AgentRuntime {
         let without_think = extract_think_blocks_text(&resp.content);
         let cleaned = strip_json_fences(&without_think);
         let json_slice = extract_first_json_object(cleaned).unwrap_or(cleaned);
-        if let Ok(parsed) = serde_json::from_str::<GroupCoordinatorDecision>(json_slice) {
-            let mut valid = Vec::new();
-            for sid in parsed.selected_agents {
-                if candidates.iter().any(|c| c.id == sid) && !valid.contains(&sid) {
-                    valid.push(sid);
+        let mut valid = match serde_json::from_str::<GroupCoordinatorDecision>(json_slice) {
+            Ok(parsed) => {
+                let mut valid = Vec::new();
+                for sid in parsed.selected_agents {
+                    if candidates.iter().any(|c| c.id == sid) && !valid.contains(&sid) {
+                        valid.push(sid);
+                    }
                 }
+                valid
             }
-            return Ok(valid);
+            Err(_) => Vec::new(),
+        };
+
+        // Deterministically ensure Programmer is selected on coding/script creation requests
+        // even if the small coordinator model defaulted to [] or produced malformed JSON/<think>.
+        if Self::is_coding_or_script_creation_request(user_content)
+            && candidates.iter().any(|c| c.id == "programmer")
+            && !valid.iter().any(|id| id == "programmer")
+        {
+            valid.push("programmer".to_string());
         }
 
-        // Fall back to Commander directly on empty/malformed routing JSON.
-        Ok(Vec::new())
+        Ok(valid)
     }
 
     async fn execute_task_with_timeout(
@@ -2903,9 +2938,12 @@ impl AgentRuntime {
         let is_main_or_direct = input.hop_count == 0
             || input.agent.id == "commander"
             || input.agent.role == AgentRole::Commander;
+        // Keep per-turn memory recall out of messages[0] so llama.cpp KV cache prefix
+        // stays intact across turns; keep Language Requirement at the end of messages[0]
+        // (same-language turns stay byte-identical and match build_prefill_messages).
         let system_prompt = self.build_system_prompt(
             &input.agent,
-            &mem_ctx,
+            "",
             is_main_or_direct,
             Some(&input.raw_user_request),
         )?;
@@ -2918,8 +2956,14 @@ impl AgentRuntime {
             image_urls: Vec::new(),
         }];
 
-        let current_text =
+        let mut current_text =
             format_user_message_with_attachments(&input.user_request, &input.attachments);
+        if !mem_ctx.trim().is_empty() {
+            if !current_text.is_empty() {
+                current_text.push_str("\n\n");
+            }
+            current_text.push_str(mem_ctx.trim());
+        }
         let current_images = extract_image_data_urls(&input.attachments);
         let has_attachments = !input.attachments.is_empty();
 
@@ -3178,9 +3222,11 @@ impl AgentRuntime {
 
             let tools_for_iter = if self.config().inference.smart_tool_routing
                 && iter == 0
+                && messages.len() <= 2
                 && !opts.has_attachments
                 && !messages.iter().any(|m| m.role == "tool")
                 && allowed_tools.len() > 12
+                && !Self::is_coding_or_script_creation_request(&opts.raw_user_request)
             {
                 select_tools_for_casual_turn(&opts.raw_user_request, &allowed_tools)
                     .unwrap_or_else(|| allowed_tools.clone())
@@ -3188,21 +3234,158 @@ impl AgentRuntime {
                 allowed_tools.clone()
             };
 
-            let resp = self
+            let is_commander = agent.role == AgentRole::Commander || agent.id == "commander";
+            let can_delegate_coding = is_commander
+                && agent.can_communicate
+                && hop_count == 0
+                && !opts.raw_user_request.trim().is_empty()
+                && Self::is_coding_or_script_creation_request(&opts.raw_user_request)
+                && self.is_agent_enabled("programmer")
+                && agent_allows_delegation(agent)
+                && !has_delegated_in_messages(messages);
+
+            let mut resp = self
                 .run_inference_call(
                     agent,
                     conversation_id,
                     task_id,
                     messages.clone(),
-                    tools_for_iter,
+                    tools_for_iter.clone(),
                     opts.thinking_level,
                     cancel.clone(),
                 )
                 .await?;
 
+            // Bug 2 runtime recovery: if model hits repetition_abort or emits only reasoning with
+            // empty visible content/tool_calls, either delegate directly when Commander received a
+            // coding/script request or retry once on this iteration with ThinkingLevel::Off.
+            if Self::is_empty_aborted_or_reasoning_only(&resp) {
+                if can_delegate_coding {
+                    resp.tool_calls.push(ToolCallRequest {
+                        id: format!("delegated-bug2-{}", new_id()),
+                        name: "assign_agent_task".to_string(),
+                        arguments: serde_json::json!({
+                            "target_agent_id": "programmer",
+                            "user_request": opts.raw_user_request.clone(),
+                        }),
+                    });
+                    resp.content.clear();
+                } else if eff_thinking != ThinkingLevel::Off {
+                    resp = self
+                        .run_inference_call(
+                            agent,
+                            conversation_id,
+                            task_id,
+                            messages.clone(),
+                            tools_for_iter.clone(),
+                            Some(ThinkingLevel::Off),
+                            cancel.clone(),
+                        )
+                        .await?;
+                }
+            }
+
+            // Bug 1 Case A: intercept Commander calling write_file/file_write on a coding/script
+            // request (without delegating) and redirect into assign_agent_task("programmer").
+            if can_delegate_coding && !resp.tool_calls.is_empty() {
+                let calls_write = resp
+                    .tool_calls
+                    .iter()
+                    .any(|tc| matches!(tc.name.as_str(), "write_file" | "file_write"));
+                let calls_delegate = resp
+                    .tool_calls
+                    .iter()
+                    .any(|tc| matches!(tc.name.as_str(), "assign_agent_task" | "delegate_task"));
+                if calls_write && !calls_delegate {
+                    resp.tool_calls = vec![ToolCallRequest {
+                        id: format!("delegated-write-{}", new_id()),
+                        name: "assign_agent_task".to_string(),
+                        arguments: serde_json::json!({
+                            "target_agent_id": "programmer",
+                            "user_request": opts.raw_user_request.clone(),
+                        }),
+                    }];
+                    resp.content.clear();
+                }
+            }
+
             if resp.tool_calls.is_empty() {
                 let cumulative_preview =
                     join_continuation_parts(&opts.continuation_parts, &resp.content);
+
+                // Bug 1 Case B: intercept Commander emitting a fenced code/script block (>= 4 lines)
+                // BEFORE auto_continuations or Commander auto-materialization can run, and delegate
+                // cleanly through handle_delegate_task.
+                if can_delegate_coding
+                    && !extract_all_fenced_script_blocks(&cumulative_preview, 4).is_empty()
+                {
+                    let delegate_args = serde_json::json!({
+                        "target_agent_id": "programmer",
+                        "user_request": opts.raw_user_request.clone(),
+                    });
+                    let args_json = delegate_args.to_string();
+                    let _ = self.events_tx.send(StreamEvent::ToolCallStarted {
+                        task_id: task_id.to_string(),
+                        agent_id: agent.id.clone(),
+                        tool_id: "assign_agent_task".to_string(),
+                        arguments_json: args_json.clone(),
+                    });
+                    let started = Instant::now();
+                    match self
+                        .handle_delegate_task(
+                            agent,
+                            task_id,
+                            root_task_id,
+                            conversation_id,
+                            delegate_args,
+                            hop_count,
+                            cancel.clone(),
+                        )
+                        .await
+                    {
+                        Ok(val) => {
+                            let dur = started.elapsed().as_millis() as u64;
+                            self.record_tool_success(
+                                agent,
+                                task_id,
+                                "assign_agent_task",
+                                &args_json,
+                                &val,
+                                dur,
+                            );
+                            let delegated_result = val
+                                .get("result")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("Delegated task completed by programmer.")
+                                .to_string();
+                            return self.finish_completed_turn(
+                                agent,
+                                task_id,
+                                conversation_id,
+                                hop_count,
+                                persist_chat_message,
+                                delegated_result,
+                                resp.reasoning.as_deref(),
+                                resp.latency_ms,
+                                resp.timings.clone(),
+                            );
+                        }
+                        Err(e) => {
+                            self.record_tool_failure(
+                                agent,
+                                task_id,
+                                "assign_agent_task",
+                                &args_json,
+                                &e.to_string(),
+                                started,
+                            );
+                            return Err(e);
+                        }
+                    }
+                }
+
                 let hit_length = resp.finish_reason.as_deref() == Some("length");
                 let has_unclosed = has_unclosed_code_fence(&cumulative_preview);
                 if (hit_length || has_unclosed) && opts.auto_continuations < MAX_AUTO_CONTINUATIONS
@@ -3219,9 +3402,14 @@ impl AgentRuntime {
                         tool_calls: None,
                         image_urls: Vec::new(),
                     });
+                    let cont_prompt = if is_commander {
+                        "Continue seamlessly from where you stopped without repeating anything."
+                    } else {
+                        "Continue seamlessly from where you stopped without repeating anything. If producing a file/app/game, finish writing the complete working file using write_file."
+                    };
                     messages.push(InferenceMessage {
                         role: "user".to_string(),
-                        content: "Continue seamlessly from where you stopped without repeating anything. If producing a file/app/game, finish writing the complete working file using write_file.".to_string(),
+                        content: cont_prompt.to_string(),
                         tool_call_id: None,
                         name: None,
                         tool_calls: None,
@@ -3503,40 +3691,17 @@ impl AgentRuntime {
                     }
                 }
 
-                let message_id = if persist_chat_message {
-                    if let Some(conv_id) = conversation_id {
-                        let msg = self.persist_assistant_message(
-                            conv_id,
-                            &agent.id,
-                            task_id,
-                            &final_content,
-                            resp.reasoning.as_deref(),
-                            None,
-                            resp.latency_ms,
-                            resp.timings.clone(),
-                        )?;
-                        self.emit_chat_completed(conv_id, task_id, &agent.id, &msg);
-                        self.spawn_kv_cache_prefill(conv_id, agent, hop_count);
-                        Some(msg.id)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                self.task_manager
-                    .complete_task(task_id, final_content.clone())?;
-                return Ok(ChatTurnResult {
-                    conversation_id: conversation_id.unwrap_or_default().to_string(),
-                    task_id: task_id.to_string(),
-                    agent_id: agent.id.clone(),
-                    status: TaskStatus::Completed,
-                    message_id,
-                    content: final_content,
-                    pending_approval_id: None,
-                    selected_participants: Vec::new(),
-                });
+                return self.finish_completed_turn(
+                    agent,
+                    task_id,
+                    conversation_id,
+                    hop_count,
+                    persist_chat_message,
+                    final_content,
+                    resp.reasoning.as_deref(),
+                    resp.latency_ms,
+                    resp.timings.clone(),
+                );
             }
 
             messages.push(InferenceMessage {
@@ -4326,7 +4491,7 @@ impl AgentRuntime {
             return self.inference.generate(req, cancel).await;
         }
 
-        let (chunk_tx, mut chunk_rx) = mpsc::channel::<InferenceStreamChunk>(64);
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<InferenceStreamChunk>(1024);
         let events_tx = self.events_tx.clone();
         let conv_id = conversation_id.unwrap_or_default().to_string();
         let tid = task_id.to_string();
@@ -4336,20 +4501,24 @@ impl AgentRuntime {
             while let Some(chunk) = chunk_rx.recv().await {
                 match chunk {
                     InferenceStreamChunk::TextDelta(delta) => {
-                        let _ = events_tx.send(StreamEvent::ChatToken {
-                            conversation_id: conv_id.clone(),
-                            task_id: tid.clone(),
-                            agent_id: aid.clone(),
-                            delta,
-                        });
+                        if events_tx.receiver_count() > 0 {
+                            let _ = events_tx.send(StreamEvent::ChatToken {
+                                conversation_id: conv_id.clone(),
+                                task_id: tid.clone(),
+                                agent_id: aid.clone(),
+                                delta,
+                            });
+                        }
                     }
                     InferenceStreamChunk::ReasoningDelta(delta) => {
-                        let _ = events_tx.send(StreamEvent::ChatReasoning {
-                            conversation_id: conv_id.clone(),
-                            task_id: tid.clone(),
-                            agent_id: aid.clone(),
-                            delta,
-                        });
+                        if events_tx.receiver_count() > 0 {
+                            let _ = events_tx.send(StreamEvent::ChatReasoning {
+                                conversation_id: conv_id.clone(),
+                                task_id: tid.clone(),
+                                agent_id: aid.clone(),
+                                delta,
+                            });
+                        }
                     }
                     InferenceStreamChunk::Error(err) => {
                         log_warn("runtime", format!("stream chunk error for {tid}: {err}"));
@@ -4429,13 +4598,18 @@ impl AgentRuntime {
             agent.system_prompt, agent.name, agent.id, agent.role_label,
         );
 
-        prompt.push_str(
+        let coding_rule = if agent.role == AgentRole::Commander || agent.id == "commander" {
+            "- When asked to create, write, or build code, HTML, apps, games, or scripts, NEVER draft or write the code yourself in your thoughts or response and NEVER call `write_file` to save code/scripts yourself; immediately delegate the task to `programmer` via `assign_agent_task` (`target_agent_id: \"programmer\"`), let Programmer save the file, and briefly confirm the result."
+        } else {
+            "- When asked to create or build code, HTML, apps, games, or scripts, save the complete working file via `write_file` instead of pasting long truncated code blocks in chat, then briefly confirm the saved filename."
+        };
+        prompt.push_str(&format!(
             "\n\nCore Response Rules:\n\
              - Always speak directly in the 1st person (\"I...\"), never refer to yourself in the 3rd person.\n\
              - NEVER begin a response with self-addressing greetings or filler like \"Got it, <AgentName>!\" or \"Got it, Commander!\"; answer the user directly in the user's own language and NEVER repeat your own sentences or paragraphs verbatim.\n\
              - Never dump your tool list unless the user explicitly asks what tools you have.\n\
-             - When asked to create or build code, HTML, apps, games, or scripts, save the complete working file via `write_file` instead of pasting long truncated code blocks in chat, then briefly confirm the saved filename.",
-        );
+             {coding_rule}",
+        ));
 
         let cfg = self.config();
         if cfg.sandbox.inject_brain_files {
@@ -4673,6 +4847,578 @@ impl AgentRuntime {
             success: false,
             duration_ms,
         });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_completed_turn(
+        self: &Arc<Self>,
+        agent: &AgentDefinition,
+        task_id: &str,
+        conversation_id: Option<&str>,
+        hop_count: u32,
+        persist_chat_message: bool,
+        final_content: String,
+        reasoning: Option<&str>,
+        latency_ms: u64,
+        timings: Option<InferenceTimings>,
+    ) -> Result<ChatTurnResult> {
+        let message_id = if persist_chat_message {
+            if let Some(conv_id) = conversation_id {
+                let msg = self.persist_assistant_message(
+                    conv_id,
+                    &agent.id,
+                    task_id,
+                    &final_content,
+                    reasoning,
+                    None,
+                    latency_ms,
+                    timings,
+                )?;
+                self.emit_chat_completed(conv_id, task_id, &agent.id, &msg);
+                self.spawn_kv_cache_prefill(conv_id, agent, hop_count);
+                Some(msg.id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.task_manager
+            .complete_task(task_id, final_content.clone())?;
+        Ok(ChatTurnResult {
+            conversation_id: conversation_id.unwrap_or_default().to_string(),
+            task_id: task_id.to_string(),
+            agent_id: agent.id.clone(),
+            status: TaskStatus::Completed,
+            message_id,
+            content: final_content,
+            pending_approval_id: None,
+            selected_participants: Vec::new(),
+        })
+    }
+
+    fn is_agent_enabled(&self, agent_id: &str) -> bool {
+        self.agent_manager
+            .get_agent(agent_id)
+            .ok()
+            .flatten()
+            .is_some_and(|a| a.enabled)
+    }
+
+    fn is_empty_aborted_or_reasoning_only(resp: &InferenceResponse) -> bool {
+        resp.content.trim().is_empty()
+            && resp.tool_calls.is_empty()
+            && (resp.finish_reason.as_deref() == Some("repetition_abort")
+                || resp
+                    .reasoning
+                    .as_ref()
+                    .is_some_and(|r| !r.trim().is_empty()))
+    }
+
+    pub(crate) fn is_schedule_intent_query(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let folded = fold_polish_ascii(trimmed);
+        let words: Vec<&str> = folded
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if words.is_empty() {
+            return false;
+        }
+
+        const SCHEDULE_EXACT_WORDS: &[&str] = &[
+            "schedule",
+            "scheduled",
+            "schedules",
+            "schedule_create",
+            "schedule_list",
+            "schedule_update",
+            "schedule_delete",
+            "harmonogram",
+            "harmonogramu",
+            "harmonogramy",
+            "harmonogramow",
+            "cron",
+            "crontab",
+            "reminder",
+            "reminders",
+            "przypomnienie",
+            "przypomnienia",
+            "przypomnij",
+            "zaplanuj",
+            "zaplanowac",
+            "codziennie",
+            "cotygodniowo",
+            "comiesiecznie",
+            "cyklicznie",
+            "cykliczne",
+        ];
+        if words.iter().any(|w| SCHEDULE_EXACT_WORDS.contains(w)) {
+            return true;
+        }
+
+        let is_time_unit_pl = |w: &str| {
+            matches!(
+                w,
+                "sekund"
+                    | "sekunda"
+                    | "sekunde"
+                    | "sekundy"
+                    | "minut"
+                    | "minuta"
+                    | "minute"
+                    | "minuty"
+                    | "godzin"
+                    | "godzina"
+                    | "godzine"
+                    | "godziny"
+                    | "dzien"
+                    | "dni"
+                    | "tydzien"
+                    | "tygodnie"
+                    | "tygodni"
+                    | "miesiac"
+                    | "miesiace"
+                    | "miesiecy"
+                    | "rano"
+                    | "wieczor"
+                    | "wieczorem"
+            )
+        };
+        let is_time_unit_en = |w: &str| {
+            matches!(
+                w,
+                "second"
+                    | "seconds"
+                    | "sec"
+                    | "secs"
+                    | "minute"
+                    | "minutes"
+                    | "min"
+                    | "mins"
+                    | "hour"
+                    | "hours"
+                    | "hr"
+                    | "hrs"
+                    | "day"
+                    | "days"
+                    | "week"
+                    | "weeks"
+                    | "month"
+                    | "months"
+                    | "morning"
+                    | "evening"
+                    | "night"
+            )
+        };
+        let is_num = |w: &str| w.chars().all(|c| c.is_ascii_digit());
+
+        for i in 0..words.len() {
+            let w = words[i];
+            if w == "co" || w == "za" {
+                if let Some(&next) = words.get(i + 1) {
+                    if is_time_unit_pl(next) {
+                        return true;
+                    }
+                    if is_num(next) {
+                        if let Some(&unit) = words.get(i + 2) {
+                            if is_time_unit_pl(unit) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            } else if w == "every" {
+                if let Some(&next) = words.get(i + 1) {
+                    if is_time_unit_en(next) {
+                        return true;
+                    }
+                    if is_num(next) {
+                        if let Some(&unit) = words.get(i + 2) {
+                            if is_time_unit_en(unit) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            } else if w == "in" {
+                if let (Some(&num), Some(&unit)) = (words.get(i + 1), words.get(i + 2)) {
+                    if is_num(num) && is_time_unit_en(unit) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    pub(crate) fn is_coding_or_script_creation_request(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() || Self::is_schedule_intent_query(trimmed) {
+            return false;
+        }
+
+        let folded = fold_polish_ascii(trimmed);
+
+        const FILE_EXTENSIONS: &[&str] =
+            &[".py", ".sh", ".ps1", ".js", ".ts", ".rs", ".html", ".css"];
+
+        let mut url_spans: Vec<(usize, usize)> = Vec::new();
+        let mut dotted_filename_spans: Vec<(usize, usize)> = Vec::new();
+        let mut target_spans: Vec<(usize, usize)> = Vec::new();
+
+        for span in whitespace_word_spans(&folded) {
+            let after_start = span.raw.trim_start_matches(|c: char| {
+                matches!(c, '"' | '\'' | '(' | '[' | '{' | '`' | '<')
+            });
+            let leading_trim = span.raw.len() - after_start.len();
+            let trimmed_tok = after_start.trim_end_matches(|c: char| {
+                matches!(
+                    c,
+                    '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | ')' | ']' | '}' | '`' | '>'
+                )
+            });
+            if trimmed_tok.is_empty() {
+                continue;
+            }
+            let adj_start = span.start + leading_trim;
+            let adj_end = adj_start + trimmed_tok.len();
+            if trimmed_tok.contains("://") {
+                url_spans.push((adj_start, adj_end));
+                continue;
+            }
+
+            if trimmed_tok.contains('.') {
+                dotted_filename_spans.push((adj_start, adj_end));
+            }
+            if FILE_EXTENSIONS.iter().any(|&ext| {
+                trimmed_tok == ext
+                    || (trimmed_tok.len() > ext.len()
+                        && trimmed_tok.ends_with(ext)
+                        && trimmed_tok.as_bytes()[trimmed_tok.len() - ext.len() - 1] != b'/')
+            }) {
+                target_spans.push((adj_start, adj_end));
+            }
+        }
+
+        // Keep '_' inside word spans so snake_case identifiers (app_config, bot_token, game_state)
+        // do not split into standalone target words like "app", "bot", or "game".
+        let mut word_spans: Vec<(usize, usize, &str)> = Vec::new();
+        let mut start_idx: Option<usize> = None;
+        for (idx, ch) in folded.char_indices() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                if start_idx.is_none() {
+                    start_idx = Some(idx);
+                }
+            } else if let Some(s) = start_idx.take() {
+                word_spans.push((s, idx, &folded[s..idx]));
+            }
+        }
+        if let Some(s) = start_idx {
+            word_spans.push((s, folded.len(), &folded[s..]));
+        }
+
+        const CREATION_VERBS: &[&str] = &[
+            "create",
+            "creating",
+            "write",
+            "writing",
+            "build",
+            "building",
+            "make",
+            "making",
+            "generate",
+            "generating",
+            "implement",
+            "implementing",
+            "code",
+            "coding",
+            "develop",
+            "developing",
+            "napisz",
+            "napisac",
+            "stworz",
+            "stworzyc",
+            "utworz",
+            "utworzyc",
+            "zbuduj",
+            "zbudowac",
+            "wygeneruj",
+            "wygenerowac",
+            "zrob",
+            "zrobic",
+            "zaprogramuj",
+            "zaprogramowac",
+            "zaimplementuj",
+            "zaimplementowac",
+            "zakoduj",
+            "zakodowac",
+        ];
+
+        const ARTIFACT_WORDS: &[&str] = &[
+            "script",
+            "scripts",
+            "skrypt",
+            "skryptu",
+            "skryptem",
+            "skrypty",
+            "skryptow",
+            "python",
+            "pythona",
+            "pythonie",
+            "pythonowy",
+            "pythonowa",
+            "pythonowe",
+            "bash",
+            "bashowy",
+            "bashowa",
+            "powershell",
+            "powershella",
+            "powershellowy",
+            "html",
+            "css",
+            "javascript",
+            "typescript",
+            "webpage",
+            "webpages",
+            "website",
+            "websites",
+            "webapp",
+            "webapps",
+            "strona",
+            "strone",
+            "strony",
+            "stronie",
+            "game",
+            "games",
+            "gra",
+            "gre",
+            "gry",
+            "grze",
+            "flappy",
+            "snake",
+            "tetris",
+            "pong",
+            "app",
+            "apps",
+            "application",
+            "applications",
+            "program",
+            "programs",
+            "programu",
+            "programy",
+            "programem",
+            "function",
+            "functions",
+            "class",
+            "classes",
+            "klasa",
+            "klase",
+            "klasy",
+            "klasie",
+            "kod",
+            "kodu",
+            "kodem",
+            "code",
+            "kalkulator",
+            "kalkulatora",
+            "calculator",
+            "calculators",
+            "bot",
+            "bots",
+            "bota",
+            "boty",
+            "botem",
+            "chatbot",
+            "chatbota",
+        ];
+
+        let mut verb_spans: Vec<(usize, usize)> = Vec::new();
+
+        for (idx, &(s, e, w)) in word_spans.iter().enumerate() {
+            if url_spans.iter().any(|&(us, ue)| s >= us && e <= ue) {
+                continue;
+            }
+            let prev_w = idx.checked_sub(1).and_then(|i| word_spans.get(i)).map(|x| x.2);
+            let next_w = word_spans.get(idx + 1).map(|x| x.2);
+            let inside_dotted = dotted_filename_spans
+                .iter()
+                .any(|&(ds, de)| s >= ds && e <= de);
+
+            if !inside_dotted && CREATION_VERBS.contains(&w) {
+                let keep_verb = match w {
+                    "code" => {
+                        let is_imperative_ctx = idx == 0
+                            || matches!(
+                                prev_w,
+                                Some(
+                                    "please"
+                                        | "pls"
+                                        | "just"
+                                        | "kindly"
+                                        | "now"
+                                        | "can"
+                                        | "could"
+                                        | "would"
+                                        | "will"
+                                        | "you"
+                                        | "me"
+                                        | "us"
+                                        | "to"
+                                        | "and"
+                                        | "or"
+                                        | "let"
+                                        | "lets"
+                                        | "help"
+                                )
+                            );
+                        let preceded_by_noun_mod = matches!(
+                            prev_w,
+                            Some(
+                                "the"
+                                    | "a"
+                                    | "an"
+                                    | "this"
+                                    | "that"
+                                    | "these"
+                                    | "those"
+                                    | "some"
+                                    | "any"
+                                    | "my"
+                                    | "your"
+                                    | "our"
+                                    | "their"
+                                    | "its"
+                                    | "source"
+                                    | "python"
+                                    | "html"
+                                    | "css"
+                                    | "js"
+                                    | "javascript"
+                                    | "typescript"
+                                    | "rust"
+                                    | "game"
+                                    | "app"
+                                    | "script"
+                                    | "error"
+                                    | "status"
+                                    | "exit"
+                                    | "pseudo"
+                                    | "example"
+                                    | "sample"
+                                    | "following"
+                                    | "clean"
+                            )
+                        );
+                        let followed_by_prep = matches!(
+                            next_w,
+                            Some(
+                                "in" | "of"
+                                    | "for"
+                                    | "from"
+                                    | "with"
+                                    | "on"
+                                    | "at"
+                                    | "to"
+                                    | "into"
+                                    | "about"
+                                    | "is"
+                                    | "was"
+                                    | "looks"
+                                    | "works"
+                            )
+                        );
+                        is_imperative_ctx && !preceded_by_noun_mod && !followed_by_prep
+                    }
+                    "build" => {
+                        let preceded_by_noun_mod = matches!(
+                            prev_w,
+                            Some(
+                                "the"
+                                    | "a"
+                                    | "an"
+                                    | "this"
+                                    | "that"
+                                    | "these"
+                                    | "those"
+                                    | "my"
+                                    | "our"
+                                    | "your"
+                                    | "failed"
+                                    | "last"
+                                    | "latest"
+                                    | "new"
+                                    | "old"
+                                    | "debug"
+                                    | "release"
+                                    | "html"
+                                    | "game"
+                                    | "app"
+                                    | "ci"
+                                    | "clean"
+                            )
+                        );
+                        let followed_by_noun = matches!(
+                            next_w,
+                            Some(
+                                "script"
+                                    | "scripts"
+                                    | "log"
+                                    | "logs"
+                                    | "error"
+                                    | "errors"
+                                    | "status"
+                                    | "output"
+                                    | "outputs"
+                                    | "system"
+                                    | "tool"
+                                    | "tools"
+                                    | "pipeline"
+                                    | "config"
+                                    | "artifact"
+                                    | "artifacts"
+                                    | "failure"
+                                    | "step"
+                                    | "steps"
+                                    | "process"
+                                    | "time"
+                            )
+                        );
+                        !preceded_by_noun_mod && !followed_by_noun
+                    }
+                    "make" => !matches!(next_w, Some("sure" | "certain" | "sense" | "use" | "way")),
+                    _ => true,
+                };
+                if keep_verb {
+                    verb_spans.push((s, e));
+                }
+            }
+
+            if ARTIFACT_WORDS.contains(&w)
+                || w.starts_with("aplikacj")
+                || w.starts_with("funkcj")
+            {
+                target_spans.push((s, e));
+            }
+            if w == "cli" {
+                if let Some(&(_, e2, next_word)) = word_spans.get(idx + 1) {
+                    if matches!(next_word, "tool" | "tools") {
+                        target_spans.push((s, e2));
+                    }
+                }
+            }
+        }
+
+        verb_spans.iter().any(|&(vs, ve)| {
+            target_spans
+                .iter()
+                .any(|&(ts, te)| ve <= ts || te <= vs)
+        })
     }
 
     fn append_audit(
@@ -6011,6 +6757,24 @@ pub(crate) fn select_tools_for_casual_turn(
     }
 }
 
+fn agent_allows_delegation(agent: &AgentDefinition) -> bool {
+    agent_allows_tool_name(agent, "assign_agent_task", "agent")
+        || agent_allows_tool_name(agent, "assign_agent_task", "orchestration")
+        || agent_allows_tool_name(agent, "delegate_task", "agent")
+        || agent_allows_tool_name(agent, "delegate_task", "orchestration")
+}
+
+fn has_delegated_in_messages(messages: &[InferenceMessage]) -> bool {
+    messages.iter().any(|m| {
+        m.role == "assistant"
+            && m.tool_calls.as_ref().is_some_and(|calls| {
+                calls
+                    .iter()
+                    .any(|tc| matches!(tc.name.as_str(), "assign_agent_task" | "delegate_task"))
+            })
+    })
+}
+
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -6225,6 +6989,7 @@ fn format_thinking_start_note(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::Low => "Thinking (low)…",
         ThinkingLevel::Medium => "Thinking (medium)…",
         ThinkingLevel::High => "Thinking (high)…",
+        ThinkingLevel::XHigh => "Thinking (xhigh)…",
         ThinkingLevel::Max => "Thinking (max)…",
     }
 }

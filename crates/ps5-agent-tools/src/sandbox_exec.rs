@@ -3235,6 +3235,7 @@ fn run_host_engine_blocking(
         None
     };
 
+    let mut wait_sleep = Duration::from_millis(25);
     let status = loop {
         if cancel_flag.load(Ordering::Acquire) {
             cleanup_host_child(&mut child, out_handle, err_handle);
@@ -3254,7 +3255,8 @@ fn run_host_engine_blocking(
                         )));
                     }
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(wait_sleep);
+                wait_sleep = (wait_sleep.saturating_mul(2)).min(Duration::from_millis(75));
             }
             Err(e) => {
                 cleanup_host_child(&mut child, out_handle, err_handle);

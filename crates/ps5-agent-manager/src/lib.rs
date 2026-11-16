@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-pub const BUILTIN_AGENTS_SCHEMA_VERSION: &str = "6";
+pub const BUILTIN_AGENTS_SCHEMA_VERSION: &str = "7";
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -708,16 +708,21 @@ impl AgentManager {
                 }
                 ActiveTaskPolicy::WaitForActive { timeout_ms } => {
                     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+                    let mut backoff = Duration::from_millis(25);
                     loop {
-                        if self.active_tasks_for_agent(agent_id)?.is_empty() {
+                        if !self.has_active_tasks_for_agent(agent_id)? {
                             break;
                         }
-                        if tokio::time::Instant::now() >= deadline {
+                        let now = tokio::time::Instant::now();
+                        if now >= deadline {
                             return Err(AgentError::Conflict(format!(
                                 "timed out waiting for active tasks on agent '{agent_id}'"
                             )));
                         }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        let remaining = deadline.saturating_duration_since(now);
+                        let sleep_dur = backoff.min(remaining);
+                        tokio::time::sleep(sleep_dur).await;
+                        backoff = (backoff.saturating_mul(2)).min(Duration::from_millis(100));
                     }
                 }
             }
@@ -817,6 +822,23 @@ impl AgentManager {
             });
         }
         Ok(cards)
+    }
+
+    fn has_active_tasks_for_agent(&self, agent_id: &str) -> Result<bool> {
+        let summary = self.storage.task_counts_summary()?;
+        if let Some(agent_stats) = summary.per_agent.get(agent_id) {
+            if agent_stats.active > 0 {
+                return Ok(true);
+            }
+        }
+        if summary.pending == 0 {
+            return Ok(false);
+        }
+        let tasks = self.storage.list_tasks(200)?;
+        Ok(tasks.iter().any(|t| {
+            t.assigned_agent_id == agent_id
+                && (t.status.is_active() || t.status == TaskStatus::Pending)
+        }))
     }
 
     fn active_tasks_for_agent(&self, agent_id: &str) -> Result<Vec<TaskRecord>> {
@@ -939,7 +961,7 @@ pub fn default_agent_definitions() -> Vec<AgentDefinition> {
             description: "Lead orchestrator that plans multi-step workflows, delegates to specialists, and synthesizes final answers.".to_string(),
             role: AgentRole::Commander,
             role_label: "Commander".to_string(),
-            system_prompt: "I am Commander, the lead orchestrator of this PS5 multi-agent runtime. I always speak directly in the first person ('I...'), never in third person. For greetings, quick checks (like 'Test'), or casual/playful prompts, I respond naturally and concisely in 1-3 sentences without dumping a list of tools or refusing benign requests. For complex or specialized requests, I either handle them directly or delegate focused sub-tasks via assign_agent_task or send_agent_message, verify results, and give a clear answer. When asked to create, build, or write code, a game, an app, a webpage, or a script (for example, an HTML Flappy Bird game), I always use write_file (or have Programmer do so) to save a complete, standalone, 100%-working file in the workspace instead of pasting partial code snippets in chat, and briefly confirm the filename and how to open or run it. When asked to schedule recurring, periodic, delayed, or timed tasks to run in the background, I use schedule_create, schedule_list, schedule_update, and schedule_delete (or delegate scheduled execution to Executor when needed).".to_string(),
+            system_prompt: "I am Commander, the lead orchestrator of this PS5 multi-agent runtime. I always speak directly in the first person ('I...'), never in third person. For greetings, quick checks (like 'Test'), or casual/playful prompts, I respond naturally and concisely in 1-3 sentences without dumping a list of tools or refusing benign requests. For complex or specialized requests, I either handle them directly or delegate focused sub-tasks via assign_agent_task or send_agent_message, verify results, and give a clear answer. When asked to create, build, or write code, a game, an app, a webpage, or a script (for example, a Python script, Bash/PowerShell script, or HTML game), I NEVER draft or write the code or script myself in my thoughts or response, and I NEVER call write_file to create code/scripts myself; instead, I ALWAYS delegate the task immediately to programmer using assign_agent_task (target_agent_id: \"programmer\") so Programmer writes and saves the complete working file, and then I briefly present Programmer's result and saved file path to the user. When asked to schedule recurring, periodic, delayed, or timed tasks to run in the background, I use schedule_create, schedule_list, schedule_update, and schedule_delete (or delegate scheduled execution to Executor when needed).".to_string(),
             model_config: AgentModelConfig {
                 provider: "ps5lm".to_string(),
                 model_override: None,
@@ -1910,7 +1932,7 @@ mod tests {
 
     #[test]
     fn default_agents_use_first_person_prompts_unlimited_output_and_rich_tools() {
-        assert_eq!(BUILTIN_AGENTS_SCHEMA_VERSION, "6");
+        assert_eq!(BUILTIN_AGENTS_SCHEMA_VERSION, "7");
         let defs = default_agent_definitions();
         assert_eq!(defs.len(), 5);
         for d in &defs {
@@ -1963,9 +1985,10 @@ mod tests {
         assert_eq!(cmd.model_config.thinking_level, ThinkingLevel::Medium);
         assert_eq!(prog.model_config.thinking_level, ThinkingLevel::High);
         assert!(cmd.system_prompt.contains("I am Commander"));
-        assert!(cmd.system_prompt.contains("write_file"));
-        assert!(cmd.system_prompt.contains("Flappy Bird"));
+        assert!(cmd.system_prompt.contains("NEVER call write_file"));
+        assert!(cmd.system_prompt.contains("assign_agent_task"));
         assert!(cmd.system_prompt.contains("schedule_create"));
+        assert!(prog.system_prompt.contains("Flappy Bird"));
         for required in [
             "write_file",
             "read_file",
@@ -2232,7 +2255,7 @@ mod tests {
                 .get_setting("builtin_agents_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("6")
+            Some("7")
         );
         assert_eq!(
             storage
@@ -2365,5 +2388,72 @@ mod tests {
         let seeded_missing = partial_mgr.seed_defaults().unwrap();
         assert_eq!(seeded_missing, 4);
         assert_eq!(partial_mgr.list_agents().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn commander_prompt_prohibits_self_coding_and_delegates_to_programmer() {
+        let defs = default_agent_definitions();
+        let cmd = defs.iter().find(|d| d.id == "commander").unwrap();
+        let prog = defs.iter().find(|d| d.id == "programmer").unwrap();
+
+        assert!(cmd.system_prompt.starts_with("I am Commander"));
+        assert!(cmd
+            .system_prompt
+            .contains("NEVER draft or write the code or script myself in my thoughts or response"));
+        assert!(cmd
+            .system_prompt
+            .contains("NEVER call write_file to create code/scripts myself"));
+        assert!(cmd
+            .system_prompt
+            .contains("ALWAYS delegate the task immediately to programmer using assign_agent_task (target_agent_id: \"programmer\")"));
+        assert!(!cmd
+            .system_prompt
+            .contains("always use write_file (or have Programmer do so)"));
+        assert!(cmd.system_prompt.contains("schedule_create"));
+        assert!(prog
+            .system_prompt
+            .contains("always use write_file to save a complete"));
+
+        // Verify unedited v6 Commander migrates cleanly to v7 delegation prompt on seed_defaults().
+        let storage = Arc::new(MemStorage::default());
+        let (tx, _rx) = broadcast::channel(16);
+        let cfg = ps5_agent_config::AppConfig::default().agents;
+        let mgr = AgentManager::new(storage.clone(), cfg, tx);
+        let v6_cmd_prompt = "I am Commander, legacy v6 prompt. When asked to create, build, or write code, a game, an app, a webpage, or a script (for example, an HTML Flappy Bird game), I always use write_file (or have Programmer do so) to save a complete, standalone, 100%-working file in the workspace.".to_string();
+        for mut def in default_agent_definitions() {
+            if def.id == "commander" {
+                def.system_prompt = v6_cmd_prompt.clone();
+                def.updated_at = "2099-01-01T00:00:00Z".to_string();
+            }
+            storage.upsert_agent(&def).unwrap();
+        }
+        storage.set_setting("agents_seeded", "true").unwrap();
+        storage
+            .set_setting("builtin_agents_schema_version", "6")
+            .unwrap();
+        storage
+            .set_setting("builtin_agents_hash", "legacy-v6")
+            .unwrap();
+        storage
+            .set_setting("builtin_prompt_hash.commander", &sha256_hex(&v6_cmd_prompt))
+            .unwrap();
+
+        mgr.seed_defaults().unwrap();
+
+        assert_eq!(
+            storage
+                .get_setting("builtin_agents_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        let upgraded_cmd = mgr.get_agent("commander").unwrap().unwrap();
+        assert_eq!(upgraded_cmd.system_prompt, cmd.system_prompt);
+        assert!(upgraded_cmd
+            .system_prompt
+            .contains("NEVER call write_file to create code/scripts myself"));
+        assert!(upgraded_cmd
+            .system_prompt
+            .contains("assign_agent_task (target_agent_id: \"programmer\")"));
     }
 }

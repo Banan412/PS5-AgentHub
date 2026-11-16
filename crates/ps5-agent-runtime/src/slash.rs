@@ -56,8 +56,8 @@ pub const BUILTIN_SLASH_COMMANDS: &[(&str, &str)] = &[
         "Summarize older conversation messages into rolling memory and archive old messages.",
     ),
     (
-        "/think [off|minimal|low|medium|high|auto]",
-        "Report or set the preferred reasoning/thinking level.",
+        "/think [off|minimal|low|medium|high|xhigh|max|auto|<mode>]",
+        "Report or set thinking level or custom Jinja reasoning_mode (e.g. einstein, spoon, 007).",
     ),
     (
         "/model [name]",
@@ -1047,6 +1047,10 @@ fn parse_think_arg(raw: &str) -> Option<ThinkArg> {
             requested: "high",
             level: ThinkingLevel::High,
         }),
+        "xhigh" => Some(ThinkArg::Explicit {
+            requested: "xhigh",
+            level: ThinkingLevel::XHigh,
+        }),
         "max" => Some(ThinkArg::Explicit {
             requested: "max",
             level: ThinkingLevel::Max,
@@ -1072,14 +1076,21 @@ fn cmd_think(
     if trimmed.is_empty() {
         let cfg = snapshot_config(config);
         let effective = parse_config_thinking_level(&cfg.inference.thinking_level);
+        let mode = cfg.inference.reasoning_mode.trim().to_string();
+        let mode_label = if mode.is_empty() {
+            "auto (from level)".to_string()
+        } else {
+            mode.clone()
+        };
         return Ok(SlashCommandResponse {
             command: "think".to_string(),
             ephemeral: true,
             content: format!(
-                "Current thinking level: `{}` (effective: `{}`, agent default: `{}`).\nAvailable: `off`, `minimal`, `low`, `medium`, `high`, `auto`.",
+                "Current thinking level: `{}` (effective: `{}`, agent default: `{}`, reasoning_mode: `{}`).\nAvailable levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`.\nCustom modes: `/think mode <name>` or `/think <name>` (e.g. `einstein`, `spoon`, `deeptree`, `logic`, `007`), `/think mode clear`.",
                 cfg.inference.thinking_level,
                 effective.as_str(),
                 agent_default_level.as_str(),
+                mode_label,
             ),
             reasoning: None,
             agent_id: Some(agent_id.to_string()),
@@ -1087,44 +1098,146 @@ fn cmd_think(
                 "thinking_level": cfg.inference.thinking_level,
                 "effective": effective.as_str(),
                 "agent_default": agent_default_level.as_str(),
+                "reasoning_mode": mode,
                 "updated": false,
             }),
         });
     }
 
-    let parsed = parse_think_arg(trimmed).ok_or_else(|| {
-        AgentError::InvalidInput(format!(
-            "unsupported thinking level '{}'; expected one of: off, minimal, low, medium, high, max, auto",
-            trimmed
-        ))
-    })?;
-
-    let (requested, effective_level) = match parsed {
-        ThinkArg::Explicit { requested, level } => (requested, level),
-        ThinkArg::Auto => ("auto", agent_default_level),
+    // Handle explicit `/think mode <name|clear|auto|off>` or custom reasoning mode aliases.
+    let mode_arg_opt = if let Some(rest) = trimmed.strip_prefix("mode") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            Some(rest.trim())
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
-    update_config(config, |cfg| {
-        cfg.inference.thinking_level = effective_level.as_str().to_string();
-    });
+    if let Some(mode_arg) = mode_arg_opt {
+        if mode_arg.is_empty() {
+            let cfg = snapshot_config(config);
+            let cur = cfg.inference.reasoning_mode.trim().to_string();
+            return Ok(SlashCommandResponse {
+                command: "think".to_string(),
+                ephemeral: true,
+                content: if cur.is_empty() {
+                    "Current `reasoning_mode`: auto (derived from thinking level).".to_string()
+                } else {
+                    format!("Current `reasoning_mode`: `{cur}`.")
+                },
+                reasoning: None,
+                agent_id: Some(agent_id.to_string()),
+                metadata: json!({
+                    "reasoning_mode": cur,
+                    "updated": false,
+                }),
+            });
+        }
+        let lower_mode = mode_arg.to_ascii_lowercase();
+        let clear = matches!(lower_mode.as_str(), "auto" | "clear" | "default" | "none" | "reset");
+        if !clear
+            && (mode_arg.len() > 48
+                || !mode_arg
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        {
+            return Err(AgentError::InvalidInput(format!(
+                "invalid reasoning mode '{}'; expected alphanumeric/hyphen/underscore name or 'clear'",
+                mode_arg
+            )));
+        }
+        let new_mode = if clear {
+            String::new()
+        } else {
+            mode_arg.to_string()
+        };
+        update_config(config, |cfg| {
+            cfg.inference.reasoning_mode = new_mode.clone();
+            if !clear
+                && parse_config_thinking_level(&cfg.inference.thinking_level) == ThinkingLevel::Off
+            {
+                cfg.inference.thinking_level = ThinkingLevel::High.as_str().to_string();
+            }
+        });
+        return Ok(SlashCommandResponse {
+            command: "think".to_string(),
+            ephemeral: true,
+            content: if clear {
+                "Cleared `reasoning_mode` override (derived from thinking level).".to_string()
+            } else {
+                format!("Custom `reasoning_mode` override set to `{new_mode}`.")
+            },
+            reasoning: None,
+            agent_id: Some(agent_id.to_string()),
+            metadata: json!({
+                "reasoning_mode": new_mode,
+                "updated": true,
+            }),
+        });
+    }
 
-    Ok(SlashCommandResponse {
-        command: "think".to_string(),
-        ephemeral: true,
-        content: format!(
-            "Preferred thinking level set to `{}` (effective runtime level: `{}`).",
-            requested,
-            effective_level.as_str(),
-        ),
-        reasoning: None,
-        agent_id: Some(agent_id.to_string()),
-        metadata: json!({
-            "requested": requested,
-            "thinking_level": requested,
-            "effective": effective_level.as_str(),
-            "updated": true,
-        }),
-    })
+    if let Some(parsed) = parse_think_arg(trimmed) {
+        let (requested, effective_level) = match parsed {
+            ThinkArg::Explicit { requested, level } => (requested, level),
+            ThinkArg::Auto => ("auto", agent_default_level),
+        };
+
+        update_config(config, |cfg| {
+            cfg.inference.thinking_level = effective_level.as_str().to_string();
+            cfg.inference.reasoning_mode.clear();
+        });
+
+        return Ok(SlashCommandResponse {
+            command: "think".to_string(),
+            ephemeral: true,
+            content: format!(
+                "Preferred thinking level set to `{}` (effective runtime level: `{}`).",
+                requested,
+                effective_level.as_str(),
+            ),
+            reasoning: None,
+            agent_id: Some(agent_id.to_string()),
+            metadata: json!({
+                "requested": requested,
+                "thinking_level": requested,
+                "effective": effective_level.as_str(),
+                "updated": true,
+            }),
+        });
+    }
+
+    const KNOWN_CUSTOM_MODES: &[&str] = &[
+        "einstein", "spoon", "deeptree", "socrates", "logic", "omni", "hyper", "ultra",
+        "xultra", "007", "coder", "xomni", "xdeeptree", "xhyper", "xsocrates", "xlogic",
+        "xeinstein", "xspoon", "xhelp", "ispoon", "ieinstein", "ixhigh",
+    ];
+    let lowered = trimmed.to_ascii_lowercase();
+    if KNOWN_CUSTOM_MODES.contains(&lowered.as_str()) {
+        update_config(config, |cfg| {
+            cfg.inference.reasoning_mode = lowered.clone();
+            if parse_config_thinking_level(&cfg.inference.thinking_level) == ThinkingLevel::Off {
+                cfg.inference.thinking_level = ThinkingLevel::High.as_str().to_string();
+            }
+        });
+        return Ok(SlashCommandResponse {
+            command: "think".to_string(),
+            ephemeral: true,
+            content: format!("Custom `reasoning_mode` override set to `{lowered}`."),
+            reasoning: None,
+            agent_id: Some(agent_id.to_string()),
+            metadata: json!({
+                "reasoning_mode": lowered,
+                "updated": true,
+            }),
+        });
+    }
+
+    Err(AgentError::InvalidInput(format!(
+        "unsupported thinking level '{}'; expected one of: off, minimal, low, medium, high, xhigh, max, auto (or 'mode <name>')",
+        trimmed
+    )))
 }
 
 async fn cmd_model(
@@ -2846,6 +2959,51 @@ mod tests {
         .await
         .expect("/think auto");
         assert_eq!(think_auto.metadata["thinking_level"], json!("auto"));
+
+        let think_custom = execute_slash_command(
+            "/think einstein",
+            None,
+            None,
+            &cfg,
+            &storage,
+            &inference,
+            &tools,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("/think einstein");
+        assert_eq!(think_custom.metadata["reasoning_mode"], json!("einstein"));
+        assert_eq!(snapshot_config(&cfg).inference.reasoning_mode, "einstein");
+
+        let think_clear = execute_slash_command(
+            "/think mode clear",
+            None,
+            None,
+            &cfg,
+            &storage,
+            &inference,
+            &tools,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("/think mode clear");
+        assert_eq!(think_clear.metadata["reasoning_mode"], json!(""));
+        assert_eq!(snapshot_config(&cfg).inference.reasoning_mode, "");
+
+        let think_xhigh = execute_slash_command(
+            "/think xhigh",
+            None,
+            None,
+            &cfg,
+            &storage,
+            &inference,
+            &tools,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("/think xhigh");
+        assert_eq!(think_xhigh.metadata["effective"], json!("xhigh"));
+        assert_eq!(snapshot_config(&cfg).inference.thinking_level, "xhigh");
 
         // /model validates against available models
         assert!(execute_slash_command(

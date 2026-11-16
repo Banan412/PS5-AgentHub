@@ -136,6 +136,7 @@ struct BrowserActivityFields {
 
 impl SandboxBrowserManager {
     pub fn new() -> Self {
+        crate::web::ensure_rustls_ring_provider();
         Self::default()
     }
 
@@ -258,27 +259,109 @@ impl SandboxBrowserManager {
         &self,
         session_id: Option<&str>,
     ) -> Result<(String, String, String)> {
-        let (sid, url, raw_html, active_selector) = {
+        let (sid, url, raw_html, active_selector, is_error_state) = {
             let mut store = self.lock_store();
             evict_idle_sessions(&mut store);
-            let sess = match session_id.map(str::trim).filter(|s| !s.is_empty()) {
-                Some(id) => store.sessions.get(id).ok_or_else(|| {
-                    AgentError::NotFound(format!("browser session '{id}' not found"))
-                })?,
-                None => store
-                    .sessions
-                    .values()
-                    .max_by_key(|s| s.last_active_seq)
-                    .ok_or_else(|| AgentError::NotFound("no active browser session".into()))?,
-            };
-            (
-                sess.id.clone(),
-                sanitize_url_for_event(&sess.current_url),
-                sess.html.clone(),
-                sess.last_selector.clone(),
-            )
+            match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(id) => match store.sessions.get(id) {
+                    Some(s) => {
+                        let is_err = s.status == 0 || s.status >= 400 || s.html.trim().is_empty();
+                        (
+                            s.id.clone(),
+                            sanitize_url_for_event(&s.current_url),
+                            s.html.clone(),
+                            s.last_selector.clone(),
+                            is_err,
+                        )
+                    }
+                    None => {
+                        let missing_html = format!(
+                            r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Session Not Found</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f17; color: #94a3b8; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+    .error-card {{ background: #131a26; border: 1px solid #374151; border-radius: 8px; padding: 2rem; max-width: 480px; text-align: center; }}
+    h3 {{ color: #f87171; margin-top: 0; }}
+    p {{ font-size: 0.95rem; margin-bottom: 0; }}
+  </style>
+</head>
+<body>
+  <div class="error-card">
+    <h3>Session Not Found</h3>
+    <p>Browser session '{safe_id}' was not found or has expired.</p>
+  </div>
+</body>
+</html>"#,
+                            safe_id = escape_html_attr(id)
+                        );
+                        return Ok((id.to_string(), "about:blank".to_string(), missing_html));
+                    }
+                },
+                None => match store.sessions.values().max_by_key(|s| s.last_active_seq) {
+                    Some(s) => {
+                        let is_err = s.status == 0 || s.status >= 400 || s.html.trim().is_empty();
+                        (
+                            s.id.clone(),
+                            sanitize_url_for_event(&s.current_url),
+                            s.html.clone(),
+                            s.last_selector.clone(),
+                            is_err,
+                        )
+                    }
+                    None => {
+                        let empty_html = r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>No Active Browser Session</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f17; color: #94a3b8; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .empty-card { background: #131a26; border: 1px dashed #374151; border-radius: 8px; padding: 2rem; max-width: 480px; text-align: center; }
+    h3 { color: #e6edf7; margin-top: 0; }
+    p { font-size: 0.95rem; margin-bottom: 0; }
+  </style>
+</head>
+<body>
+  <div class="empty-card">
+    <h3>No Active Browser Session</h3>
+    <p>No browser session has been initiated yet.</p>
+  </div>
+</body>
+</html>"#.to_string();
+                        return Ok(("none".to_string(), "about:blank".to_string(), empty_html));
+                    }
+                },
+            }
         };
-        let sanitized = sanitize_html_for_preview(&raw_html, active_selector.as_deref());
+
+        let sanitized = if is_error_state && raw_html.trim().is_empty() {
+            format!(
+                r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Browser Session Error</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f17; color: #94a3b8; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+    .error-card {{ background: #131a26; border: 1px solid #ef4444; border-radius: 8px; padding: 2rem; max-width: 480px; text-align: center; }}
+    h3 {{ color: #f87171; margin-top: 0; }}
+  </style>
+</head>
+<body>
+  <div class="error-card">
+    <h3>Navigation Error</h3>
+    <p>The target page could not be loaded.</p>
+  </div>
+</body>
+</html>"#
+            )
+        } else {
+            sanitize_html_for_preview(&raw_html, active_selector.as_deref())
+        };
+
         Ok((sid, url, sanitized))
     }
 
@@ -439,7 +522,7 @@ impl SandboxBrowserManager {
             },
         );
 
-        let resp = fetch_page_with_cookies(
+        let resp = match fetch_page_with_cookies(
             reqwest::Method::GET,
             &target_url,
             None,
@@ -447,13 +530,184 @@ impl SandboxBrowserManager {
             &existing_cookies,
             cfg,
         )
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                let error_msg = err.to_string();
+                let error_html = format!(
+                    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Navigation Failed</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f17; color: #e6edf7; padding: 2rem; }}
+    .error-card {{ background: #131a26; border: 1px solid #ef4444; border-radius: 8px; padding: 1.5rem; max-width: 600px; margin: 2rem auto; }}
+    h2 {{ color: #f87171; margin-top: 0; }}
+    .url {{ word-break: break-all; color: #60a5fa; font-family: monospace; font-size: 0.9rem; }}
+    .msg {{ color: #94a3b8; margin: 1rem 0; font-size: 0.95rem; }}
+  </style>
+</head>
+<body>
+  <div class="error-card">
+    <h2>Navigation Failed</h2>
+    <p class="url">{safe_url}</p>
+    <p class="msg">{safe_msg}</p>
+  </div>
+</body>
+</html>"#,
+                    safe_url = escape_html_attr(&target_url),
+                    safe_msg = escape_html_text(&error_msg),
+                );
+
+                let sid = {
+                    let mut store = self.lock_store();
+                    evict_idle_sessions(&mut store);
+                    store.access_seq = store.access_seq.saturating_add(1);
+                    let seq = store.access_seq;
+                    let sid = requested_sid
+                        .unwrap_or_else(|| generate_session_id(&store.sessions));
+                    if let Some(sess) = store.sessions.get_mut(&sid) {
+                        apply_meta_agent(sess, meta);
+                        sess.current_url = target_url.clone();
+                        sess.title = Some("Navigation Failed".into());
+                        sess.status = 502;
+                        sess.html = error_html;
+                        sess.last_action = Some(action.to_string());
+                        sess.last_active = Instant::now();
+                        sess.last_active_seq = seq;
+                        sess.last_active_iso = now_iso();
+                    } else {
+                        ensure_session_capacity(&mut store);
+                        let sess = BrowserSession {
+                            id: sid.clone(),
+                            current_url: target_url.clone(),
+                            title: Some("Navigation Failed".into()),
+                            status: 502,
+                            html: error_html,
+                            history: vec![target_url.clone()],
+                            cookies: existing_cookies,
+                            elements: Vec::new(),
+                            forms: Vec::new(),
+                            input_values: HashMap::new(),
+                            cursor_x_pct: 0.0,
+                            cursor_y_pct: 0.0,
+                            scroll_y: 0.0,
+                            last_action: Some(action.to_string()),
+                            last_selector: None,
+                            agent_id: meta.and_then(|m| non_empty_trimmed(m.agent_id.as_deref())),
+                            last_active: Instant::now(),
+                            last_active_seq: seq,
+                            last_active_iso: now_iso(),
+                        };
+                        store.sessions.insert(sid.clone(), sess);
+                    }
+                    sid
+                };
+
+                self.emit_activity(
+                    meta,
+                    BrowserActivityFields {
+                        session_id: sid,
+                        action: action.to_string(),
+                        url: Some(target_url),
+                        title: Some("Navigation Failed".into()),
+                        selector: None,
+                        x_pct: None,
+                        y_pct: None,
+                        w_pct: None,
+                        h_pct: None,
+                        scroll_y: None,
+                        status: "error".into(),
+                        session_agent_id: existing_agent,
+                    },
+                );
+
+                return Err(err);
+            }
+        };
 
         if let Some(challenge) = check_html_challenge(&resp) {
+            let kind = challenge["challenge_kind"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            let challenge_html = format!(
+                r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Security Challenge Gate</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f17; color: #e6edf7; padding: 2rem; }}
+    .challenge-card {{ background: #131a26; border: 1px solid #f59e0b; border-radius: 8px; padding: 1.5rem; max-width: 600px; margin: 2rem auto; }}
+    h2 {{ color: #fbbf24; margin-top: 0; }}
+    .url {{ word-break: break-all; color: #60a5fa; font-family: monospace; font-size: 0.9rem; }}
+    .msg {{ color: #94a3b8; margin: 1rem 0; font-size: 0.95rem; }}
+  </style>
+</head>
+<body>
+  <div class="challenge-card">
+    <h2>Challenge Gate Detected ({safe_kind})</h2>
+    <p class="url">{safe_url}</p>
+    <p class="msg">This destination requires interactive human verification. Headless browser cannot bypass security gates.</p>
+  </div>
+</body>
+</html>"#,
+                safe_kind = escape_html_attr(&kind),
+                safe_url = escape_html_attr(&resp.final_url),
+            );
+
+            let sid = {
+                let mut store = self.lock_store();
+                evict_idle_sessions(&mut store);
+                store.access_seq = store.access_seq.saturating_add(1);
+                let seq = store.access_seq;
+                let sid = requested_sid
+                    .unwrap_or_else(|| generate_session_id(&store.sessions));
+                if let Some(sess) = store.sessions.get_mut(&sid) {
+                    apply_meta_agent(sess, meta);
+                    sess.current_url = resp.final_url.clone();
+                    sess.title = Some(format!("Challenge: {kind}"));
+                    sess.status = resp.status;
+                    sess.html = challenge_html;
+                    sess.last_action = Some(action.to_string());
+                    sess.last_active = Instant::now();
+                    sess.last_active_seq = seq;
+                    sess.last_active_iso = now_iso();
+                } else {
+                    ensure_session_capacity(&mut store);
+                    let sess = BrowserSession {
+                        id: sid.clone(),
+                        current_url: resp.final_url.clone(),
+                        title: Some(format!("Challenge: {kind}")),
+                        status: resp.status,
+                        html: challenge_html,
+                        history: vec![resp.final_url.clone()],
+                        cookies: existing_cookies,
+                        elements: Vec::new(),
+                        forms: Vec::new(),
+                        input_values: HashMap::new(),
+                        cursor_x_pct: 0.0,
+                        cursor_y_pct: 0.0,
+                        scroll_y: 0.0,
+                        last_action: Some(action.to_string()),
+                        last_selector: None,
+                        agent_id: meta.and_then(|m| non_empty_trimmed(m.agent_id.as_deref())),
+                        last_active: Instant::now(),
+                        last_active_seq: seq,
+                        last_active_iso: now_iso(),
+                    };
+                    store.sessions.insert(sid.clone(), sess);
+                }
+                sid
+            };
+
             self.emit_activity(
                 meta,
                 BrowserActivityFields {
-                    session_id: requested_sid.unwrap_or_default(),
+                    session_id: sid,
                     action: action.to_string(),
                     url: Some(resp.final_url.clone()),
                     title: challenge["challenge_kind"].as_str().map(str::to_string),
@@ -2320,6 +2574,8 @@ async fn fetch_page_with_cookies(
     cfg: &ToolsConfig,
 ) -> Result<crate::web::ValidatedHttpResponse> {
     let mut headers = HeaderMap::new();
+    let profile = crate::web::BrowserHeadersProfile::rotate();
+    profile.apply_to_headers(&mut headers);
     if let Some(ct) = content_type {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static(ct));
     }
@@ -5496,5 +5752,60 @@ mod tests {
         assert!(err_coords.1.unwrap() > 0.0 && err_coords.2.unwrap() > 0.0);
 
         server.abort();
+    }
+
+    #[test]
+    fn preview_html_returns_clean_placeholder_when_no_session() {
+        let mgr = SandboxBrowserManager::new();
+        let (sid, url, html) = mgr
+            .sanitized_session_preview_html(None)
+            .expect("should return Ok rather than NotFound");
+        assert_eq!(sid, "none");
+        assert_eq!(url, "about:blank");
+        assert!(html.contains("No Active Browser Session"));
+    }
+
+    #[test]
+    fn preview_html_returns_clean_error_when_session_not_found() {
+        let mgr = SandboxBrowserManager::new();
+        let (sid, url, html) = mgr
+            .sanitized_session_preview_html(Some("missing_sid_123"))
+            .expect("should return Ok rather than NotFound");
+        assert_eq!(sid, "missing_sid_123");
+        assert_eq!(url, "about:blank");
+        assert!(html.contains("Session Not Found"));
+        assert!(html.contains("missing_sid_123"));
+    }
+
+    #[tokio::test]
+    async fn handle_open_records_error_session_on_navigation_failure() {
+        let mgr = SandboxBrowserManager::new();
+        let mut cfg = ToolsConfig::default();
+        cfg.network_access = true;
+        cfg.block_private_lan_web_requests = false;
+        let client = reqwest::Client::new();
+
+        // Attempt navigation to a port where no server is listening
+        let bad_url = "http://127.0.0.1:1";
+        let res = mgr
+            .execute(
+                &json!({
+                    "action": "open",
+                    "session_id": "test_err_session",
+                    "url": bad_url,
+                }),
+                &cfg,
+                &client,
+            )
+            .await;
+        assert!(res.is_err(), "navigation to dead port should fail");
+
+        // Verify session was recorded in error state in store.sessions
+        let (sid, url, html) = mgr
+            .sanitized_session_preview_html(Some("test_err_session"))
+            .expect("error session preview should return Ok");
+        assert_eq!(sid, "test_err_session");
+        assert!(html.contains("Navigation Failed") || html.contains("Navigation Error"));
+        assert_eq!(url, "http://127.0.0.1:1/");
     }
 }

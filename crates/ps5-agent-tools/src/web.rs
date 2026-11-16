@@ -121,6 +121,130 @@ pub fn build_web_client(timeout_secs: u64) -> Result<reqwest::Client> {
     build_pinned_web_client(timeout_secs, None, &[])
 }
 
+/// Modern desktop browser profile that rotates realistic User-Agents
+/// and attaches standard Client Hint and Fetch Metadata headers to reduce
+/// bot detection and rate limiting.
+#[derive(Debug, Clone)]
+pub struct BrowserHeadersProfile {
+    pub user_agent: &'static str,
+    pub sec_ch_ua: Option<&'static str>,
+    pub sec_ch_ua_mobile: &'static str,
+    pub sec_ch_ua_platform: Option<&'static str>,
+    pub sec_fetch_dest: &'static str,
+    pub sec_fetch_mode: &'static str,
+    pub sec_fetch_site: &'static str,
+    pub sec_fetch_user: &'static str,
+    pub accept: &'static str,
+    pub accept_language: &'static str,
+    pub upgrade_insecure_requests: &'static str,
+}
+
+impl BrowserHeadersProfile {
+    /// Rotates across realistic modern desktop browser profiles (Chrome 124 on Windows/macOS,
+    /// Edge 124 on Windows, Firefox 125 on Windows).
+    pub fn rotate() -> &'static BrowserHeadersProfile {
+        static PROFILES: OnceLock<Vec<BrowserHeadersProfile>> = OnceLock::new();
+        static ROTATION_INDEX: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let profiles = PROFILES.get_or_init(|| {
+            vec![
+                BrowserHeadersProfile {
+                    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    sec_ch_ua: Some("\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\""),
+                    sec_ch_ua_mobile: "?0",
+                    sec_ch_ua_platform: Some("\"Windows\""),
+                    sec_fetch_dest: "document",
+                    sec_fetch_mode: "navigate",
+                    sec_fetch_site: "none",
+                    sec_fetch_user: "?1",
+                    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    accept_language: "en-US,en;q=0.9",
+                    upgrade_insecure_requests: "1",
+                },
+                BrowserHeadersProfile {
+                    user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    sec_ch_ua: Some("\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\""),
+                    sec_ch_ua_mobile: "?0",
+                    sec_ch_ua_platform: Some("\"macOS\""),
+                    sec_fetch_dest: "document",
+                    sec_fetch_mode: "navigate",
+                    sec_fetch_site: "none",
+                    sec_fetch_user: "?1",
+                    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    accept_language: "en-US,en;q=0.9",
+                    upgrade_insecure_requests: "1",
+                },
+                BrowserHeadersProfile {
+                    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+                    sec_ch_ua: Some("\"Chromium\";v=\"124\", \"Microsoft Edge\";v=\"124\", \"Not-A.Brand\";v=\"99\""),
+                    sec_ch_ua_mobile: "?0",
+                    sec_ch_ua_platform: Some("\"Windows\""),
+                    sec_fetch_dest: "document",
+                    sec_fetch_mode: "navigate",
+                    sec_fetch_site: "none",
+                    sec_fetch_user: "?1",
+                    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    accept_language: "en-US,en;q=0.9",
+                    upgrade_insecure_requests: "1",
+                },
+                BrowserHeadersProfile {
+                    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+                    sec_ch_ua: None,
+                    sec_ch_ua_mobile: "?0",
+                    sec_ch_ua_platform: Some("\"Windows\""),
+                    sec_fetch_dest: "document",
+                    sec_fetch_mode: "navigate",
+                    sec_fetch_site: "none",
+                    sec_fetch_user: "?1",
+                    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    accept_language: "en-US,en;q=0.9",
+                    upgrade_insecure_requests: "1",
+                },
+            ]
+        });
+        let idx = ROTATION_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % profiles.len();
+        &profiles[idx]
+    }
+
+    /// Appends standard modern browser headers if not already present in `headers`.
+    pub fn apply_to_headers(&self, headers: &mut HeaderMap) {
+        if let Some(ua) = self.sec_ch_ua {
+            headers
+                .entry(HeaderName::from_static("sec-ch-ua"))
+                .or_insert_with(|| HeaderValue::from_static(ua));
+        }
+        headers
+            .entry(HeaderName::from_static("sec-ch-ua-mobile"))
+            .or_insert_with(|| HeaderValue::from_static(self.sec_ch_ua_mobile));
+        if let Some(plat) = self.sec_ch_ua_platform {
+            headers
+                .entry(HeaderName::from_static("sec-ch-ua-platform"))
+                .or_insert_with(|| HeaderValue::from_static(plat));
+        }
+        headers
+            .entry(HeaderName::from_static("sec-fetch-dest"))
+            .or_insert_with(|| HeaderValue::from_static(self.sec_fetch_dest));
+        headers
+            .entry(HeaderName::from_static("sec-fetch-mode"))
+            .or_insert_with(|| HeaderValue::from_static(self.sec_fetch_mode));
+        headers
+            .entry(HeaderName::from_static("sec-fetch-site"))
+            .or_insert_with(|| HeaderValue::from_static(self.sec_fetch_site));
+        headers
+            .entry(HeaderName::from_static("sec-fetch-user"))
+            .or_insert_with(|| HeaderValue::from_static(self.sec_fetch_user));
+        headers
+            .entry(ACCEPT)
+            .or_insert_with(|| HeaderValue::from_static(self.accept));
+        headers
+            .entry(HeaderName::from_static("accept-language"))
+            .or_insert_with(|| HeaderValue::from_static(self.accept_language));
+        headers
+            .entry(HeaderName::from_static("upgrade-insecure-requests"))
+            .or_insert_with(|| HeaderValue::from_static(self.upgrade_insecure_requests));
+    }
+}
+
 fn build_pinned_web_client(
     timeout_secs: u64,
     pinned_host: Option<&str>,
@@ -132,10 +256,15 @@ fn build_pinned_web_client(
     } else {
         timeout_secs.clamp(1, 30)
     };
+    let profile = BrowserHeadersProfile::rotate();
+    let mut default_headers = HeaderMap::new();
+    profile.apply_to_headers(&mut default_headers);
+
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(connect_secs))
-        .user_agent("ps5-agent/0.1");
+        .user_agent(profile.user_agent)
+        .default_headers(default_headers);
     if timeout_secs > 0 {
         builder = builder.timeout(Duration::from_secs(timeout_secs));
     }
@@ -562,12 +691,26 @@ pub(crate) async fn fetch_validated_url(
     let mut current_body = body;
     let max_bytes = effective_max_web_bytes(cfg);
 
+    // Reuse HTTP client connection pool across redirect hops to prevent socket churn and TCP port exhaustion.
+    let mut client_cache: Vec<(Option<String>, Vec<SocketAddr>, reqwest::Client)> =
+        Vec::with_capacity(MAX_REDIRECTS + 1);
+
     for _hop in 0..=MAX_REDIRECTS {
-        let hop_client = build_pinned_web_client(
-            cfg.default_timeout_secs,
-            current_url.host_str(),
-            &current_addrs,
-        )?;
+        let hop_host = current_url.host_str().map(|h| h.to_string());
+        let hop_client = if let Some((_, _, cached)) = client_cache
+            .iter()
+            .find(|(h, a, _)| *h == hop_host && a.as_slice() == current_addrs.as_slice())
+        {
+            cached.clone()
+        } else {
+            let fresh = build_pinned_web_client(
+                cfg.default_timeout_secs,
+                current_url.host_str(),
+                &current_addrs,
+            )?;
+            client_cache.push((hop_host, current_addrs.clone(), fresh.clone()));
+            fresh
+        };
         let mut req = hop_client
             .request(current_method.clone(), current_url.clone())
             .headers(current_headers.clone());
@@ -968,6 +1111,71 @@ pub async fn exec_web_fetch(
         }
     };
 
+    let is_yt = is_youtube_url(url);
+    if is_yt {
+        let encoded_url: String = url::form_urlencoded::byte_serialize(url.as_bytes()).collect();
+        let oembed_url = format!("https://www.youtube.com/oembed?url={encoded_url}&format=json");
+        let mut oembed_headers = HeaderMap::new();
+        oembed_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        if let Ok(oembed_resp) =
+            fetch_validated_url(reqwest::Method::GET, &oembed_url, oembed_headers, None, cfg).await
+        {
+            if oembed_resp.status == 200 {
+                if let Ok(val) = serde_json::from_slice::<Value>(&oembed_resp.body) {
+                    let title = val
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("YouTube Video")
+                        .trim();
+                    let author_name = val
+                        .get("author_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let author_url = val
+                        .get("author_url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let media_type = val
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("video")
+                        .trim();
+
+                    let formatted = if extract_mode == "text" {
+                        if !author_name.is_empty() {
+                            format!("{title}\n\nChannel: {author_name} ({author_url})\nType: {media_type}\nURL: {url}")
+                        } else {
+                            format!("{title}\nType: {media_type}\nURL: {url}")
+                        }
+                    } else if !author_name.is_empty() {
+                        format!("# {title}\n\n- **Platform**: YouTube ({media_type})\n- **Channel**: [{author_name}]({author_url})\n- **URL**: {url}\n\n[Video content available on YouTube]")
+                    } else {
+                        format!("# {title}\n\n- **Platform**: YouTube ({media_type})\n- **URL**: {url}\n\n[Video content available on YouTube]")
+                    };
+
+                    let (bounded, chars_truncated) = match max_chars {
+                        Some(limit) => truncate_to_chars(&formatted, limit),
+                        None => (formatted, false),
+                    };
+                    let wrapped = wrap_untrusted_web_content(url, &bounded);
+
+                    return Ok(json!({
+                        "ok": true,
+                        "blocked_by_challenge": false,
+                        "status": 200,
+                        "url": url,
+                        "title": Some(title.to_string()),
+                        "extract_mode": extract_mode,
+                        "content": wrapped,
+                        "truncated": chars_truncated,
+                    }));
+                }
+            }
+        }
+    }
+
     let mut headers = HeaderMap::new();
     headers.insert(
         ACCEPT,
@@ -988,7 +1196,9 @@ pub async fn exec_web_fetch(
         }));
     }
 
-    let (title, extracted) = if looks_like_html(&resp.headers, &raw) {
+    let (og_title, og_desc) = extract_opengraph_metadata(&raw);
+
+    let (mut title, extracted) = if looks_like_html(&resp.headers, &raw) {
         if extract_mode == "text" {
             extract_title_and_text(&raw)
         } else {
@@ -998,9 +1208,33 @@ pub async fn exec_web_fetch(
         (None, raw)
     };
 
+    if title.is_none() {
+        title = og_title.clone();
+    }
+
+    let effective_content = if (is_yt || extracted.trim().is_empty())
+        && (og_title.is_some() || og_desc.is_some())
+    {
+        let t = og_title.as_deref().or(title.as_deref()).unwrap_or("Media");
+        let d = og_desc.as_deref().unwrap_or("");
+        if extract_mode == "text" {
+            if !d.is_empty() {
+                format!("{t}\n\n{d}")
+            } else {
+                t.to_string()
+            }
+        } else if !d.is_empty() {
+            format!("# {t}\n\n{d}")
+        } else {
+            format!("# {t}")
+        }
+    } else {
+        extracted
+    };
+
     let (bounded, chars_truncated) = match max_chars {
-        Some(limit) => truncate_to_chars(&extracted, limit),
-        None => (extracted, false),
+        Some(limit) => truncate_to_chars(&effective_content, limit),
+        None => (effective_content, false),
     };
     let wrapped = wrap_untrusted_web_content(&resp.final_url, &bounded);
 
@@ -1014,6 +1248,71 @@ pub async fn exec_web_fetch(
         "content": wrapped,
         "truncated": resp.truncated || chars_truncated,
     }))
+}
+
+fn is_youtube_url(url: &str) -> bool {
+    static YT_RE: OnceLock<Regex> = OnceLock::new();
+    let re = YT_RE.get_or_init(|| {
+        RegexBuilder::new(
+            r"(?i)(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/)|youtu\.be/)([\w-]{11})",
+        )
+        .build()
+        .expect("valid static regex")
+    });
+    re.is_match(url)
+}
+
+fn extract_opengraph_metadata(html: &str) -> (Option<String>, Option<String>) {
+    static OG_TITLE_RE: OnceLock<Regex> = OnceLock::new();
+    static OG_DESC_RE: OnceLock<Regex> = OnceLock::new();
+    static OG_TITLE_REV: OnceLock<Regex> = OnceLock::new();
+    static OG_DESC_REV: OnceLock<Regex> = OnceLock::new();
+
+    let title_re = OG_TITLE_RE.get_or_init(|| {
+        RegexBuilder::new(
+            r#"(?is)<meta\b[^>]*?(?:property|name)\s*=\s*["'](?:og:title|twitter:title)["'][^>]*?content\s*=\s*["']([^"']*)["'][^>]*>"#,
+        )
+        .build()
+        .expect("valid static regex")
+    });
+    let desc_re = OG_DESC_RE.get_or_init(|| {
+        RegexBuilder::new(
+            r#"(?is)<meta\b[^>]*?(?:property|name)\s*=\s*["'](?:og:description|twitter:description|description)["'][^>]*?content\s*=\s*["']([^"']*)["'][^>]*>"#,
+        )
+        .build()
+        .expect("valid static regex")
+    });
+
+    let title_rev = OG_TITLE_REV.get_or_init(|| {
+        RegexBuilder::new(
+            r#"(?is)<meta\b[^>]*?content\s*=\s*["']([^"']*)["'][^>]*?(?:property|name)\s*=\s*["'](?:og:title|twitter:title)["'][^>]*>"#,
+        )
+        .build()
+        .expect("valid static regex")
+    });
+    let desc_rev = OG_DESC_REV.get_or_init(|| {
+        RegexBuilder::new(
+            r#"(?is)<meta\b[^>]*?content\s*=\s*["']([^"']*)["'][^>]*?(?:property|name)\s*=\s*["'](?:og:description|twitter:description|description)["'][^>]*>"#,
+        )
+        .build()
+        .expect("valid static regex")
+    });
+
+    let title = title_re
+        .captures(html)
+        .or_else(|| title_rev.captures(html))
+        .map(|c| decode_html_entities(&c[1]))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let desc = desc_re
+        .captures(html)
+        .or_else(|| desc_rev.captures(html))
+        .map(|c| decode_html_entities(&c[1]))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    (title, desc)
 }
 
 #[derive(Debug, Clone)]
@@ -1052,9 +1351,201 @@ fn resolve_search_provider(requested: Option<&str>, cfg: &ToolsConfig) -> Result
     };
 
     match selected.as_str() {
-        "duckduckgo" | "searxng" | "brave" | "tavily" => Ok(selected),
+        "duckduckgo" | "duckduckgo_lite" | "searxng" | "brave" | "tavily" => Ok(selected),
         other => Err(AgentError::InvalidInput(format!(
-            "unsupported web_search provider '{other}'; expected duckduckgo, searxng, brave, or tavily"
+            "unsupported web_search provider '{other}'; expected duckduckgo, duckduckgo_lite, searxng, brave, or tavily"
+        ))),
+    }
+}
+
+fn build_search_fallback_chain(starting_provider: &str, cfg: &ToolsConfig) -> Vec<String> {
+    const CANONICAL_CHAIN: [&str; 5] = [
+        "duckduckgo",
+        "duckduckgo_lite",
+        "searxng",
+        "brave",
+        "tavily",
+    ];
+
+    let start_idx = CANONICAL_CHAIN
+        .iter()
+        .position(|p| p.eq_ignore_ascii_case(starting_provider))
+        .unwrap_or(0);
+
+    let mut chain = Vec::new();
+    chain.push(CANONICAL_CHAIN[start_idx].to_string());
+
+    for p in &CANONICAL_CHAIN[start_idx + 1..] {
+        match *p {
+            "duckduckgo" | "duckduckgo_lite" => chain.push(p.to_string()),
+            "searxng" => {
+                if !cfg.searxng_url.trim().is_empty() {
+                    chain.push(p.to_string());
+                }
+            }
+            "brave" => {
+                if !cfg.brave_api_key.trim().is_empty() {
+                    chain.push(p.to_string());
+                }
+            }
+            "tavily" => {
+                if !cfg.tavily_api_key.trim().is_empty() {
+                    chain.push(p.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    chain
+}
+
+fn prepare_provider_request(
+    provider: &str,
+    effective_query: &str,
+    freshness: Option<&str>,
+    count: usize,
+    cfg: &ToolsConfig,
+) -> Result<(reqwest::Method, Url, HeaderMap, Option<Vec<u8>>)> {
+    match provider {
+        "duckduckgo" => {
+            let mut u = Url::parse("https://html.duckduckgo.com/html/")
+                .expect("valid static duckduckgo URL");
+            {
+                let mut pairs = u.query_pairs_mut();
+                pairs.append_pair("q", effective_query);
+                if let Some(f) = freshness {
+                    let df = match f {
+                        "day" | "pd" | "d" => Some("d"),
+                        "week" | "pw" | "w" => Some("w"),
+                        "month" | "pm" | "m" => Some("m"),
+                        "year" | "py" | "y" => Some("y"),
+                        _ => None,
+                    };
+                    if let Some(df_val) = df {
+                        pairs.append_pair("df", df_val);
+                    }
+                }
+            }
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml"));
+            Ok((reqwest::Method::GET, u, hdrs, None))
+        }
+        "duckduckgo_lite" => {
+            let mut u = Url::parse("https://lite.duckduckgo.com/lite/")
+                .expect("valid static duckduckgo lite URL");
+            {
+                let mut pairs = u.query_pairs_mut();
+                pairs.append_pair("q", effective_query);
+                if let Some(f) = freshness {
+                    let df = match f {
+                        "day" | "pd" | "d" => Some("d"),
+                        "week" | "pw" | "w" => Some("w"),
+                        "month" | "pm" | "m" => Some("m"),
+                        "year" | "py" | "y" => Some("y"),
+                        _ => None,
+                    };
+                    if let Some(df_val) = df {
+                        pairs.append_pair("df", df_val);
+                    }
+                }
+            }
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml"));
+            Ok((reqwest::Method::GET, u, hdrs, None))
+        }
+        "searxng" => {
+            if cfg.searxng_url.trim().is_empty() {
+                return Err(AgentError::InvalidInput(
+                    "searxng search requires tools.searxng_url to be configured".into(),
+                ));
+            }
+            let mut u = searxng_search_url(&cfg.searxng_url)?;
+            {
+                let mut pairs = u.query_pairs_mut();
+                pairs.append_pair("q", effective_query);
+                pairs.append_pair("format", "json");
+                if let Some(f) = freshness {
+                    let tr = match f {
+                        "pd" | "d" => "day",
+                        "pw" | "w" => "week",
+                        "pm" | "m" => "month",
+                        "py" | "y" => "year",
+                        other => other,
+                    };
+                    pairs.append_pair("time_range", tr);
+                }
+            }
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert(ACCEPT, HeaderValue::from_static("application/json"));
+            Ok((reqwest::Method::GET, u, hdrs, None))
+        }
+        "brave" => {
+            if cfg.brave_api_key.trim().is_empty() {
+                return Err(AgentError::InvalidInput(
+                    "brave search requires tools.brave_api_key to be configured".into(),
+                ));
+            }
+            let mut u = Url::parse("https://api.search.brave.com/res/v1/web/search")
+                .expect("valid static brave URL");
+            {
+                let mut pairs = u.query_pairs_mut();
+                pairs.append_pair("q", effective_query);
+                pairs.append_pair("count", &count.to_string());
+                if let Some(f) = freshness {
+                    let bf = match f {
+                        "day" | "d" => "pd",
+                        "week" | "w" => "pw",
+                        "month" | "m" => "pm",
+                        "year" | "y" => "py",
+                        other => other,
+                    };
+                    pairs.append_pair("freshness", bf);
+                }
+            }
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert(ACCEPT, HeaderValue::from_static("application/json"));
+            let token = HeaderValue::from_str(cfg.brave_api_key.trim()).map_err(|e| {
+                AgentError::InvalidInput(format!("invalid tools.brave_api_key header value: {e}"))
+            })?;
+            hdrs.insert(HeaderName::from_static("x-subscription-token"), token);
+            Ok((reqwest::Method::GET, u, hdrs, None))
+        }
+        "tavily" => {
+            if cfg.tavily_api_key.trim().is_empty() {
+                return Err(AgentError::InvalidInput(
+                    "tavily search requires tools.tavily_api_key to be configured".into(),
+                ));
+            }
+            let u = Url::parse("https://api.tavily.com/search")
+                .expect("valid static tavily URL");
+            let mut payload = json!({
+                "api_key": cfg.tavily_api_key.trim(),
+                "query": effective_query,
+                "max_results": count,
+                "search_depth": "basic",
+            });
+            if let Some(f) = freshness {
+                let tr = match f {
+                    "pd" | "d" => "day",
+                    "pw" | "w" => "week",
+                    "pm" | "m" => "month",
+                    "py" | "y" => "year",
+                    other => other,
+                };
+                payload["time_range"] = Value::String(tr.to_string());
+            }
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            hdrs.insert(ACCEPT, HeaderValue::from_static("application/json"));
+            Ok((
+                reqwest::Method::POST,
+                u,
+                hdrs,
+                Some(serde_json::to_vec(&payload).unwrap_or_default()),
+            ))
+        }
+        other => Err(AgentError::InvalidInput(format!(
+            "unsupported web_search provider '{other}'"
         ))),
     }
 }
@@ -1138,7 +1629,8 @@ pub async fn exec_web_search(
         .filter(|s| !s.is_empty());
 
     let freshness = normalize_freshness(args.get("freshness").and_then(|v| v.as_str()));
-    let provider = resolve_search_provider(args.get("provider").and_then(|v| v.as_str()), cfg)?;
+    let initial_provider =
+        resolve_search_provider(args.get("provider").and_then(|v| v.as_str()), cfg)?;
 
     let effective_query = match domain {
         Some(ref dom) if !raw_query.to_ascii_lowercase().contains("site:") => {
@@ -1147,179 +1639,161 @@ pub async fn exec_web_search(
         _ => raw_query.to_string(),
     };
 
-    let (method, request_url, mut headers, body) = match provider.as_str() {
-        "duckduckgo" => {
-            let mut u = Url::parse("https://html.duckduckgo.com/html/")
-                .expect("valid static duckduckgo URL");
-            {
-                let mut pairs = u.query_pairs_mut();
-                pairs.append_pair("q", &effective_query);
-                if let Some(ref f) = freshness {
-                    let df = match f.as_str() {
-                        "day" | "pd" | "d" => Some("d"),
-                        "week" | "pw" | "w" => Some("w"),
-                        "month" | "pm" | "m" => Some("m"),
-                        "year" | "py" | "y" => Some("y"),
-                        _ => None,
-                    };
-                    if let Some(df_val) = df {
-                        pairs.append_pair("df", df_val);
-                    }
-                }
+    let chain = build_search_fallback_chain(&initial_provider, cfg);
+    let mut last_challenge: Option<(String, String, u16, String)> = None;
+    let mut last_error: Option<String> = None;
+
+    for current_provider in chain {
+        let (method, request_url, mut headers, body) = match prepare_provider_request(
+            &current_provider,
+            &effective_query,
+            freshness.as_deref(),
+            count,
+            cfg,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                last_error = Some(e.to_string());
+                continue;
             }
-            let mut hdrs = HeaderMap::new();
-            hdrs.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml"));
-            (reqwest::Method::GET, u, hdrs, None)
+        };
+
+        if let Err(e) = validate_web_url(request_url.as_str(), cfg).await {
+            last_error = Some(e.to_string());
+            continue;
         }
-        "searxng" => {
-            if cfg.searxng_url.trim().is_empty() {
-                return Err(AgentError::InvalidInput(
-                    "searxng search requires tools.searxng_url to be configured".into(),
-                ));
-            }
-            let mut u = searxng_search_url(&cfg.searxng_url)?;
-            {
-                let mut pairs = u.query_pairs_mut();
-                pairs.append_pair("q", &effective_query);
-                pairs.append_pair("format", "json");
-                if let Some(ref f) = freshness {
-                    let tr = match f.as_str() {
-                        "pd" | "d" => "day",
-                        "pw" | "w" => "week",
-                        "pm" | "m" => "month",
-                        "py" | "y" => "year",
-                        other => other,
-                    };
-                    pairs.append_pair("time_range", tr);
+
+        let cache_key = SearchCacheKey {
+            provider: current_provider.clone(),
+            endpoint_url: request_url.to_string(),
+            query: effective_query.clone(),
+            count,
+            freshness: freshness.clone(),
+            domain: domain.clone(),
+        };
+
+        if let Ok(mut cache) = search_cache().lock() {
+            if let Some(mut cached_resp) = cache.get(&cache_key) {
+                if let Some(obj) = cached_resp.as_object_mut() {
+                    obj.insert("cached".to_string(), Value::Bool(true));
                 }
+                return Ok(cached_resp);
             }
-            let mut hdrs = HeaderMap::new();
-            hdrs.insert(ACCEPT, HeaderValue::from_static("application/json"));
-            (reqwest::Method::GET, u, hdrs, None)
         }
-        "brave" => {
-            if cfg.brave_api_key.trim().is_empty() {
-                return Err(AgentError::InvalidInput(
-                    "brave search requires tools.brave_api_key to be configured".into(),
-                ));
+
+        headers.entry(ACCEPT).or_insert_with(|| HeaderValue::from_static("*/*"));
+
+        let mut resp_result = fetch_validated_url(
+            method.clone(),
+            request_url.as_str(),
+            headers.clone(),
+            body.clone(),
+            cfg,
+        )
+        .await;
+
+        let needs_retry = match &resp_result {
+            Ok(resp) => {
+                resp.status == 429
+                    || resp.status == 503
+                    || detect_challenge_gate(
+                        resp.status,
+                        &resp.headers,
+                        &String::from_utf8_lossy(&resp.body),
+                    )
+                    .is_some()
             }
-            let mut u = Url::parse("https://api.search.brave.com/res/v1/web/search")
-                .expect("valid static brave URL");
-            {
-                let mut pairs = u.query_pairs_mut();
-                pairs.append_pair("q", &effective_query);
-                pairs.append_pair("count", &count.to_string());
-                if let Some(ref f) = freshness {
-                    let bf = match f.as_str() {
-                        "day" | "d" => "pd",
-                        "week" | "w" => "pw",
-                        "month" | "m" => "pm",
-                        "year" | "y" => "py",
-                        other => other,
-                    };
-                    pairs.append_pair("freshness", bf);
-                }
-            }
-            let mut hdrs = HeaderMap::new();
-            hdrs.insert(ACCEPT, HeaderValue::from_static("application/json"));
-            let token = HeaderValue::from_str(cfg.brave_api_key.trim()).map_err(|e| {
-                AgentError::InvalidInput(format!("invalid tools.brave_api_key header value: {e}"))
-            })?;
-            hdrs.insert(HeaderName::from_static("x-subscription-token"), token);
-            (reqwest::Method::GET, u, hdrs, None)
-        }
-        "tavily" => {
-            if cfg.tavily_api_key.trim().is_empty() {
-                return Err(AgentError::InvalidInput(
-                    "tavily search requires tools.tavily_api_key to be configured".into(),
-                ));
-            }
-            let u = Url::parse("https://api.tavily.com/search")
-                .expect("valid static tavily URL");
-            let mut payload = json!({
-                "api_key": cfg.tavily_api_key.trim(),
-                "query": effective_query,
-                "max_results": count,
-                "search_depth": "basic",
-            });
-            if let Some(ref f) = freshness {
-                let tr = match f.as_str() {
-                    "pd" | "d" => "day",
-                    "pw" | "w" => "week",
-                    "pm" | "m" => "month",
-                    "py" | "y" => "year",
-                    other => other,
-                };
-                payload["time_range"] = Value::String(tr.to_string());
-            }
-            let mut hdrs = HeaderMap::new();
-            hdrs.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            hdrs.insert(ACCEPT, HeaderValue::from_static("application/json"));
-            (
-                reqwest::Method::POST,
-                u,
-                hdrs,
-                Some(serde_json::to_vec(&payload).unwrap_or_default()),
+            Err(err) => matches!(err, AgentError::Timeout(_)),
+        };
+
+        if needs_retry {
+            let jitter_bytes = uuid::Uuid::new_v4();
+            let jitter_ms =
+                u64::from_le_bytes(jitter_bytes.as_bytes()[..8].try_into().unwrap()) % 250;
+            tokio::time::sleep(Duration::from_millis(500 + jitter_ms)).await;
+
+            resp_result = fetch_validated_url(
+                method,
+                request_url.as_str(),
+                headers,
+                body,
+                cfg,
             )
+            .await;
         }
-        _ => unreachable!("validated provider above"),
-    };
 
-    // Always validate provider URL against current network/SSRF/domain policy before cache lookup.
-    validate_web_url(request_url.as_str(), cfg).await?;
-
-    let cache_key = SearchCacheKey {
-        provider: provider.clone(),
-        endpoint_url: request_url.to_string(),
-        query: effective_query.clone(),
-        count,
-        freshness: freshness.clone(),
-        domain: domain.clone(),
-    };
-    if let Ok(mut cache) = search_cache().lock() {
-        if let Some(mut cached_resp) = cache.get(&cache_key) {
-            if let Some(obj) = cached_resp.as_object_mut() {
-                obj.insert("cached".to_string(), Value::Bool(true));
+        let resp = match resp_result {
+            Ok(r) => r,
+            Err(err) => {
+                last_error = Some(err.to_string());
+                continue;
             }
-            return Ok(cached_resp);
+        };
+
+        let body_text = String::from_utf8_lossy(&resp.body);
+        if let Some(kind) = detect_challenge_gate(resp.status, &resp.headers, &body_text) {
+            last_challenge = Some((current_provider.clone(), kind, resp.status, resp.final_url));
+            continue;
         }
+
+        if resp.status >= 400 {
+            last_error = Some(format!(
+                "search provider '{current_provider}' returned HTTP {}",
+                resp.status
+            ));
+            continue;
+        }
+
+        let items = match current_provider.as_str() {
+            "duckduckgo" => parse_duckduckgo_html(&body_text, count),
+            "duckduckgo_lite" => parse_duckduckgo_lite_html(&body_text, count),
+            "searxng" => match parse_searxng_json(&body_text, count) {
+                Ok(items) => items,
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    continue;
+                }
+            },
+            "brave" => match parse_brave_json(&body_text, count) {
+                Ok(items) => items,
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    continue;
+                }
+            },
+            "tavily" => match parse_tavily_json(&body_text, count) {
+                Ok(items) => items,
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    continue;
+                }
+            },
+            _ => Vec::new(),
+        };
+
+        let response = format_search_response(&current_provider, &effective_query, false, &items);
+        if let Ok(mut cache) = search_cache().lock() {
+            cache.insert(cache_key, response.clone());
+        }
+        return Ok(response);
     }
 
-    headers.entry(ACCEPT).or_insert_with(|| HeaderValue::from_static("*/*"));
-    let resp = fetch_validated_url(method, request_url.as_str(), headers, body, cfg).await?;
-    let body_text = String::from_utf8_lossy(&resp.body);
-
-    if let Some(kind) = detect_challenge_gate(resp.status, &resp.headers, &body_text) {
+    if let Some((provider, kind, status, final_url)) = last_challenge {
         return Ok(json!({
             "ok": false,
             "blocked_by_challenge": true,
             "challenge_kind": kind,
             "provider": provider,
-            "status": resp.status,
-            "url": resp.final_url,
+            "status": status,
+            "url": final_url,
         }));
     }
 
-    if resp.status >= 400 {
-        return Err(AgentError::Tool {
-            tool_id: "web_search".into(),
-            message: format!("search provider '{provider}' returned HTTP {}", resp.status),
-        });
-    }
-
-    let items = match provider.as_str() {
-        "duckduckgo" => parse_duckduckgo_html(&body_text, count),
-        "searxng" => parse_searxng_json(&body_text, count)?,
-        "brave" => parse_brave_json(&body_text, count)?,
-        "tavily" => parse_tavily_json(&body_text, count)?,
-        _ => Vec::new(),
-    };
-
-    let response = format_search_response(&provider, &effective_query, false, &items);
-    if let Ok(mut cache) = search_cache().lock() {
-        cache.insert(cache_key, response.clone());
-    }
-    Ok(response)
+    Err(AgentError::Tool {
+        tool_id: "web_search".into(),
+        message: last_error
+            .unwrap_or_else(|| "all search providers in fallback chain failed".into()),
+    })
 }
 
 fn parse_json_search_items(
@@ -1569,6 +2043,89 @@ fn parse_duckduckgo_html(html: &str, limit: usize) -> Vec<SearchResultItem> {
         });
     }
     results
+}
+
+fn parse_duckduckgo_lite_html(html: &str, limit: usize) -> Vec<SearchResultItem> {
+    let standard = parse_duckduckgo_html(html, limit);
+    if !standard.is_empty() {
+        return standard;
+    }
+
+    static TABLE_ROW_RE: OnceLock<Regex> = OnceLock::new();
+    let row_re = TABLE_ROW_RE.get_or_init(|| {
+        RegexBuilder::new(r"(?is)<tr\b[^>]*>(.*?)</tr>")
+            .build()
+            .expect("valid static regex")
+    });
+    static ANCHOR_RE: OnceLock<Regex> = OnceLock::new();
+    let anchor_re = ANCHOR_RE.get_or_init(|| {
+        RegexBuilder::new(r"(?is)<a\b([^>]*)>(.*?)</a>")
+            .build()
+            .expect("valid static regex")
+    });
+
+    let mut results = Vec::new();
+    let mut pending_title_url: Option<(String, String)> = None;
+
+    for row_cap in row_re.captures_iter(html) {
+        if results.len() >= limit {
+            break;
+        }
+        let row_content = &row_cap[1];
+
+        let mut found_anchor = None;
+        for cap in anchor_re.captures_iter(row_content) {
+            let attrs = &cap[1];
+            if let Some(href) = extract_attr(attrs, "href") {
+                if let Some(unwrapped) = unwrap_duckduckgo_href(&href) {
+                    let title = strip_tags_and_collapse(&cap[2]);
+                    if !title.is_empty() && !is_ddg_nav_title(&title) {
+                        found_anchor = Some((title, unwrapped));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some((t, u)) = found_anchor {
+            if let Some((prev_t, prev_u)) = pending_title_url.take() {
+                results.push(SearchResultItem {
+                    title: prev_t,
+                    url: prev_u,
+                    snippet: String::new(),
+                });
+            }
+            pending_title_url = Some((t, u));
+        } else if let Some((prev_t, prev_u)) = pending_title_url.take() {
+            let snippet = extract_ddg_snippet(row_content)
+                .unwrap_or_else(|| strip_tags_and_collapse(row_content));
+            results.push(SearchResultItem {
+                title: prev_t,
+                url: prev_u,
+                snippet,
+            });
+        }
+    }
+
+    if let Some((prev_t, prev_u)) = pending_title_url {
+        if results.len() < limit {
+            results.push(SearchResultItem {
+                title: prev_t,
+                url: prev_u,
+                snippet: String::new(),
+            });
+        }
+    }
+
+    results
+}
+
+fn is_ddg_nav_title(title: &str) -> bool {
+    let lower = title.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "next" | "previous" | "next page" | "prev page" | "duckduckgo" | "feedback"
+    )
 }
 
 fn truncate_to_chars(s: &str, max_chars: usize) -> (String, bool) {
@@ -2305,5 +2862,152 @@ mod tests {
         let oversized = "a".repeat(MAX_EXTRACT_HTML_BYTES + 1);
         let err = exec_extract_html_text(&json!({ "html": oversized })).unwrap_err();
         assert!(matches!(err, AgentError::LimitExceeded(_)));
+    }
+
+    #[test]
+    fn browser_headers_profile_rotates_and_attaches_headers() {
+        let p1 = BrowserHeadersProfile::rotate();
+        let p2 = BrowserHeadersProfile::rotate();
+        assert!(!p1.user_agent.is_empty());
+        assert!(!p2.user_agent.is_empty());
+
+        let mut headers = HeaderMap::new();
+        p1.apply_to_headers(&mut headers);
+        assert_eq!(
+            headers.get("sec-ch-ua-mobile").unwrap().to_str().unwrap(),
+            "?0"
+        );
+        assert_eq!(
+            headers.get("sec-fetch-dest").unwrap().to_str().unwrap(),
+            "document"
+        );
+        assert_eq!(
+            headers.get("sec-fetch-mode").unwrap().to_str().unwrap(),
+            "navigate"
+        );
+        assert_eq!(
+            headers.get("upgrade-insecure-requests").unwrap().to_str().unwrap(),
+            "1"
+        );
+        assert!(headers.get("accept-language").is_some());
+    }
+
+    #[test]
+    fn duckduckgo_lite_html_table_parser_extracts_results() {
+        let lite_html = r#"
+        <table border="0">
+          <tr>
+            <td valign="top">1.&nbsp;</td>
+            <td>
+              <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.rust-lang.org%2F&amp;rut=1">Rust Programming Language</a>
+            </td>
+          </tr>
+          <tr>
+            <td>&nbsp;</td>
+            <td class="result-snippet">A language empowering everyone to build reliable and efficient software.</td>
+          </tr>
+          <tr>
+            <td valign="top">2.&nbsp;</td>
+            <td>
+              <a rel="nofollow" href="https://crates.io">Crates.io: The Rust Package Registry</a>
+            </td>
+          </tr>
+          <tr>
+            <td>&nbsp;</td>
+            <td class="result-snippet">Search and publish crates for the Rust ecosystem.</td>
+          </tr>
+        </table>
+        "#;
+        let items = parse_duckduckgo_lite_html(lite_html, 5);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Rust Programming Language");
+        assert_eq!(items[0].url, "https://www.rust-lang.org/");
+        assert_eq!(
+            items[0].snippet,
+            "A language empowering everyone to build reliable and efficient software."
+        );
+        assert_eq!(items[1].title, "Crates.io: The Rust Package Registry");
+        assert_eq!(items[1].url, "https://crates.io/");
+        assert_eq!(
+            items[1].snippet,
+            "Search and publish crates for the Rust ecosystem."
+        );
+    }
+
+    #[test]
+    fn youtube_url_detection_and_opengraph_extraction() {
+        assert!(is_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(is_youtube_url("https://youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(is_youtube_url("https://youtu.be/dQw4w9WgXcQ"));
+        assert!(is_youtube_url("https://www.youtube.com/shorts/dQw4w9WgXcQ"));
+        assert!(is_youtube_url("https://www.youtube.com/watch?feature=shared&v=dQw4w9WgXcQ"));
+        assert!(!is_youtube_url("https://example.com/watch?v=dQw4w9WgXcQ"));
+
+        let sample_html = r#"
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta property="og:title" content="Rick Astley - Never Gonna Give You Up">
+          <meta property="og:description" content="The official video for Never Gonna Give You Up by Rick Astley">
+        </head>
+        <body><div id="player"></div></body>
+        </html>
+        "#;
+        let (title, desc) = extract_opengraph_metadata(sample_html);
+        assert_eq!(
+            title.as_deref(),
+            Some("Rick Astley - Never Gonna Give You Up")
+        );
+        assert_eq!(
+            desc.as_deref(),
+            Some("The official video for Never Gonna Give You Up by Rick Astley")
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_opengraph_fallback_for_media() {
+        let app = Router::new().route(
+            "/yt-mock",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/html")],
+                    r#"<!DOCTYPE html>
+                    <html>
+                    <head>
+                      <meta property="og:title" content="PS5 System Architecture Deep Dive">
+                      <meta property="og:description" content="Detailed analysis of custom Zen2 and RDNA2 GPU.">
+                    </head>
+                    <body><div id="app"></div><script>loadVideo();</script></body>
+                    </html>"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = local_cfg(true);
+        let client = build_web_client(5).unwrap();
+
+        let fetched = exec_web_fetch(
+            &json!({
+                "url": format!("http://127.0.0.1:{port}/yt-mock"),
+                "extract_mode": "markdown",
+            }),
+            &cfg,
+            &client,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fetched["ok"], true);
+        assert_eq!(fetched["title"], "PS5 System Architecture Deep Dive");
+        let content = fetched["content"].as_str().unwrap();
+        assert!(content.contains("# PS5 System Architecture Deep Dive"));
+        assert!(content.contains("Detailed analysis of custom Zen2 and RDNA2 GPU."));
     }
 }

@@ -3743,4 +3743,694 @@ mod tests {
                 && a.5 == "completed"
         }));
     }
+
+    fn push_write_file_tool(tools: &mut MockToolExecutor) {
+        tools.specs.push(ToolSpec {
+            id: "write_file".into(),
+            name: "write_file".into(),
+            category: "files".into(),
+            description: "write file".into(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            output_schema: serde_json::json!({ "type": "object" }),
+            required_permissions: vec![],
+            requires_approval: false,
+            is_mutating: true,
+            enabled: true,
+            timeout_secs: 10,
+        });
+    }
+
+    #[tokio::test]
+    async fn commander_direct_chat_intercepts_write_file_and_delegates_to_programmer() {
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        // Turn 1: Commander attempts write_file directly -> intercepted & delegated to programmer.
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "cmd-wf-1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "scrape.py", "content": "print(1)" }),
+        }]);
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "prog-wf-1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "scrape.py", "content": "print('ok')" }),
+        }]);
+        inf.push_text("Created scrape.py cleanly.");
+        inf.push_text("Programmer saved scrape.py.");
+
+        // Turn 2: Commander attempts legacy alias file_write directly -> also intercepted & delegated.
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "cmd-fw-2".into(),
+            name: "file_write".into(),
+            arguments: serde_json::json!({ "path": "backup.sh", "content": "echo hi" }),
+        }]);
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "prog-wf-2".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "backup.sh", "content": "#!/bin/sh\necho ok\n" }),
+        }]);
+        inf.push_text("Created backup.sh cleanly.");
+        inf.push_text("Programmer saved backup.sh.");
+
+        let mut raw_tools = MockToolExecutor::default_suite();
+        push_write_file_tool(&mut raw_tools);
+        let tools = Arc::new(raw_tools);
+        let (storage, rt) = setup_runtime(inf.clone(), tools.clone(), None);
+        create_conv(
+            &storage,
+            "conv-cmd-write",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+
+        let r1 = rt
+            .handle_chat_message(
+                "conv-cmd-write",
+                "Write a Python script to parse logs",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status, TaskStatus::Completed);
+        assert_eq!(r1.agent_id, "commander");
+        assert_eq!(r1.content, "Programmer saved scrape.py.");
+
+        let r2 = rt
+            .handle_chat_message(
+                "conv-cmd-write",
+                "Create a bash script for backups",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status, TaskStatus::Completed);
+        assert_eq!(r2.content, "Programmer saved backup.sh.");
+
+        let execs = tools.executed_contexts.lock().unwrap().clone();
+        assert!(
+            !execs
+                .iter()
+                .any(|(_, _, aid, tid)| aid == "commander" && matches!(tid.as_str(), "write_file" | "file_write")),
+            "commander must never execute write_file/file_write directly: {execs:?}"
+        );
+        assert_eq!(
+            execs
+                .iter()
+                .filter(|(_, _, aid, tid)| aid == "programmer" && tid == "write_file")
+                .count(),
+            2
+        );
+
+        for task_id in [&r1.task_id, &r2.task_id] {
+            let envs = storage.list_agent_messages(Some(task_id), None, 50).unwrap();
+            assert!(
+                envs.iter().any(|e| {
+                    e.sender_agent_id == "commander"
+                        && e.recipient_agent_id == "programmer"
+                        && e.message_type == AgentMessageType::TaskAssignment
+                }),
+                "missing TaskAssignment commander -> programmer for {task_id}"
+            );
+            assert!(
+                envs.iter().any(|e| {
+                    e.sender_agent_id == "programmer"
+                        && e.recipient_agent_id == "commander"
+                        && e.message_type == AgentMessageType::TaskCompleted
+                }),
+                "missing TaskCompleted programmer -> commander for {task_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn commander_direct_chat_intercepts_fenced_code_block_and_delegates_to_programmer() {
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        // Subcase 1: Closed >=4 line HTML block from Commander -> delegated directly via handle_delegate_task.
+        inf.push_text(
+            "Here is your game:\n```html\n<!doctype html>\n<html>\n<body><canvas id=\"c\"></canvas></body>\n</html>\n```",
+        );
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "prog-flappy".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "flappy.html", "content": "<html></html>" }),
+        }]);
+        inf.push_text("Saved flappy.html ([FILE_CREATED: flappy.html]).");
+
+        // Subcase 2: Unclosed fenced Python block hitting length limit -> must delegate instead of auto-continuing Commander.
+        inf.push_fn(|_| InferenceResponse {
+            content: "Draft:\n```python\nimport sys\ndef main():\n    print('hi')\n    return 0".into(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model: "mock-ps5lm".into(),
+            finish_reason: Some("length".into()),
+            usage: TokenUsage::default(),
+            latency_ms: 5,
+            timings: None,
+        });
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "prog-py".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "test.py", "content": "print('hi')" }),
+        }]);
+        inf.push_text("Saved test.py ([FILE_CREATED: test.py]).");
+
+        let mut raw_tools = MockToolExecutor::default_suite();
+        push_write_file_tool(&mut raw_tools);
+        let tools = Arc::new(raw_tools);
+        let (storage, rt) = setup_runtime(inf.clone(), tools.clone(), None);
+        create_conv(
+            &storage,
+            "conv-cmd-fenced",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+
+        let r1 = rt
+            .handle_chat_message(
+                "conv-cmd-fenced",
+                "Build an HTML Flappy Bird game",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status, TaskStatus::Completed);
+        assert_eq!(r1.content, "Saved flappy.html ([FILE_CREATED: flappy.html]).");
+
+        let r2 = rt
+            .handle_chat_message(
+                "conv-cmd-fenced",
+                "Napisz skrypt test.py w Pythonie",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status, TaskStatus::Completed);
+        assert_eq!(r2.content, "Saved test.py ([FILE_CREATED: test.py]).");
+        // 3 inference calls per turn (Commander fence -> Programmer write_file -> Programmer reply), no auto-continuation.
+        assert_eq!(inf.recorded_requests().len(), 6);
+
+        let execs = tools.executed_contexts.lock().unwrap().clone();
+        assert_eq!(
+            execs
+                .iter()
+                .filter(|(_, _, aid, tid)| aid == "programmer" && tid == "write_file")
+                .count(),
+            2
+        );
+        assert!(
+            !execs.iter().any(|(_, _, aid, _)| aid == "commander"),
+            "commander must not execute tools directly in fenced-block Case B: {execs:?}"
+        );
+
+        let tool_records = storage.tool_execs.lock().unwrap().clone();
+        assert_eq!(
+            tool_records
+                .iter()
+                .filter(|r| r.agent_id == "commander" && r.tool_id == "assign_agent_task" && r.success)
+                .count(),
+            2
+        );
+
+        for task_id in [&r1.task_id, &r2.task_id] {
+            let envs = storage.list_agent_messages(Some(task_id), None, 50).unwrap();
+            assert!(envs.iter().any(|e| {
+                e.sender_agent_id == "commander"
+                    && e.recipient_agent_id == "programmer"
+                    && e.message_type == AgentMessageType::TaskAssignment
+            }));
+            assert!(envs.iter().any(|e| {
+                e.sender_agent_id == "programmer"
+                    && e.recipient_agent_id == "commander"
+                    && e.message_type == AgentMessageType::TaskCompleted
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn commander_direct_chat_repetition_abort_on_script_request_delegates_to_programmer() {
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        inf.push_fn(|_| InferenceResponse {
+            content: String::new(),
+            reasoning: Some("Stwórzmy skrypt... Stwórzmy skrypt...".into()),
+            tool_calls: Vec::new(),
+            model: "mock-ps5lm".into(),
+            finish_reason: Some("repetition_abort".into()),
+            usage: TokenUsage::default(),
+            latency_ms: 5,
+            timings: None,
+        });
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "prog-wf-abort".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "analyze.py", "content": "print('ok')" }),
+        }]);
+        inf.push_text("Saved analyze.py.");
+        inf.push_text("Programmer saved analyze.py.");
+
+        let mut raw_tools = MockToolExecutor::default_suite();
+        push_write_file_tool(&mut raw_tools);
+        let tools = Arc::new(raw_tools);
+        let (storage, rt) = setup_runtime(inf.clone(), tools.clone(), None);
+        create_conv(
+            &storage,
+            "conv-cmd-abort",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+
+        let res = rt
+            .handle_chat_message(
+                "conv-cmd-abort",
+                "Stwórz skrypt Pythona do analizy danych",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status, TaskStatus::Completed);
+        assert_eq!(res.content, "Programmer saved analyze.py.");
+        // Ensure Commander keeps assign_agent_task even on smart_tool_routing and delegates cleanly in 4 requests.
+        assert_eq!(inf.recorded_requests().len(), 4);
+        assert!(
+            inf.recorded_requests()[0]
+                .tools
+                .iter()
+                .any(|t| t.name == "assign_agent_task"),
+            "Commander must retain assign_agent_task for script creation requests"
+        );
+
+        let execs = tools.executed_contexts.lock().unwrap().clone();
+        assert!(execs
+            .iter()
+            .any(|(_, _, aid, tid)| aid == "programmer" && tid == "write_file"));
+        let envs = storage
+            .list_agent_messages(Some(&res.task_id), None, 50)
+            .unwrap();
+        assert!(envs.iter().any(|e| {
+            e.sender_agent_id == "commander"
+                && e.recipient_agent_id == "programmer"
+                && e.message_type == AgentMessageType::TaskAssignment
+        }));
+        assert!(envs.iter().any(|e| {
+            e.sender_agent_id == "programmer"
+                && e.recipient_agent_id == "commander"
+                && e.message_type == AgentMessageType::TaskCompleted
+        }));
+    }
+
+    #[tokio::test]
+    async fn auto_coordinator_deterministically_routes_script_creation_to_programmer() {
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        // Case 1: coordinator returns [] -> deterministic fallback selects programmer.
+        inf.push_text(r#"{"selected_agents": []}"#);
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "prog-grp-1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "script.py", "content": "print(1)" }),
+        }]);
+        inf.push_text("Programmer saved script.py.");
+
+        // Case 2: coordinator emits unclosed <think> (malformed JSON) -> deterministic fallback selects programmer.
+        inf.push_text("<think>routing without closing tag");
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "prog-grp-2".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "flappy.html", "content": "<html></html>" }),
+        }]);
+        inf.push_text("Programmer saved flappy.html.");
+
+        // Case 3: short Polish greeting-prefixed coding prompt must NOT trigger casual greeting short-circuit.
+        inf.push_text(r#"{"selected_agents": []}"#);
+        inf.push_text("Programmer created calc.py.");
+
+        let mut raw_tools = MockToolExecutor::default_suite();
+        push_write_file_tool(&mut raw_tools);
+        let tools = Arc::new(raw_tools);
+        let (storage, rt) = setup_runtime(inf.clone(), tools.clone(), None);
+        create_conv(
+            &storage,
+            "conv-grp-code",
+            ConversationMode::Group {
+                participant_agent_ids: vec![
+                    "commander".into(),
+                    "researcher".into(),
+                    "programmer".into(),
+                ],
+            },
+        );
+
+        let r1 = rt
+            .handle_chat_message(
+                "conv-grp-code",
+                "Napisz skrypt Pythona",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.selected_participants, vec!["programmer".to_string()]);
+        assert_eq!(r1.agent_id, "programmer");
+
+        let r2 = rt
+            .handle_chat_message(
+                "conv-grp-code",
+                "Make a Flappy Bird game in HTML",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.selected_participants, vec!["programmer".to_string()]);
+        assert_eq!(r2.agent_id, "programmer");
+
+        let r3 = rt
+            .handle_chat_message(
+                "conv-grp-code",
+                "hej zrób mi kalkulator",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r3.selected_participants, vec!["programmer".to_string()]);
+        assert_eq!(r3.agent_id, "programmer");
+
+        let reqs = inf.recorded_requests();
+        let coord_req = &reqs[0];
+        assert_eq!(coord_req.max_output_tokens, 256);
+        assert!(coord_req.messages[0]
+            .content
+            .starts_with("You are routing a group chat turn. Default to {\"selected_agents\": []} so Commander handles the message directly.\n"));
+        assert!(coord_req.messages[0].content.contains("MUST select [\"programmer\"]"));
+    }
+
+    #[test]
+    fn coding_or_script_creation_classifier_and_prompt_rules_preserve_regressions() {
+        // Positive EN & PL script/code/app/game prompts
+        for prompt in [
+            "Write a Python script to parse JSON",
+            "Create a .py CLI tool",
+            "Build an HTML Flappy Bird game",
+            "Build a website",
+            "Make a pong website",
+            "Generate a powershell bot",
+            "Implement a calculator in HTML",
+            "Napisz skrypt w Pythonie",
+            "Stwórz grę snake w HTML",
+            "Utwórz stronę internetową dla sklepu",
+            "Zbuduj aplikację w HTML",
+            "Wygeneruj funkcję sortującą w .py",
+            "Zrób kalkulator",
+            "Zaprogramuj grę tetris",
+            "Write a python script with a timer",
+            "Write Python code",
+            "Code a simple app",
+            "Please code a calculator in HTML",
+            "Can you code a snake game",
+            "Write a Python script to scrape https://example.com/index.html",
+        ] {
+            assert!(
+                AgentRuntime::is_coding_or_script_creation_request(prompt),
+                "expected coding request = true for: {prompt}"
+            );
+        }
+
+        // Regression & boundary false-positive prompts
+        for prompt in [
+            "Summarize options for programmer",
+            "Could you help organize my weekly roadmap notes?",
+            "Summarize the project layout without specialist tools.",
+            "Summarize system status",
+            "Check status via mcp and read Cargo.toml",
+            "zrób ten task co 60 sekund",
+            "schedule a python backup every 10 minutes",
+            "Zaplanuj codziennie sprawdzanie logów Python",
+            "Execute 9 sequential calculator checks",
+            "Keep calling calculator past limit 3",
+            "Render final HTML only after finishing thought.",
+            "Write a brief for programmer",
+            "Napisz do programmera",
+            "Write a great progress report about the robot",
+            "Write about klasyfikacja and approval approach",
+            "Summarize the code",
+            "Check code.py",
+            "Summarize the Python code",
+            "Check the HTML code",
+            "Explain this JavaScript code",
+            "Read the code in main.py",
+            "Check code.py and test.py",
+            "Inspect error codes in the app",
+            "Show status codes for the website",
+            "Check the build script",
+            "Summarize the HTML build",
+            "Inspect failed builds for the app",
+            "Check build.rs and main.rs",
+            "What creates an HTML page?",
+            "Nightly builds of the app",
+            "Write documentation for app_config",
+            "Write notes on bot_token",
+            "Create a summary of game_state",
+            "Make sure the website is online",
+            "Make sure the Python script finished",
+            "Write a summary of https://example.com/index.html",
+            "Write notes on https://example.com/python/app.py",
+            "hej",
+            "dzien dobry commander",
+        ] {
+            assert!(
+                !AgentRuntime::is_coding_or_script_creation_request(prompt),
+                "expected coding request = false for: {prompt}"
+            );
+        }
+
+        // System prompt rules: Commander prohibits self-writing code; Programmer retains write_file; KV prefix preserved.
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        let tools = Arc::new(MockToolExecutor::default_suite());
+        let (storage, rt) = setup_runtime(inf, tools, None);
+        let cmd = storage.get_agent("commander").unwrap().unwrap();
+        let prog = storage.get_agent("programmer").unwrap().unwrap();
+
+        let cmd_sys_en = rt.build_system_prompt(&cmd, "", true, Some("Hello")).unwrap();
+        let cmd_sys_pl = rt.build_system_prompt(&cmd, "", true, Some("Cześć")).unwrap();
+        let prog_sys = rt.build_system_prompt(&prog, "", true, Some("Hello")).unwrap();
+
+        assert!(cmd_sys_en.contains("Got it, Commander!"));
+        assert!(cmd_sys_en.contains("NEVER repeat your own sentences or paragraphs verbatim"));
+        assert!(cmd_sys_en.contains("NEVER call `write_file` to save code/scripts yourself"));
+        assert!(cmd_sys_en.contains("assign_agent_task"));
+        assert!(prog_sys.contains("save the complete working file via `write_file`"));
+        assert!(!prog_sys.contains("NEVER call `write_file`"));
+
+        let prefix_en = cmd_sys_en.split("\n\nLanguage Requirement:").next().unwrap();
+        let prefix_pl = cmd_sys_pl.split("\n\nLanguage Requirement:").next().unwrap();
+        assert_eq!(prefix_en, prefix_pl);
+    }
+
+    #[tokio::test]
+    async fn bug2_recovery_retries_once_with_thinking_off_after_repetition_abort() {
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        // Subcase A: non-coding prompt hits repetition_abort at ThinkingLevel::High -> retries once with ThinkingLevel::Off.
+        inf.push_fn(|_| InferenceResponse {
+            content: String::new(),
+            reasoning: Some("Let me check. Let me check.".into()),
+            tool_calls: Vec::new(),
+            model: "mock-ps5lm".into(),
+            finish_reason: Some("repetition_abort".into()),
+            usage: TokenUsage::default(),
+            latency_ms: 5,
+            timings: None,
+        });
+        inf.push_text("KV cache warming preloads the static prefix.");
+
+        // Subcase B: post-delegation iter >= 1 hitting repetition_abort must retry Commander with ThinkingLevel::Off, NOT re-delegate!
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "cmd-del-1".into(),
+            name: "assign_agent_task".into(),
+            arguments: serde_json::json!({
+                "target_agent_id": "programmer",
+                "user_request": "Write a Python script for fibonacci"
+            }),
+        }]);
+        inf.push_tool_calls(vec![ToolCallRequest {
+            id: "prog-fib".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "fib.py", "content": "print(1)" }),
+        }]);
+        inf.push_text("Saved fib.py.");
+        inf.push_fn(|_| InferenceResponse {
+            content: String::new(),
+            reasoning: Some("Repeating summary. Repeating summary.".into()),
+            tool_calls: Vec::new(),
+            model: "mock-ps5lm".into(),
+            finish_reason: Some("repetition_abort".into()),
+            usage: TokenUsage::default(),
+            latency_ms: 5,
+            timings: None,
+        });
+        inf.push_text("Programmer created fib.py cleanly.");
+
+        // Subcase C: already ThinkingLevel::Off hitting repetition_abort must NOT send a duplicate identical retry request.
+        inf.push_fn(|_| InferenceResponse {
+            content: String::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model: "mock-ps5lm".into(),
+            finish_reason: Some("repetition_abort".into()),
+            usage: TokenUsage::default(),
+            latency_ms: 5,
+            timings: None,
+        });
+
+        let mut raw_tools = MockToolExecutor::default_suite();
+        push_write_file_tool(&mut raw_tools);
+        let tools = Arc::new(raw_tools);
+        let (storage, rt) = setup_runtime(inf.clone(), tools, None);
+        create_conv(
+            &storage,
+            "conv-bug2-retry",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+
+        let r1 = rt
+            .handle_chat_message_with_options(
+                "conv-bug2-retry",
+                "Explain KV cache warming briefly.",
+                None,
+                Some(ThinkingLevel::High),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.content, "KV cache warming preloads the static prefix.");
+
+        let r2 = rt
+            .handle_chat_message_with_options(
+                "conv-bug2-retry",
+                "Write a Python script for fibonacci",
+                None,
+                Some(ThinkingLevel::High),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.content, "Programmer created fib.py cleanly.");
+
+        let r3 = rt
+            .handle_chat_message_with_options(
+                "conv-bug2-retry",
+                "Summarize status cleanly",
+                None,
+                Some(ThinkingLevel::Off),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(r3.content.is_empty());
+
+        let reqs = inf.recorded_requests();
+        // Subcase A: 2 requests (High -> Off); Subcase B: 5 requests (Cmd delegate -> Prog tool -> Prog reply -> Cmd abort -> Cmd Off); Subcase C: 1 request (Off, no duplicate).
+        assert_eq!(reqs.len(), 8);
+        assert_eq!(reqs[0].thinking_level, ThinkingLevel::High);
+        assert_eq!(reqs[1].thinking_level, ThinkingLevel::Off);
+        assert_eq!(reqs[5].thinking_level, ThinkingLevel::High);
+        assert_eq!(reqs[6].thinking_level, ThinkingLevel::Off);
+        assert_eq!(reqs[7].thinking_level, ThinkingLevel::Off);
+
+        let r2_envs = storage
+            .list_agent_messages(Some(&r2.task_id), None, 50)
+            .unwrap();
+        assert_eq!(
+            r2_envs
+                .iter()
+                .filter(|e| e.message_type == AgentMessageType::TaskAssignment)
+                .count(),
+            1,
+            "must not re-delegate to programmer after delegation already occurred"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_turn_kv_cache_prefix_stays_byte_identical_across_languages_and_prefill() {
+        let inf = Arc::new(ScriptedInferenceProvider::new());
+        inf.push_text("Hello! Ready to help.");
+        inf.push_text("Jasne, chętnie pomogę.");
+
+        let mut raw_tools = MockToolExecutor::default_suite();
+        // Ensure > 12 tools so smart_tool_routing is active on turn 1 but disabled on turn 2+.
+        for i in 0..14 {
+            raw_tools.specs.push(ToolSpec {
+                id: format!("extra_tool_{i}"),
+                name: format!("extra_tool_{i}"),
+                category: "files".into(),
+                description: "extra".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                output_schema: serde_json::json!({ "type": "object" }),
+                required_permissions: vec![],
+                requires_approval: false,
+                is_mutating: false,
+                enabled: true,
+                timeout_secs: 10,
+            });
+        }
+        let tools = Arc::new(raw_tools);
+        let mut cfg = AppConfig::default();
+        cfg.inference.prefill_kv_cache = true;
+        cfg.inference.smart_tool_routing = true;
+        let (storage, rt) = setup_runtime(inf.clone(), tools, Some(cfg));
+
+        create_conv(
+            &storage,
+            "conv-kv-prefix",
+            ConversationMode::Direct {
+                agent_id: "commander".into(),
+            },
+        );
+
+        let r1 = rt
+            .handle_chat_message("conv-kv-prefix", "Hello there", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(r1.status, TaskStatus::Completed);
+
+        for _ in 0..50 {
+            if !inf.prefill_requests().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let r2 = rt
+            .handle_chat_message(
+                "conv-kv-prefix",
+                "Please explain how prompt caching works.",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status, TaskStatus::Completed);
+
+        let reqs = inf.recorded_requests();
+        assert_eq!(reqs.len(), 2);
+        let prefills = inf.prefill_requests();
+        assert!(!prefills.is_empty());
+
+        // messages[0] (system) must stay byte-for-byte identical across Turn 1, prefill, and Turn 2.
+        assert_eq!(reqs[0].messages[0].content, reqs[1].messages[0].content);
+        assert_eq!(reqs[0].messages[0].content, prefills[0].messages[0].content);
+
+        // Turn 2's history prefix (messages[0..=2]) must match prefill's messages[0..=2] verbatim.
+        assert_eq!(reqs[1].messages.len(), 4);
+        assert_eq!(reqs[1].messages[1].content, prefills[0].messages[1].content);
+        assert_eq!(reqs[1].messages[2].content, prefills[0].messages[2].content);
+        assert!(reqs[1]
+            .messages[3]
+            .content
+            .starts_with("Please explain how prompt caching works."));
+
+        // Multi-turn request must keep full tool schemas matching prefill so Jinja tool prefix stays cached.
+        assert_eq!(reqs[1].tools.len(), prefills[0].tools.len());
+    }
 }

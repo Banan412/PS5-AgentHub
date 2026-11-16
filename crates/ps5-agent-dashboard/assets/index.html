@@ -364,6 +364,7 @@
                   </div>
                 </div>
                 <div id="chat-header-actions" class="chat-header-actions">
+                  <button id="btn-chat-live-browser-toggle" type="button" class="btn btn-secondary btn-sm" title="Toggle Live Agent Browser Dock" aria-label="Toggle Live Agent Browser Dock" aria-pressed="false">Browser Dock</button>
                   <label class="toggle-switch chat-raw-toggle" for="chat-raw-output-toggle" title="Show raw unformatted model output including &lt;think&gt; blocks">
                     <input id="chat-raw-output-toggle" type="checkbox" aria-label="Show raw unformatted model output">
                     <span class="toggle-slider" aria-hidden="true"></span>
@@ -428,6 +429,7 @@
                       <option value="low">Thinking: Low</option>
                       <option value="medium" selected>Thinking: Medium</option>
                       <option value="high">Thinking: High</option>
+                      <option value="xhigh">Thinking: XHigh</option>
                       <option value="max">Thinking: Max</option>
                     </select>
                   </div>
@@ -1149,7 +1151,8 @@
                       <option value="low">low (Fast replies)</option>
                       <option value="medium" selected>medium (Balanced)</option>
                       <option value="high">high (Deep planning)</option>
-                      <option value="max">max (Maximum reasoning)</option>
+                      <option value="xhigh">xhigh (Extra-high / DavidAU xhigh)</option>
+                      <option value="max">max (Maximum reasoning / xhigh)</option>
                     </select>
                     <p id="hint-cfg-thinking-level" class="field-hint">Default reasoning depth for thinking-capable models. Default: <code>medium</code>. Higher levels improve complex coding/planning accuracy at the cost of extra tokens and latency.</p>
                   </div>
@@ -1600,6 +1603,30 @@
                     </div>
 
                     <div class="field">
+                      <label for="cfg-reasoning-mode">Reasoning Effort / Mode Override (<code>reasoning_mode</code>)</label>
+                      <input id="cfg-reasoning-mode" type="text" class="input mono" list="reasoning-mode-list" placeholder="Auto (from Thinking Level)" aria-describedby="hint-cfg-reasoning-mode">
+                      <datalist id="reasoning-mode-list">
+                        <option value="xhigh"></option>
+                        <option value="einstein"></option>
+                        <option value="spoon"></option>
+                        <option value="deeptree"></option>
+                        <option value="logic"></option>
+                        <option value="socrates"></option>
+                        <option value="hyper"></option>
+                        <option value="omni"></option>
+                        <option value="ultra"></option>
+                        <option value="xultra"></option>
+                        <option value="007"></option>
+                        <option value="coder"></option>
+                        <option value="xeinstein"></option>
+                        <option value="xspoon"></option>
+                        <option value="xdeeptree"></option>
+                        <option value="xomni"></option>
+                      </datalist>
+                      <small id="hint-cfg-reasoning-mode" class="field-hint">Optional custom <code>reasoning_effort</code> sent to models supporting Jinja thinking modes (e.g., DavidAU Qwen3.5/3.8 <code>einstein</code>, <code>spoon</code>, <code>deeptree</code>, <code>logic</code>, <code>007</code>). Leave empty to derive from Thinking Level.</small>
+                    </div>
+
+                    <div class="field">
                       <label for="cfg-timings-per-token">Timings Per Token (<code>timings_per_token</code>)</label>
                       <select id="cfg-timings-per-token" class="select" aria-describedby="hint-cfg-timings-per-token">
                         <option value="false" selected>Disabled (Lower payload overhead)</option>
@@ -1709,6 +1736,7 @@
               <option value="low">low</option>
               <option value="medium" selected>medium</option>
               <option value="high">high</option>
+              <option value="xhigh">xhigh</option>
               <option value="max">max</option>
             </select>
           </div>

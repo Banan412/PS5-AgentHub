@@ -59,7 +59,7 @@
     { cmd: '/context', args: '', desc: 'Show prompt token/char footprint, active brain files & memories' },
     { cmd: '/tools', args: '[agent]', desc: 'List effective enabled tools, denied tools & group expansions' },
     { cmd: '/compact', args: '', desc: 'Summarize older conversation messages cleanly' },
-    { cmd: '/think', args: '[off|minimal|low|medium|high|auto]', desc: 'Report or set preferred thinking level' },
+    { cmd: '/think', args: '[off|minimal|low|medium|high|xhigh|max|auto|<mode>]', desc: 'Set thinking level or custom mode (einstein, spoon, 007)' },
     { cmd: '/model', args: '[name]', desc: 'Report active model or validated override' },
     { cmd: '/sandbox', args: '[mode|policy]', desc: 'Inspect or update sandbox mode & approval policy' },
     { cmd: '/doctor', args: '[fix]', desc: 'Run 12-point system health diagnostics (or auto-fix)' },
@@ -705,7 +705,7 @@
   }
 
   function openChatLiveBrowserDock(opts) {
-    if (state.chatLiveBrowserDismissed) return;
+    if (state.chatLiveBrowserDismissed && !(opts && opts.force)) return;
     const dock = getEl('chat-live-browser-dock');
     if (dock) dock.hidden = false;
     if (!state.activeLiveBrowserSessionId && state.liveBrowserOrder.length > 0) {
@@ -719,12 +719,41 @@
         pill.textContent = opts.statusText;
       }
     }
+    syncChatLiveBrowserToggleBtn(true);
   }
 
   function hideChatLiveBrowserDock() {
     state.chatLiveBrowserDismissed = true;
     const dock = getEl('chat-live-browser-dock');
     if (dock) dock.hidden = true;
+    syncChatLiveBrowserToggleBtn(false);
+  }
+
+  function toggleChatLiveBrowserDock(forceState) {
+    const dock = getEl('chat-live-browser-dock');
+    if (!dock) return;
+    const shouldOpen = (typeof forceState === 'boolean') ? forceState : dock.hidden;
+    if (shouldOpen) {
+      state.chatLiveBrowserDismissed = false;
+      openChatLiveBrowserDock({ force: true });
+    } else {
+      hideChatLiveBrowserDock();
+    }
+  }
+
+  function syncChatLiveBrowserToggleBtn(isOpen) {
+    const btn = getEl('btn-chat-live-browser-toggle');
+    if (!btn) return;
+    const dock = getEl('chat-live-browser-dock');
+    const open = (typeof isOpen === 'boolean') ? isOpen : Boolean(dock && !dock.hidden);
+    btn.setAttribute('aria-pressed', open ? 'true' : 'false');
+    if (open) {
+      btn.classList.add('is-active');
+      btn.title = 'Hide Live Agent Browser Dock';
+    } else {
+      btn.classList.remove('is-active');
+      btn.title = 'Open Live Agent Browser Dock';
+    }
   }
 
   function syncChatLiveBrowserDockForConversation(convId) {
@@ -735,12 +764,16 @@
     if (hasMatch && !state.chatLiveBrowserDismissed) {
       dock.hidden = false;
       const matchingTab = tabs.find((t) => t && t.conversation_id === convId);
-      if (matchingTab && (!state.activeLiveBrowserSessionId || !state.liveBrowserTabs.has(state.activeLiveBrowserSessionId))) {
+      if (matchingTab && (!state.activeLiveBrowserSessionId || !state.liveBrowserTabs.has(state.activeLiveBrowserSessionId) || (state.liveBrowserTabs.get(state.activeLiveBrowserSessionId) && state.liveBrowserTabs.get(state.activeLiveBrowserSessionId).conversation_id !== convId))) {
         state.activeLiveBrowserSessionId = matchingTab.session_id;
       }
       renderAllLiveBrowserViewports({ refreshPreview: true, immediatePreview: true });
+      syncChatLiveBrowserToggleBtn(true);
     } else if (!state.agenticSearchEnabled) {
       dock.hidden = true;
+      syncChatLiveBrowserToggleBtn(false);
+    } else {
+      syncChatLiveBrowserToggleBtn(!dock.hidden);
     }
   }
 
@@ -759,7 +792,7 @@
   function formatBrowserPillMeta(action, status) {
     const st = String(status || '').trim().toLowerCase();
     const act = String(action || '').trim().toLowerCase();
-    const labelRaw = status || action || 'Idle';
+    const labelRaw = String(status || action || 'Idle');
     const label = labelRaw.charAt(0).toUpperCase() + labelRaw.slice(1);
     if (st === 'error' || st === 'failed') return { text: label, cls: 'pill-danger' };
     if (st === 'navigating' || st === 'running' || act === 'search' || act === 'web_search') {
@@ -3847,6 +3880,489 @@
     return frag;
   }
 
+  function renderMarkdownIncremental(contentEl, bucket, text) {
+    const normalized = String(text || '').replace(/\r\n?/g, '\n');
+    if (!normalized) {
+      clearEl(contentEl);
+      bucket._streamRenderState = null;
+      return;
+    }
+
+    let state = bucket._streamRenderState;
+    if (!state || !normalized.startsWith(state.committedText)) {
+      clearEl(contentEl);
+      state = {
+        committedText: '',
+        committedLineIndex: 0,
+        activeBlock: null
+      };
+      bucket._streamRenderState = state;
+    }
+
+    const lines = normalized.split('\n');
+    let i = state.committedLineIndex;
+
+    function createCodeBlockEl(lang, codeText) {
+      const codeNode = document.createTextNode(codeText);
+      const copyBtn = el('button', {
+        type: 'button',
+        className: 'md-code-btn',
+        onClick: () => copyTextWithFeedback(copyBtn, codeNode.data, 'Copy')
+      }, 'Copy');
+      const actionBtns = [copyBtn];
+      if (lang === 'html' || lang === 'htm') {
+        actionBtns.push(el('button', {
+          type: 'button',
+          className: 'md-code-btn',
+          onClick: () => openHtmlSnippetPreview(codeNode.data)
+        }, 'Preview HTML'));
+      }
+      const langSpan = el('span', { className: 'md-code-lang' }, lang || 'text');
+      const actionsWrap = el('div', { className: 'md-code-actions' }, actionBtns);
+      const codeEl = el('code', null, codeNode);
+      const blockEl = el('div', { className: 'md-code-block' },
+        el('div', { className: 'md-code-header' },
+          langSpan,
+          actionsWrap
+        ),
+        el('pre', null, codeEl)
+      );
+      return { blockEl, codeNode, copyBtn, langSpan, actionsWrap, lang };
+    }
+
+    function syncCodeBlockHeader(active, currentLang) {
+      if (!active) return;
+      if (currentLang && currentLang !== active.lang) {
+        active.lang = currentLang;
+        if (active.langSpan) active.langSpan.textContent = currentLang;
+        if ((currentLang === 'html' || currentLang === 'htm') && active.actionsWrap && active.actionsWrap.childNodes.length === 1) {
+          active.actionsWrap.appendChild(el('button', {
+            type: 'button',
+            className: 'md-code-btn',
+            onClick: () => openHtmlSnippetPreview(active.codeNode.data)
+          }, 'Preview HTML'));
+        }
+      }
+    }
+
+    function updateInlineContainer(container, inlineText) {
+      clearEl(container);
+      container.appendChild(renderInlineNodes(inlineText, 0));
+    }
+
+    function getCommittedPrefix(linesArr, committedIdx) {
+      if (committedIdx <= 0) return '';
+      if (committedIdx < linesArr.length) {
+        return linesArr.slice(0, committedIdx).join('\n') + '\n';
+      }
+      return linesArr.slice(0, committedIdx).join('\n');
+    }
+
+    while (i < lines.length) {
+      const startI = i;
+      const line = lines[i];
+
+      if (!line.trim()) {
+        i++;
+        continue;
+      }
+
+      // Fenced code block (``` or ~~~)
+      const fenceMatch = line.match(/^\s*(```+|~~~+)\s*([^\s`~]*)/);
+      if (fenceMatch) {
+        const fenceChar = fenceMatch[1][0];
+        const fenceLen = fenceMatch[1].length;
+        const lang = (fenceMatch[2] || '').toLowerCase();
+        const codeLines = [];
+        let closed = false;
+        i++;
+        while (i < lines.length) {
+          const closeMatch = lines[i].match(/^\s*(```+|~~~+)\s*$/);
+          if (closeMatch && closeMatch[1][0] === fenceChar && closeMatch[1].length >= fenceLen) {
+            closed = true;
+            i++;
+            break;
+          }
+          codeLines.push(lines[i]);
+          i++;
+        }
+
+        const codeText = codeLines.join('\n');
+
+        if (closed) {
+          if (state.activeBlock && state.activeBlock.type === 'code' && state.activeBlock.startLine === startI) {
+            syncCodeBlockHeader(state.activeBlock, lang);
+            state.activeBlock.codeNode.data = codeText;
+            state.activeBlock = null;
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+              state.activeBlock = null;
+            }
+            const { blockEl } = createCodeBlockEl(lang, codeText);
+            contentEl.appendChild(blockEl);
+          }
+          state.committedLineIndex = i;
+          state.committedText = getCommittedPrefix(lines, i);
+          continue;
+        } else {
+          if (state.activeBlock && state.activeBlock.type === 'code' && state.activeBlock.startLine === startI) {
+            syncCodeBlockHeader(state.activeBlock, lang);
+            state.activeBlock.codeNode.data = codeText;
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+            }
+            const { blockEl, codeNode, copyBtn, langSpan, actionsWrap } = createCodeBlockEl(lang, codeText);
+            contentEl.appendChild(blockEl);
+            state.activeBlock = {
+              type: 'code',
+              startLine: startI,
+              el: blockEl,
+              codeNode,
+              copyBtn,
+              langSpan,
+              actionsWrap,
+              lang
+            };
+          }
+          break;
+        }
+      }
+
+      // Horizontal rule
+      if (/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+        if (i + 1 < lines.length) {
+          if (state.activeBlock && state.activeBlock.type === 'hr' && state.activeBlock.startLine === startI) {
+            state.activeBlock = null;
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+              state.activeBlock = null;
+            }
+            contentEl.appendChild(el('hr', { className: 'md-hr' }));
+          }
+          i++;
+          state.committedLineIndex = i;
+          state.committedText = getCommittedPrefix(lines, i);
+          continue;
+        } else {
+          if (state.activeBlock && state.activeBlock.type === 'hr' && state.activeBlock.startLine === startI) {
+            // Already active hr
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+            }
+            const hrEl = el('hr', { className: 'md-hr' });
+            contentEl.appendChild(hrEl);
+            state.activeBlock = { type: 'hr', startLine: startI, el: hrEl };
+          }
+          break;
+        }
+      }
+
+      // ATX Heading
+      const headingMatch = line.match(/^\s{0,3}(#{1,6})\s+(.+?)(?:\s+#+)?\s*$/);
+      if (headingMatch) {
+        const level = Math.min(4, headingMatch[1].length);
+        const headingText = headingMatch[2];
+        if (i + 1 < lines.length) {
+          if (state.activeBlock && state.activeBlock.type === 'heading' && state.activeBlock.startLine === startI) {
+            updateInlineContainer(state.activeBlock.el, headingText);
+            state.activeBlock = null;
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+              state.activeBlock = null;
+            }
+            const hEl = el(`h${level}`, { className: `md-h${level}` });
+            updateInlineContainer(hEl, headingText);
+            contentEl.appendChild(hEl);
+          }
+          i++;
+          state.committedLineIndex = i;
+          state.committedText = getCommittedPrefix(lines, i);
+          continue;
+        } else {
+          if (state.activeBlock && state.activeBlock.type === 'heading' && state.activeBlock.startLine === startI) {
+            updateInlineContainer(state.activeBlock.el, headingText);
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+            }
+            const hEl = el(`h${level}`, { className: `md-h${level}` });
+            updateInlineContainer(hEl, headingText);
+            contentEl.appendChild(hEl);
+            state.activeBlock = { type: 'heading', startLine: startI, el: hEl };
+          }
+          break;
+        }
+      }
+
+      // Blockquote
+      if (/^\s{0,3}>\s?/.test(line)) {
+        const quoteLines = [];
+        let hasTerminator = false;
+        while (i < lines.length && /^\s{0,3}>\s?/.test(lines[i])) {
+          quoteLines.push(lines[i].replace(/^\s{0,3}>\s?/, ''));
+          i++;
+        }
+        if (i < lines.length - 1 && !lines[i].trim()) {
+          hasTerminator = true;
+          i++;
+        }
+        const quoteText = quoteLines.join('\n');
+        const isCompleteBlock = hasTerminator || (i < lines.length && Boolean(lines[i].trim()));
+        if (isCompleteBlock) {
+          if (state.activeBlock && state.activeBlock.type === 'quote' && state.activeBlock.startLine === startI) {
+            clearEl(state.activeBlock.el);
+            state.activeBlock.el.appendChild(renderMarkdownNodes(quoteText, 1));
+            state.activeBlock = null;
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+              state.activeBlock = null;
+            }
+            const qEl = el('blockquote', { className: 'md-blockquote' }, renderMarkdownNodes(quoteText, 1));
+            contentEl.appendChild(qEl);
+          }
+          state.committedLineIndex = i;
+          state.committedText = getCommittedPrefix(lines, i);
+          continue;
+        } else {
+          if (state.activeBlock && state.activeBlock.type === 'quote' && state.activeBlock.startLine === startI) {
+            clearEl(state.activeBlock.el);
+            state.activeBlock.el.appendChild(renderMarkdownNodes(quoteText, 1));
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+            }
+            const qEl = el('blockquote', { className: 'md-blockquote' }, renderMarkdownNodes(quoteText, 1));
+            contentEl.appendChild(qEl);
+            state.activeBlock = { type: 'quote', startLine: startI, el: qEl };
+          }
+          break;
+        }
+      }
+
+      // Pipe table
+      if (line.includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1])) {
+        const headers = splitTableRow(line);
+        i += 2;
+        const bodyRows = [];
+        let hasTerminator = false;
+        while (i < lines.length && lines[i].trim() && lines[i].includes('|') && !/^\s*(```|~~~|#|>)/.test(lines[i])) {
+          bodyRows.push(splitTableRow(lines[i]));
+          i++;
+        }
+        if (i < lines.length - 1 && !lines[i].trim()) {
+          hasTerminator = true;
+          i++;
+        }
+        const populateTable = (wrap) => {
+          clearEl(wrap);
+          const theadRow = el('tr', null, headers.map((h) => el('th', null, renderInlineNodes(h, 0))));
+          const tbody = el('tbody', null, bodyRows.map((row) =>
+            el('tr', null, headers.map((_, colIdx) => el('td', null, renderInlineNodes(row[colIdx] || '', 0))))
+          ));
+          wrap.appendChild(el('table', { className: 'data-table md-table' },
+            el('thead', null, theadRow),
+            tbody
+          ));
+        };
+        const isCompleteBlock = hasTerminator || (i < lines.length && Boolean(lines[i].trim()));
+        if (isCompleteBlock) {
+          if (state.activeBlock && state.activeBlock.type === 'table' && state.activeBlock.startLine === startI) {
+            populateTable(state.activeBlock.el);
+            state.activeBlock = null;
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+              state.activeBlock = null;
+            }
+            const tblWrap = el('div', { className: 'md-table-wrap' });
+            populateTable(tblWrap);
+            contentEl.appendChild(tblWrap);
+          }
+          state.committedLineIndex = i;
+          state.committedText = getCommittedPrefix(lines, i);
+          continue;
+        } else {
+          if (state.activeBlock && state.activeBlock.type === 'table' && state.activeBlock.startLine === startI) {
+            populateTable(state.activeBlock.el);
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+            }
+            const tblWrap = el('div', { className: 'md-table-wrap' });
+            populateTable(tblWrap);
+            contentEl.appendChild(tblWrap);
+            state.activeBlock = { type: 'table', startLine: startI, el: tblWrap };
+          }
+          break;
+        }
+      }
+
+      // Unordered list
+      if (/^\s*[-*+]\s+\S/.test(line)) {
+        const items = [];
+        let hasTerminator = false;
+        while (i < lines.length && /^\s*[-*+](\s+.*)?$/.test(lines[i])) {
+          items.push(lines[i].replace(/^\s*[-*+]\s*/, ''));
+          i++;
+        }
+        if (i < lines.length - 1 && !lines[i].trim()) {
+          hasTerminator = true;
+          i++;
+        }
+        const populateUl = (ulEl) => {
+          clearEl(ulEl);
+          for (const it of items) {
+            ulEl.appendChild(el('li', null, renderInlineNodes(it, 0)));
+          }
+        };
+        const isCompleteBlock = hasTerminator || (i < lines.length && Boolean(lines[i].trim()));
+        if (isCompleteBlock) {
+          if (state.activeBlock && state.activeBlock.type === 'ul' && state.activeBlock.startLine === startI) {
+            populateUl(state.activeBlock.el);
+            state.activeBlock = null;
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+              state.activeBlock = null;
+            }
+            const ulEl = el('ul', { className: 'md-ul' });
+            populateUl(ulEl);
+            contentEl.appendChild(ulEl);
+          }
+          state.committedLineIndex = i;
+          state.committedText = getCommittedPrefix(lines, i);
+          continue;
+        } else {
+          if (state.activeBlock && state.activeBlock.type === 'ul' && state.activeBlock.startLine === startI) {
+            populateUl(state.activeBlock.el);
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+            }
+            const ulEl = el('ul', { className: 'md-ul' });
+            populateUl(ulEl);
+            contentEl.appendChild(ulEl);
+            state.activeBlock = { type: 'ul', startLine: startI, el: ulEl };
+          }
+          break;
+        }
+      }
+
+      // Ordered list
+      if (/^\s*\d+[.)]\s+\S/.test(line)) {
+        const items = [];
+        let hasTerminator = false;
+        while (i < lines.length && /^\s*\d+[.)]?(\s.*)?$/.test(lines[i])) {
+          items.push(lines[i].replace(/^\s*\d+[.)]?\s*/, ''));
+          i++;
+        }
+        if (i < lines.length - 1 && !lines[i].trim()) {
+          hasTerminator = true;
+          i++;
+        }
+        const populateOl = (olEl) => {
+          clearEl(olEl);
+          for (const it of items) {
+            olEl.appendChild(el('li', null, renderInlineNodes(it, 0)));
+          }
+        };
+        const isCompleteBlock = hasTerminator || (i < lines.length && Boolean(lines[i].trim()));
+        if (isCompleteBlock) {
+          if (state.activeBlock && state.activeBlock.type === 'ol' && state.activeBlock.startLine === startI) {
+            populateOl(state.activeBlock.el);
+            state.activeBlock = null;
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+              state.activeBlock = null;
+            }
+            const olEl = el('ol', { className: 'md-ol' });
+            populateOl(olEl);
+            contentEl.appendChild(olEl);
+          }
+          state.committedLineIndex = i;
+          state.committedText = getCommittedPrefix(lines, i);
+          continue;
+        } else {
+          if (state.activeBlock && state.activeBlock.type === 'ol' && state.activeBlock.startLine === startI) {
+            populateOl(state.activeBlock.el);
+          } else {
+            if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+              state.activeBlock.el.remove();
+            }
+            const olEl = el('ol', { className: 'md-ol' });
+            populateOl(olEl);
+            contentEl.appendChild(olEl);
+            state.activeBlock = { type: 'ol', startLine: startI, el: olEl };
+          }
+          break;
+        }
+      }
+
+      // Paragraph
+      const paraLines = [];
+      let hasTerminator = false;
+      while (
+        i < lines.length &&
+        lines[i].trim() &&
+        !/^\s*(```+|~~~+)/.test(lines[i]) &&
+        !/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(lines[i]) &&
+        !/^\s{0,3}#{1,6}\s+\S/.test(lines[i]) &&
+        !/^\s{0,3}>\s?/.test(lines[i]) &&
+        !/^\s*[-*+]\s+\S/.test(lines[i]) &&
+        !/^\s*\d+[.)]\s+\S/.test(lines[i]) &&
+        !(lines[i].includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1]))
+      ) {
+        paraLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length - 1 && !lines[i].trim()) {
+        hasTerminator = true;
+        i++;
+      }
+
+      const paraText = paraLines.join('\n');
+      const isCompleteBlock = hasTerminator || (i < lines.length && Boolean(lines[i].trim()));
+
+      if (isCompleteBlock) {
+        if (state.activeBlock && state.activeBlock.type === 'para' && state.activeBlock.startLine === startI) {
+          updateInlineContainer(state.activeBlock.el, paraText);
+          state.activeBlock = null;
+        } else {
+          if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+            state.activeBlock.el.remove();
+            state.activeBlock = null;
+          }
+          const pEl = el('p', { className: 'md-p' });
+          updateInlineContainer(pEl, paraText);
+          contentEl.appendChild(pEl);
+        }
+        state.committedLineIndex = i;
+        state.committedText = getCommittedPrefix(lines, i);
+        continue;
+      } else {
+        if (state.activeBlock && state.activeBlock.type === 'para' && state.activeBlock.startLine === startI) {
+          updateInlineContainer(state.activeBlock.el, paraText);
+        } else {
+          if (state.activeBlock && state.activeBlock.el && state.activeBlock.el.parentNode === contentEl) {
+            state.activeBlock.el.remove();
+          }
+          const pEl = el('p', { className: 'md-p' });
+          updateInlineContainer(pEl, paraText);
+          contentEl.appendChild(pEl);
+          state.activeBlock = { type: 'para', startLine: startI, el: pEl };
+        }
+        break;
+      }
+    }
+  }
+
   function extractPathFromToolArgs(rawArgs) {
     let obj = rawArgs;
     if (typeof obj === 'string') {
@@ -4674,6 +5190,7 @@
     bucket._renderedReasoning = null;
     bucket._renderedToolsSig = '';
     bucket._renderedArtifactsSig = '';
+    bucket._streamRenderState = null;
 
     updateLiveStreamBubbleContent(bucket);
     return bubbleEl;
@@ -4688,6 +5205,7 @@
       bucket._renderedRawMode = rawMode;
       bucket._renderedText = null;
       bucket._renderedReasoning = null;
+      bucket._streamRenderState = null;
     }
 
     // 1. Reasoning drawer (hidden when inline raw <think> output is shown)
@@ -4710,7 +5228,9 @@
     }
 
     // 2. Live tool calls
-    const toolsSig = JSON.stringify(bucket.toolCalls.map((t) => [t.tool_id, t.running, t.success, t.duration_ms]));
+    const toolsSig = bucket.toolCalls.length > 0
+      ? JSON.stringify(bucket.toolCalls.map((t) => [t.tool_id, t.running, t.success, t.duration_ms]))
+      : '';
     if (toolsSig !== bucket._renderedToolsSig) {
       bucket._renderedToolsSig = toolsSig;
       clearEl(refs.toolsWrap);
@@ -4729,31 +5249,59 @@
     const displayValue = rawMode ? formatRawMessageText(rText, nextText) : nextText;
     if (displayValue !== bucket._renderedText) {
       bucket._renderedText = displayValue;
-      clearEl(refs.contentEl);
-      if (displayValue) {
-        if (rawMode) {
-          refs.contentEl.appendChild(el('pre', { className: 'msg-raw-output' }, document.createTextNode(displayValue)));
+      if (rawMode) {
+        if (!refs._rawPreEl || !refs._rawTextNode) {
+          clearEl(refs.contentEl);
+          refs._rawPreEl = el('pre', { className: 'msg-raw-output' });
+          refs._rawTextNode = document.createTextNode(displayValue);
+          refs._rawPreEl.appendChild(refs._rawTextNode);
+          refs.contentEl.appendChild(refs._rawPreEl);
+          bucket._streamRenderState = null;
         } else {
-          refs.contentEl.appendChild(renderMarkdownNodes(nextText));
+          refs._rawTextNode.data = displayValue;
         }
       } else {
-        refs.contentEl.appendChild(document.createTextNode(!rawMode && rText.trim() ? 'Thinking\u2026' : 'Streaming\u2026'));
+        if (refs._rawPreEl) {
+          clearEl(refs.contentEl);
+          delete refs._rawPreEl;
+          delete refs._rawTextNode;
+          bucket._streamRenderState = null;
+        }
+        if (nextText) {
+          if (refs._placeholderNode) {
+            refs._placeholderNode.remove();
+            refs._placeholderNode = null;
+          }
+          renderMarkdownIncremental(refs.contentEl, bucket, nextText);
+        } else {
+          const placeholderText = !rawMode && rText.trim() ? 'Thinking\u2026' : 'Streaming\u2026';
+          if (!refs._placeholderNode) {
+            clearEl(refs.contentEl);
+            refs._placeholderNode = document.createTextNode(placeholderText);
+            refs.contentEl.appendChild(refs._placeholderNode);
+            bucket._streamRenderState = null;
+          } else {
+            refs._placeholderNode.data = placeholderText;
+          }
+        }
       }
     }
 
     // 4. Artifact cards detected so far
-    const files = extractCreatedFilePaths({ content: nextText, liveTools: bucket.toolCalls });
-    const artSig = files.join('\0');
-    if (artSig !== bucket._renderedArtifactsSig) {
-      bucket._renderedArtifactsSig = artSig;
-      clearEl(refs.artifactsWrap);
-      if (files.length > 0) {
-        refs.artifactsWrap.hidden = false;
-        for (const fp of files) {
-          refs.artifactsWrap.appendChild(buildFileArtifactCard(fp));
+    if (bucket.toolCalls.length > 0 || nextText.includes('[')) {
+      const files = extractCreatedFilePaths({ content: nextText, liveTools: bucket.toolCalls });
+      const artSig = files.join('\0');
+      if (artSig !== bucket._renderedArtifactsSig) {
+        bucket._renderedArtifactsSig = artSig;
+        clearEl(refs.artifactsWrap);
+        if (files.length > 0) {
+          refs.artifactsWrap.hidden = false;
+          for (const fp of files) {
+            refs.artifactsWrap.appendChild(buildFileArtifactCard(fp));
+          }
+        } else {
+          refs.artifactsWrap.hidden = true;
         }
-      } else {
-        refs.artifactsWrap.hidden = true;
       }
     }
   }
@@ -6287,7 +6835,7 @@
     );
     const currentThinking = String(mc.thinking_level || 'medium').toLowerCase();
     const thinkingSel = el('select', { id: 'agent-model-thinking', className: 'select' },
-      ['off', 'low', 'medium', 'high', 'max'].map((lvl) =>
+      ['off', 'low', 'medium', 'high', 'xhigh', 'max'].map((lvl) =>
         el('option', { value: lvl, selected: currentThinking === lvl }, lvl)
       )
     );
@@ -9215,6 +9763,7 @@
     setInputValue('cfg-id-slot', inf.id_slot ?? -1);
     setInputValue('cfg-samplers', inf.samplers || '');
     setInputValue('cfg-reasoning-format', inf.reasoning_format ?? 'deepseek');
+    setInputValue('cfg-reasoning-mode', inf.reasoning_mode ?? '');
     setInputValue('cfg-timings-per-token', inf.timings_per_token === true ? 'true' : 'false');
     setInputValue('cfg-stop-sequences', Array.isArray(inf.stop_sequences) ? inf.stop_sequences.join('\n') : '');
     setInputValue('cfg-grammar', inf.grammar || '');
@@ -9454,6 +10003,7 @@
         id_slot: readIntInRange('cfg-id-slot', 'Pinned Server Slot', -1, 64),
         samplers: ($('cfg-samplers').value || '').trim(),
         reasoning_format: ($('cfg-reasoning-format').value || '').trim(),
+      reasoning_mode: ($('cfg-reasoning-mode') ? ($('cfg-reasoning-mode').value || '').trim() : ''),
         timings_per_token: $('cfg-timings-per-token').value === 'true',
         stop_sequences: stopSequences,
         grammar: $('cfg-grammar').value || '',
@@ -10640,6 +11190,11 @@
     }
     const btnCloseLiveDock = getEl('btn-chat-live-browser-close');
     if (btnCloseLiveDock) btnCloseLiveDock.addEventListener('click', hideChatLiveBrowserDock);
+    const btnLiveDockToggle = getEl('btn-chat-live-browser-toggle');
+    if (btnLiveDockToggle) {
+      btnLiveDockToggle.addEventListener('click', () => toggleChatLiveBrowserDock());
+    }
+    syncChatLiveBrowserToggleBtn();
 
     const btnSandboxAgenticRun = getEl('btn-sandbox-agentic-run');
     if (btnSandboxAgenticRun) btnSandboxAgenticRun.addEventListener('click', runSandboxAgenticSearch);

@@ -89,6 +89,7 @@ pub enum ThinkingLevel {
     #[default]
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -99,6 +100,7 @@ impl ThinkingLevel {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
             Self::Max => "max",
         }
     }
@@ -113,6 +115,7 @@ impl std::str::FromStr for ThinkingLevel {
             "low" => Ok(Self::Low),
             "medium" => Ok(Self::Medium),
             "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
             "max" => Ok(Self::Max),
             _ => Err(format!("invalid thinking level: {s}")),
         }

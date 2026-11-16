@@ -584,36 +584,34 @@ impl Ps5LmProvider {
         let initial_in_think = completions_prompt_starts_in_think(req.api_mode, &payload);
         let mut splitter = ThinkStreamSplitter::with_initial_in_think(initial_in_think);
         let mut byte_stream = resp.bytes_stream();
-        let mut raw_buf: Vec<u8> = Vec::new();
+        let mut raw_buf: Vec<u8> = Vec::with_capacity(32 * 1024);
         let mut current_event: Option<String> = None;
+        let sleep = tokio::time::sleep(req_timeout.unwrap_or(Duration::from_secs(3600)));
+        tokio::pin!(sleep);
 
         loop {
-            let next_chunk = match req_timeout {
-                Some(idle_dur) => {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            return Err(AgentError::Cancelled("inference stream cancelled".into()));
-                        }
-                        res = tokio::time::timeout(idle_dur, byte_stream.next()) => match res {
-                            Ok(chunk) => chunk,
-                            Err(_) => {
-                                return Err(AgentError::Timeout(format!(
-                                    "SSE stream idle timed out after {}s waiting for next chunk",
-                                    idle_dur.as_secs()
-                                )));
-                            }
-                        }
+            let next_chunk = if let Some(idle_dur) = req_timeout {
+                sleep.as_mut().reset(tokio::time::Instant::now() + idle_dur);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err(AgentError::Cancelled("inference stream cancelled".into()));
                     }
+                    _ = &mut sleep => {
+                        return Err(AgentError::Timeout(format!(
+                            "SSE stream idle timed out after {}s waiting for next chunk",
+                            idle_dur.as_secs()
+                        )));
+                    }
+                    chunk = byte_stream.next() => chunk,
                 }
-                None => {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            return Err(AgentError::Cancelled("inference stream cancelled".into()));
-                        }
-                        chunk = byte_stream.next() => chunk,
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err(AgentError::Cancelled("inference stream cancelled".into()));
                     }
+                    chunk = byte_stream.next() => chunk,
                 }
             };
 
@@ -641,14 +639,15 @@ impl Ps5LmProvider {
                         )
                         .await?;
                         consumed = line_end + 1;
-                        if sse_state.aborted_loop_clean.is_some() {
+                        if sse_state.aborted_by_repetition || sse_state.aborted_loop_clean.is_some()
+                        {
                             break;
                         }
                     }
                     if consumed > 0 {
                         raw_buf.drain(..consumed);
                     }
-                    if sse_state.aborted_loop_clean.is_some() {
+                    if sse_state.aborted_by_repetition || sse_state.aborted_loop_clean.is_some() {
                         break;
                     }
                 }
@@ -659,7 +658,10 @@ impl Ps5LmProvider {
             }
         }
 
-        if !raw_buf.is_empty() && sse_state.aborted_loop_clean.is_none() {
+        if !raw_buf.is_empty()
+            && !sse_state.aborted_by_repetition
+            && sse_state.aborted_loop_clean.is_none()
+        {
             let mut tail = raw_buf.as_slice();
             if tail.ends_with(b"\r") {
                 tail = &tail[..tail.len() - 1];
@@ -673,12 +675,15 @@ impl Ps5LmProvider {
             }
         }
 
-        let was_aborted = sse_state.aborted_loop_clean.is_some();
+        let was_aborted =
+            sse_state.aborted_by_repetition || sse_state.aborted_loop_clean.is_some();
         for piece in splitter.finish() {
             match &piece {
                 StreamPiece::Reasoning(r) => {
                     sse_state.inline_reasoning.push_str(r);
-                    emit_stream_piece(piece, tx).await;
+                    if !was_aborted {
+                        emit_stream_piece(piece, tx).await;
+                    }
                 }
                 StreamPiece::Text(t) if !was_aborted => {
                     if !t.is_empty() {
@@ -692,7 +697,10 @@ impl Ps5LmProvider {
 
         sse_state.finalize_loop_guard_eof();
 
-        if !sse_state.saw_done && sse_state.aborted_loop_clean.is_none() {
+        if !sse_state.saw_done
+            && !sse_state.aborted_by_repetition
+            && sse_state.aborted_loop_clean.is_none()
+        {
             return Err(AgentError::Inference(
                 "incomplete SSE stream: stream ended before completion marker".into(),
             ));
@@ -1924,8 +1932,11 @@ fn parse_health_body(
 }
 
 fn build_http_client(cfg: &InferenceConfig) -> Result<reqwest::Client> {
+    ensure_rustls_ring_provider();
     let mut builder = reqwest::Client::builder()
         .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .pool_max_idle_per_host(32)
         .pool_idle_timeout(Duration::from_secs(45));
     if cfg.connect_timeout_secs > 0 {
         builder = builder.connect_timeout(Duration::from_secs(cfg.connect_timeout_secs));
@@ -2047,7 +2058,9 @@ pub fn apply_llamacpp_sampling_fields(
         obj.insert("dry_multiplier".into(), json!(cfg.dry_multiplier));
         obj.insert("dry_base".into(), json!(cfg.dry_base));
         obj.insert("dry_allowed_length".into(), json!(cfg.dry_allowed_length));
-        obj.insert("dry_penalty_last_n".into(), json!(cfg.dry_penalty_last_n));
+        if cfg.dry_penalty_last_n >= 0 {
+            obj.insert("dry_penalty_last_n".into(), json!(cfg.dry_penalty_last_n));
+        }
     }
     if cfg.mirostat > 0 {
         obj.insert("mirostat".into(), json!(cfg.mirostat));
@@ -2070,6 +2083,14 @@ pub fn apply_llamacpp_sampling_fields(
 
     if let Some(list) = parse_samplers_str(&cfg.samplers) {
         obj.insert("samplers".into(), json!(list));
+    } else if cfg.top_k > 0
+        && (cfg.dry_multiplier > 0.0
+            || (cfg.repeat_penalty.is_finite() && (cfg.repeat_penalty - 1.0).abs() >= 1e-5))
+    {
+        obj.insert(
+            "samplers".into(),
+            json!(["top_k", "top_p", "min_p", "penalties", "dry", "temperature"]),
+        );
     }
 
     if !cfg.grammar.trim().is_empty() {
@@ -2233,6 +2254,14 @@ fn build_chat_completions_payload(
         payload["max_tokens"] = json!(req.max_output_tokens);
     }
 
+    let custom_mode = cfg.reasoning_mode.trim();
+    let effort_for = |default_effort: &str| -> String {
+        if custom_mode.is_empty() {
+            default_effort.to_string()
+        } else {
+            custom_mode.to_string()
+        }
+    };
     match req.thinking_level {
         ThinkingLevel::Off => {
             payload["chat_template_kwargs"] = json!({"enable_thinking": false});
@@ -2241,22 +2270,27 @@ fn build_chat_completions_payload(
         }
         ThinkingLevel::Low => {
             payload["chat_template_kwargs"] = json!({"enable_thinking": true});
-            payload["reasoning_effort"] = Value::String("low".to_string());
+            payload["reasoning_effort"] = Value::String(effort_for("low"));
             payload["reasoning_budget"] = json!(512);
         }
         ThinkingLevel::Medium => {
             payload["chat_template_kwargs"] = json!({"enable_thinking": true});
-            payload["reasoning_effort"] = Value::String("medium".to_string());
+            payload["reasoning_effort"] = Value::String(effort_for("medium"));
             payload["reasoning_budget"] = json!(2048);
         }
         ThinkingLevel::High => {
             payload["chat_template_kwargs"] = json!({"enable_thinking": true});
-            payload["reasoning_effort"] = Value::String("high".to_string());
+            payload["reasoning_effort"] = Value::String(effort_for("high"));
             payload["reasoning_budget"] = json!(8192);
+        }
+        ThinkingLevel::XHigh => {
+            payload["chat_template_kwargs"] = json!({"enable_thinking": true});
+            payload["reasoning_effort"] = Value::String(effort_for("xhigh"));
+            payload["reasoning_budget"] = json!(16384);
         }
         ThinkingLevel::Max => {
             payload["chat_template_kwargs"] = json!({"enable_thinking": true});
-            payload["reasoning_effort"] = Value::String("high".to_string());
+            payload["reasoning_effort"] = Value::String(effort_for("xhigh"));
             payload["reasoning_budget"] = json!(-1);
         }
     }
@@ -2358,16 +2392,27 @@ fn build_responses_payload(
     if req.max_output_tokens > 0 {
         payload["max_output_tokens"] = json!(req.max_output_tokens);
     }
+    let custom_mode = cfg.reasoning_mode.trim();
+    let effort_for = |default_effort: &str| -> String {
+        if custom_mode.is_empty() {
+            default_effort.to_string()
+        } else {
+            custom_mode.to_string()
+        }
+    };
     match req.thinking_level {
         ThinkingLevel::Off => {}
         ThinkingLevel::Low => {
-            payload["reasoning"] = json!({"effort": "low"});
+            payload["reasoning"] = json!({"effort": effort_for("low")});
         }
         ThinkingLevel::Medium => {
-            payload["reasoning"] = json!({"effort": "medium"});
+            payload["reasoning"] = json!({"effort": effort_for("medium")});
         }
-        ThinkingLevel::High | ThinkingLevel::Max => {
-            payload["reasoning"] = json!({"effort": "high"});
+        ThinkingLevel::High => {
+            payload["reasoning"] = json!({"effort": effort_for("high")});
+        }
+        ThinkingLevel::XHigh | ThinkingLevel::Max => {
+            payload["reasoning"] = json!({"effort": effort_for("xhigh")});
         }
     }
     if let Some(inst) = instructions {
@@ -2552,6 +2597,7 @@ fn build_anthropic_payload(
         ThinkingLevel::Low => Some(1024u32),
         ThinkingLevel::Medium => Some(4096u32),
         ThinkingLevel::High => Some(8192u32),
+        ThinkingLevel::XHigh => Some(12288u32),
         ThinkingLevel::Max => Some(16384u32),
     };
     let ends_with_assistant = payload["messages"]
@@ -3217,9 +3263,13 @@ struct SseAccumulator {
     saw_done: bool,
     final_response_override: Option<Value>,
     loop_guard: StreamingRepetitionGuard,
+    reasoning_loop_guard: StreamingRepetitionGuard,
     loop_guard_finished: bool,
+    aborted_by_repetition: bool,
     aborted_loop_clean: Option<String>,
     emitted_text: bool,
+    first_token_at: Option<Instant>,
+    token_count: usize,
 }
 
 impl SseAccumulator {
@@ -3238,10 +3288,98 @@ impl SseAccumulator {
             saw_done: false,
             final_response_override: None,
             loop_guard: StreamingRepetitionGuard::new(),
+            reasoning_loop_guard: StreamingRepetitionGuard::new(),
             loop_guard_finished: false,
+            aborted_by_repetition: false,
             aborted_loop_clean: None,
             emitted_text: false,
+            first_token_at: None,
+            token_count: 0,
         }
+    }
+
+    fn note_token_arrival(&mut self) {
+        if self.first_token_at.is_none() {
+            self.first_token_at = Some(Instant::now());
+        }
+        self.token_count += 1;
+    }
+
+    fn mark_first_token(&mut self) {
+        self.note_token_arrival();
+    }
+
+    fn compute_decode_tok_per_sec(&self) -> Option<f64> {
+        let first_at = self.first_token_at?;
+        let elapsed_secs = first_at.elapsed().as_secs_f64();
+        if elapsed_secs <= 0.0 {
+            return None;
+        }
+        let count = if self.usage.completion_tokens > 0 {
+            self.usage.completion_tokens as usize
+        } else {
+            self.token_count
+        };
+        if count == 0 {
+            return None;
+        }
+        let rate = count as f64 / elapsed_secs;
+        if rate.is_finite() && rate >= 0.0 {
+            Some(rate)
+        } else {
+            None
+        }
+    }
+
+    fn finalize_timings(&self) -> Option<InferenceTimings> {
+        let mut final_timings = self.timings.clone();
+        if let Some(decode_rate) = self.compute_decode_tok_per_sec() {
+            match &mut final_timings {
+                Some(t) => {
+                    if t.predicted_per_second.is_none() {
+                        t.predicted_per_second = Some(decode_rate);
+                    }
+                }
+                None => {
+                    final_timings = Some(InferenceTimings {
+                        predicted_per_second: Some(decode_rate),
+                        prompt_per_second: None,
+                        predicted_ms: self.first_token_at.map(|t| t.elapsed().as_millis() as f64),
+                        prompt_ms: None,
+                        predicted_n: Some(self.token_count as u32),
+                        prompt_n: None,
+                        cache_n: None,
+                    });
+                }
+            }
+        }
+        final_timings
+    }
+
+    fn push_reasoning_delta(&mut self, delta: &str) -> Vec<InferenceStreamChunk> {
+        if self.aborted_by_repetition || self.aborted_loop_clean.is_some() || delta.is_empty() {
+            return Vec::new();
+        }
+        self.mark_first_token();
+        self.api_reasoning.push_str(delta);
+        if self.reasoning_loop_guard.observe(delta) {
+            self.aborted_by_repetition = true;
+            self.finish_reason = Some("repetition_abort".to_string());
+            self.api_reasoning =
+                crate::parser::truncate_verbatim_prose_loops(&self.api_reasoning);
+            self.inline_reasoning =
+                crate::parser::truncate_verbatim_prose_loops(&self.inline_reasoning);
+            if self.aborted_loop_clean.is_none() {
+                let clean_visible = crate::parser::truncate_verbatim_prose_loops(
+                    self.loop_guard.visible_so_far(),
+                )
+                .trim()
+                .to_string();
+                self.aborted_loop_clean = Some(clean_visible);
+            }
+            return Vec::new();
+        }
+        vec![InferenceStreamChunk::ReasoningDelta(delta.to_string())]
     }
 
     async fn push_content_delta(
@@ -3250,9 +3388,10 @@ impl SseAccumulator {
         splitter: &mut ThinkStreamSplitter,
         tx: &mpsc::Sender<InferenceStreamChunk>,
     ) {
-        if self.aborted_loop_clean.is_some() || delta.is_empty() {
+        if self.aborted_by_repetition || self.aborted_loop_clean.is_some() || delta.is_empty() {
             return;
         }
+        self.note_token_arrival();
         match self.loop_guard.push_delta(delta) {
             StreamingLoopDecision::Continue => {
                 self.raw_content.push_str(delta);
@@ -3276,9 +3415,10 @@ impl SseAccumulator {
                 for piece in splitter.push(delta) {
                     if let StreamPiece::Reasoning(r) = &piece {
                         self.inline_reasoning.push_str(r);
-                        emit_stream_piece(piece, tx).await;
                     }
                 }
+                self.inline_reasoning =
+                    crate::parser::truncate_verbatim_prose_loops(&self.inline_reasoning);
                 if !self.emitted_text && !truncated_clean_visible.is_empty() {
                     self.emitted_text = true;
                     let _ = tx
@@ -3287,6 +3427,7 @@ impl SseAccumulator {
                         ))
                         .await;
                 }
+                self.aborted_by_repetition = true;
                 self.aborted_loop_clean = Some(truncated_clean_visible);
                 self.finish_reason = Some("repetition_abort".to_string());
             }
@@ -3298,13 +3439,30 @@ impl SseAccumulator {
             return;
         }
         self.loop_guard_finished = true;
-        if self.aborted_loop_clean.is_some() {
+        if self.aborted_by_repetition || self.aborted_loop_clean.is_some() {
+            return;
+        }
+        if let StreamingLoopDecision::AbortRepeatedLoop { .. } = self.reasoning_loop_guard.finish() {
+            self.aborted_by_repetition = true;
+            self.finish_reason = Some("repetition_abort".to_string());
+            self.api_reasoning =
+                crate::parser::truncate_verbatim_prose_loops(&self.api_reasoning);
+            self.inline_reasoning =
+                crate::parser::truncate_verbatim_prose_loops(&self.inline_reasoning);
+            let clean_visible =
+                crate::parser::truncate_verbatim_prose_loops(self.loop_guard.visible_so_far())
+                    .trim()
+                    .to_string();
+            self.aborted_loop_clean = Some(clean_visible);
             return;
         }
         if let StreamingLoopDecision::AbortRepeatedLoop {
             truncated_clean_visible,
         } = self.loop_guard.finish()
         {
+            self.aborted_by_repetition = true;
+            self.inline_reasoning =
+                crate::parser::truncate_verbatim_prose_loops(&self.inline_reasoning);
             self.aborted_loop_clean = Some(truncated_clean_visible);
             self.finish_reason = Some("repetition_abort".to_string());
         }
@@ -3346,7 +3504,16 @@ impl SseAccumulator {
     }
 
     fn into_response(mut self, latency_ms: u64) -> Result<InferenceResponse> {
-        if let Some(clean_visible) = self.aborted_loop_clean.take() {
+        let effective_timings = self.finalize_timings();
+        self.api_reasoning = crate::parser::truncate_verbatim_prose_loops(&self.api_reasoning);
+        self.inline_reasoning =
+            crate::parser::truncate_verbatim_prose_loops(&self.inline_reasoning);
+        if self.aborted_by_repetition || self.aborted_loop_clean.is_some() {
+            let clean_visible = self.aborted_loop_clean.take().unwrap_or_else(|| {
+                crate::parser::truncate_verbatim_prose_loops(self.loop_guard.visible_so_far())
+                    .trim()
+                    .to_string()
+            });
             let api_tcs = self.finalize_tool_calls();
             let reasoning = match (
                 non_empty_opt(&self.api_reasoning),
@@ -3367,7 +3534,7 @@ impl SseAccumulator {
                     .or_else(|| Some("repetition_abort".to_string())),
                 usage: self.usage,
                 latency_ms,
-                timings: self.timings,
+                timings: effective_timings,
             });
         }
 
@@ -3390,6 +3557,14 @@ impl SseAccumulator {
                     if parsed.reasoning.is_none() {
                         parsed.reasoning = streamed_reasoning;
                     }
+                    parsed.reasoning = parsed
+                        .reasoning
+                        .map(|r| {
+                            crate::parser::truncate_verbatim_prose_loops(r.trim())
+                                .trim()
+                                .to_string()
+                        })
+                        .filter(|r| !r.is_empty());
                     if parsed.tool_calls.is_empty() {
                         let streamed_tcs = self.finalize_tool_calls();
                         if !streamed_tcs.is_empty() {
@@ -3399,7 +3574,7 @@ impl SseAccumulator {
                     if parsed.finish_reason.is_none() {
                         parsed.finish_reason = self.finish_reason;
                     }
-                    let mut combined_timings = self.timings;
+                    let mut combined_timings = effective_timings;
                     merge_timings(&mut combined_timings, parsed.timings.take());
                     parsed.timings = combined_timings;
                     return Ok(parsed);
@@ -3421,7 +3596,7 @@ impl SseAccumulator {
             finish_reason: self.finish_reason,
             usage: self.usage,
             latency_ms,
-            timings: self.timings,
+            timings: effective_timings,
         })
     }
 }
@@ -3501,6 +3676,40 @@ async fn emit_stream_piece(piece: StreamPiece, tx: &mpsc::Sender<InferenceStream
     let _ = tx.send(chunk).await;
 }
 
+#[derive(Deserialize)]
+struct FastChatChunk<'a> {
+    #[serde(borrow)]
+    model: Option<&'a str>,
+    #[serde(borrow)]
+    choices: Option<Vec<FastChoice<'a>>>,
+    #[serde(default)]
+    usage: Option<Value>,
+    #[serde(default)]
+    timings: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct FastChoice<'a> {
+    #[serde(borrow)]
+    finish_reason: Option<&'a str>,
+    #[serde(borrow)]
+    delta: Option<FastDelta<'a>>,
+}
+
+#[derive(Deserialize)]
+struct FastDelta<'a> {
+    #[serde(borrow)]
+    content: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    reasoning_content: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    reasoning: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default)]
+    tool_calls: Option<Vec<Value>>,
+}
+
 async fn process_sse_line(
     line: &str,
     current_event: &mut Option<String>,
@@ -3529,6 +3738,72 @@ async fn process_sse_line(
         acc.finalize_loop_guard_eof();
         return Ok(());
     }
+    if acc.aborted_by_repetition || acc.aborted_loop_clean.is_some() {
+        return Ok(());
+    }
+
+    if acc.mode == ApiMode::ChatCompletions && current_event.as_deref() != Some("error") {
+        if let Ok(fast) = serde_json::from_str::<FastChatChunk>(payload_str) {
+            if fast.error.is_none() {
+                if let Some(timings_val) = &fast.timings {
+                    merge_timings(&mut acc.timings, parse_timings(Some(timings_val)));
+                }
+                if let Some(m) = fast.model {
+                    if acc.model.is_empty() || acc.model != m {
+                        acc.model = m.to_string();
+                    }
+                }
+                if let Some(u) = &fast.usage {
+                    acc.usage = parse_usage(Some(u));
+                }
+                if let Some(choice) = fast.choices.as_ref().and_then(|c| c.first()) {
+                    if let Some(fr) = choice.finish_reason {
+                        acc.finish_reason = Some(fr.to_string());
+                    }
+                    if let Some(delta) = &choice.delta {
+                        if let Some(r) = delta.reasoning_content.as_deref().or(delta.reasoning.as_deref()) {
+                            for chunk in acc.push_reasoning_delta(r) {
+                                let _ = tx.send(chunk).await;
+                            }
+                            if acc.aborted_by_repetition {
+                                return Ok(());
+                            }
+                        }
+                        if let Some(c) = delta.content.as_deref() {
+                            acc.push_content_delta(c, splitter, tx).await;
+                            if acc.aborted_by_repetition {
+                                return Ok(());
+                            }
+                        }
+                        if let Some(tcs) = &delta.tool_calls {
+                            for tc in tcs {
+                                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                let entry = acc.tool_calls.entry(idx).or_default();
+                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                    if !id.is_empty() {
+                                        entry.id = id.to_string();
+                                    }
+                                }
+                                if let Some(func) = tc.get("function") {
+                                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                        entry.name.push_str(name);
+                                    }
+                                    if let Some(args) = func.get("arguments") {
+                                        if let Some(s) = args.as_str() {
+                                            entry.arguments_buf.push_str(s);
+                                        } else if args.is_object() {
+                                            entry.arguments_val = Some(args.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
 
     let val: Value = serde_json::from_str(payload_str)
         .map_err(|e| AgentError::Inference(format!("malformed SSE JSON chunk: {e}")))?;
@@ -3544,7 +3819,9 @@ async fn process_sse_line(
     match acc.mode {
         ApiMode::ChatCompletions => {
             if let Some(m) = val.get("model").and_then(|v| v.as_str()) {
-                acc.model = m.to_string();
+                if acc.model.is_empty() || acc.model != m {
+                    acc.model = m.to_string();
+                }
             }
             if val.get("usage").is_some() {
                 acc.usage = parse_usage(val.get("usage"));
@@ -3563,11 +3840,18 @@ async fn process_sse_line(
                         .or_else(|| delta.get("reasoning"))
                         .and_then(|v| v.as_str())
                     {
-                        acc.api_reasoning.push_str(r);
-                        let _ = tx.send(InferenceStreamChunk::ReasoningDelta(r.to_string())).await;
+                        for chunk in acc.push_reasoning_delta(r) {
+                            let _ = tx.send(chunk).await;
+                        }
+                        if acc.aborted_by_repetition {
+                            return Ok(());
+                        }
                     }
                     if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
                         acc.push_content_delta(c, splitter, tx).await;
+                        if acc.aborted_by_repetition {
+                            return Ok(());
+                        }
                     }
                     if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                         for tc in tcs {
@@ -3609,8 +3893,12 @@ async fn process_sse_line(
                 }
                 "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
                     if let Some(delta) = val.get("delta").and_then(|v| v.as_str()) {
-                        acc.api_reasoning.push_str(delta);
-                        let _ = tx.send(InferenceStreamChunk::ReasoningDelta(delta.to_string())).await;
+                        for chunk in acc.push_reasoning_delta(delta) {
+                            let _ = tx.send(chunk).await;
+                        }
+                        if acc.aborted_by_repetition {
+                            return Ok(());
+                        }
                     }
                 }
                 "response.output_item.added" => {
@@ -3728,7 +4016,12 @@ async fn process_sse_line(
                             }
                             "reasoning" if acc.api_reasoning.is_empty() => {
                                 for txt in extract_responses_reasoning_parts(item) {
-                                    acc.api_reasoning.push_str(&txt);
+                                    for chunk in acc.push_reasoning_delta(&txt) {
+                                        let _ = tx.send(chunk).await;
+                                    }
+                                    if acc.aborted_by_repetition {
+                                        return Ok(());
+                                    }
                                 }
                             }
                             _ => {}
@@ -3749,7 +4042,9 @@ async fn process_sse_line(
                         .and_then(|v| v.as_str())
                         .unwrap_or(default_status)
                         .to_string();
-                    acc.finish_reason = Some(status_fr);
+                    if !acc.aborted_by_repetition && acc.aborted_loop_clean.is_none() {
+                        acc.finish_reason = Some(status_fr);
+                    }
                     if let Some(resp) = val.get("response") {
                         acc.final_response_override = Some(resp.clone());
                         if resp.get("usage").is_some() {
@@ -3829,10 +4124,12 @@ async fn process_sse_line(
                             }
                             "thinking_delta" => {
                                 if let Some(txt) = delta.get("thinking").and_then(|v| v.as_str()) {
-                                    acc.api_reasoning.push_str(txt);
-                                    let _ = tx
-                                        .send(InferenceStreamChunk::ReasoningDelta(txt.to_string()))
-                                        .await;
+                                    for chunk in acc.push_reasoning_delta(txt) {
+                                        let _ = tx.send(chunk).await;
+                                    }
+                                    if acc.aborted_by_repetition {
+                                        return Ok(());
+                                    }
                                 }
                             }
                             "input_json_delta" => {
@@ -3846,12 +4143,14 @@ async fn process_sse_line(
                     }
                 }
                 "message_delta" => {
-                    if let Some(sr) = val
-                        .get("delta")
-                        .and_then(|d| d.get("stop_reason"))
-                        .and_then(|v| v.as_str())
-                    {
-                        acc.finish_reason = Some(sr.to_string());
+                    if !acc.aborted_by_repetition && acc.aborted_loop_clean.is_none() {
+                        if let Some(sr) = val
+                            .get("delta")
+                            .and_then(|d| d.get("stop_reason"))
+                            .and_then(|v| v.as_str())
+                        {
+                            acc.finish_reason = Some(sr.to_string());
+                        }
                     }
                     if let Some(u) = val.get("usage") {
                         let out_tok = u
@@ -3999,6 +4298,15 @@ mod tests {
         assert_eq!(high["reasoning_effort"], "high");
         assert_eq!(high["reasoning_budget"], 8192);
 
+        let xhigh = build_request_payload(
+            &req_with(ApiMode::ChatCompletions, ThinkingLevel::XHigh, 256, vec![]),
+            &cfg,
+            "qwen3",
+            false,
+        );
+        assert_eq!(xhigh["reasoning_effort"], "xhigh");
+        assert_eq!(xhigh["reasoning_budget"], 16384);
+
         let max = build_request_payload(
             &req_with(ApiMode::ChatCompletions, ThinkingLevel::Max, 512, vec![]),
             &cfg,
@@ -4006,10 +4314,21 @@ mod tests {
             false,
         );
         assert_eq!(max["max_tokens"], 512);
-        assert_eq!(max["reasoning_effort"], "high");
+        assert_eq!(max["reasoning_effort"], "xhigh");
         assert_eq!(max["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(max["reasoning_budget"], -1);
         assert_eq!(max["reasoning_format"], "deepseek");
+
+        let mut custom_cfg = cfg.clone();
+        custom_cfg.reasoning_mode = "einstein".to_string();
+        let custom = build_request_payload(
+            &req_with(ApiMode::ChatCompletions, ThinkingLevel::High, 256, vec![]),
+            &custom_cfg,
+            "qwen3",
+            false,
+        );
+        assert_eq!(custom["reasoning_effort"], "einstein");
+        assert_eq!(custom["reasoning_budget"], 8192);
     }
 
     #[test]
@@ -5012,5 +5331,156 @@ mod tests {
         let bad_provider = Ps5LmProvider::new(bad_cfg).unwrap();
         let err = bad_provider.import_kv_and_sampling().await.unwrap_err();
         assert!(matches!(err, AgentError::InferenceUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn sse_accumulator_aborts_and_deduplicates_looping_reasoning_content() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. ChatCompletions looping single-line `reasoning_content` aborts immediately & deduplicates
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut acc = SseAccumulator::new(ApiMode::ChatCompletions, "qwen3".into());
+        let mut splitter = ThinkStreamSplitter::new();
+        let mut ev = None;
+
+        process_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"First planning note. Checking the workspace setup now! "}}]}"#,
+            &mut ev,
+            &mut acc,
+            &mut splitter,
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(!acc.aborted_by_repetition);
+
+        process_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"Checking the workspace setup now! "}}]}"#,
+            &mut ev,
+            &mut acc,
+            &mut splitter,
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(acc.aborted_by_repetition);
+
+        // Trailing finish_reason chunk must not overwrite `repetition_abort`
+        process_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"Checking the workspace setup now!"},"finish_reason":"stop"}]}"#,
+            &mut ev,
+            &mut acc,
+            &mut splitter,
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        drop(tx);
+        let mut emitted = Vec::new();
+        while let Some(c) = rx.recv().await {
+            emitted.push(c);
+        }
+        assert_eq!(emitted.len(), 1);
+        assert!(matches!(emitted[0], InferenceStreamChunk::ReasoningDelta(_)));
+
+        let resp = acc.into_response(12).unwrap();
+        assert_eq!(resp.finish_reason.as_deref(), Some("repetition_abort"));
+        assert_eq!(
+            resp.reasoning.as_deref(),
+            Some("First planning note. Checking the workspace setup now!")
+        );
+
+        // 2. Responses `response.reasoning.delta` loop aborts & deduplicates
+        let (r_tx, _r_rx) = mpsc::channel(32);
+        let mut r_acc = SseAccumulator::new(ApiMode::Responses, "gpt-oss".into());
+        let mut r_splitter = ThinkStreamSplitter::new();
+        let mut r_ev = None;
+        for line in [
+            r#"data: {"type":"response.reasoning.delta","delta":"Analyzing dependencies carefully. "}"#,
+            r#"data: {"type":"response.reasoning.delta","delta":"Analyzing dependencies carefully."}"#,
+            r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        ] {
+            process_sse_line(line, &mut r_ev, &mut r_acc, &mut r_splitter, &r_tx)
+                .await
+                .unwrap();
+        }
+        assert!(r_acc.aborted_by_repetition);
+        let r_resp = r_acc.into_response(5).unwrap();
+        assert_eq!(r_resp.finish_reason.as_deref(), Some("repetition_abort"));
+        assert_eq!(
+            r_resp.reasoning.as_deref(),
+            Some("Analyzing dependencies carefully.")
+        );
+
+        // 3. AnthropicMessages `thinking_delta` clause loop aborts & deduplicates
+        let (a_tx, _a_rx) = mpsc::channel(32);
+        let mut a_acc = SseAccumulator::new(ApiMode::AnthropicMessages, "claude".into());
+        let mut a_splitter = ThinkStreamSplitter::new();
+        let mut a_ev = None;
+        for line in [
+            "event: content_block_delta",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Verify the config value, verify the config value, verify the config value"}}"#,
+            "event: message_delta",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        ] {
+            process_sse_line(line, &mut a_ev, &mut a_acc, &mut a_splitter, &a_tx)
+                .await
+                .unwrap();
+        }
+        assert!(a_acc.aborted_by_repetition);
+        let a_resp = a_acc.into_response(5).unwrap();
+        assert_eq!(a_resp.finish_reason.as_deref(), Some("repetition_abort"));
+        assert_eq!(
+            a_resp.reasoning.as_deref(),
+            Some("Verify the config value")
+        );
+
+        // 4. End-to-end HTTP SSE stream breaks early on looping `reasoning_content` without `[DONE]`
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 4096];
+            let _ = socket.read(&mut req_buf).await;
+
+            let mut sse = String::new();
+            sse.push_str(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"First check. Verifying workspace runtime configuration. \"}}]}\n\n",
+            );
+            for _ in 0..8 {
+                sse.push_str(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Verifying workspace runtime configuration. \"}}]}\n\n",
+                );
+            }
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                sse.len()
+            );
+            let _ = socket.write_all(hdr.as_bytes()).await;
+            let _ = socket.write_all(sse.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let mut cfg = InferenceConfig::default();
+        cfg.base_url = format!("http://{addr}");
+        cfg.max_retries = 0;
+        let provider = Ps5LmProvider::new(cfg).unwrap();
+        let (http_tx, _http_rx) = mpsc::channel(64);
+        let http_resp = provider
+            .generate_stream(
+                req_with(ApiMode::ChatCompletions, ThinkingLevel::High, 256, vec![]),
+                http_tx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let _ = server.await;
+
+        assert_eq!(http_resp.finish_reason.as_deref(), Some("repetition_abort"));
+        assert_eq!(
+            http_resp.reasoning.as_deref(),
+            Some("First check. Verifying workspace runtime configuration.")
+        );
     }
 }

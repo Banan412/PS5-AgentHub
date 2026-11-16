@@ -296,9 +296,14 @@ fn assert_thinking_wire_payload(body: &Value, level: ThinkingLevel) {
             assert_eq!(body["reasoning_effort"], json!("high"));
             assert_eq!(body["reasoning_budget"], json!(8192));
         }
+        ThinkingLevel::XHigh => {
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
+            assert_eq!(body["reasoning_effort"], json!("xhigh"));
+            assert_eq!(body["reasoning_budget"], json!(16384));
+        }
         ThinkingLevel::Max => {
             assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
-            assert_eq!(body["reasoning_effort"], json!("high"));
+            assert_eq!(body["reasoning_effort"], json!("xhigh"));
             assert_eq!(body["reasoning_budget"], json!(-1));
         }
     }
@@ -318,12 +323,13 @@ async fn test_thinking_levels_override_and_per_agent_model_config() {
     let conv_cmd = create_direct_conversation(&harness, "Thinking Overrides", "commander").await;
     let mut events_rx = harness.system.events_tx.subscribe();
 
-    // Part 1: Verify all 5 ThinkingLevel chat overrides (`off`, `low`, `medium`, `high`, `max`)
+    // Part 1: Verify all 6 ThinkingLevel chat overrides (`off`, `low`, `medium`, `high`, `xhigh`, `max`)
     let levels = [
         ThinkingLevel::Off,
         ThinkingLevel::Low,
         ThinkingLevel::Medium,
         ThinkingLevel::High,
+        ThinkingLevel::XHigh,
         ThinkingLevel::Max,
     ];
 

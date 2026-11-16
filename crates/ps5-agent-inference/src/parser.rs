@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ps5_agent_core::{InferenceMessage, ToolCallRequest};
 use serde_json::Value;
@@ -237,7 +237,7 @@ pub fn parse_model_output(
 fn join_non_empty(parts: Vec<String>) -> Option<String> {
     let filtered: Vec<String> = parts
         .into_iter()
-        .map(|s| s.trim().to_string())
+        .map(|s| truncate_verbatim_prose_loops(s.trim()).trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
     if filtered.is_empty() {
@@ -1356,16 +1356,437 @@ fn collapse_contiguous_cycles<T>(
     (keep, changed)
 }
 
-fn deduplicate_line_sentences(line: &str) -> (String, bool) {
-    let spans = split_sentence_spans(line);
-    if spans.len() < 2 {
-        return trim_contiguous_phrase_repeats(line);
+fn has_code_syntax_evidence(t: &str) -> bool {
+    t.contains(['=', ';', '{', '}', '[', ']'])
+        || t.contains("::")
+        || t.contains("->")
+        || t.contains("=>")
+}
+
+fn is_code_or_structured_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if is_markdown_table_row(t) || is_pure_number_or_divider(t) {
+        return true;
+    }
+    if t.starts_with("```")
+        || t.starts_with("~~~")
+        || t.starts_with("//")
+        || t.starts_with("/*")
+        || t.starts_with("#!")
+        || t.starts_with("#include")
+        || t.starts_with("{\"")
+        || t.starts_with("[{")
+    {
+        return true;
+    }
+    const UNAMBIGUOUS_CODE_PREFIXES: &[&str] = &[
+        "fn ",
+        "pub fn ",
+        "pub async fn ",
+        "async fn ",
+        "const ",
+        "struct ",
+        "enum ",
+        "impl ",
+        "trait ",
+        "def ",
+        "async def ",
+        "var ",
+        "if (",
+        "for (",
+        "while (",
+        "switch (",
+    ];
+    if UNAMBIGUOUS_CODE_PREFIXES.iter().any(|p| t.starts_with(p)) {
+        return true;
+    }
+    if [
+        "=>",
+        "&&",
+        "||",
+        "!==",
+        "===",
+        "println!",
+        "eprintln!",
+        "assert_eq!",
+        "assert!",
+    ]
+    .iter()
+    .any(|tok| t.contains(tok))
+    {
+        return true;
+    }
+    if (t.contains(" = ") && t.ends_with(';')) || (t.starts_with('{') && t.contains(':')) {
+        return true;
+    }
+    const PROSE_AMBIGUOUS_CODE_PREFIXES: &[&str] = &[
+        "let ",
+        "use ",
+        "from ",
+        "return ",
+        "class ",
+        "match ",
+        "import ",
+        "export ",
+        "function ",
+        "static ",
+        "mod ",
+    ];
+    if PROSE_AMBIGUOUS_CODE_PREFIXES.iter().any(|p| t.starts_with(p)) {
+        if has_code_syntax_evidence(t) {
+            return true;
+        }
+        if t.starts_with("from ") && t.contains(" import ") {
+            return true;
+        }
+        if t.starts_with("import ") && (t.contains('.') || t.contains(" as ")) {
+            return true;
+        }
+        if t.starts_with("class ") && (t.ends_with(':') || t.contains('(')) {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_list_marker_prefix(s: &str) -> &str {
+    let trimmed = s.trim_start();
+    for prefix in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.trim_start();
+        }
+    }
+    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if (1..=4).contains(&digits) {
+        let after_digits = &trimmed[digits..];
+        if let Some(rest) = after_digits
+            .strip_prefix(". ")
+            .or_else(|| after_digits.strip_prefix(") "))
+        {
+            return rest.trim_start();
+        }
+    }
+    s
+}
+
+fn normalize_clause_key(s: &str) -> String {
+    let trimmed = s.trim().trim_end_matches([',', ';', ':', '-', '\u{2014}']);
+    normalize_prose_key(trimmed)
+}
+
+fn trim_trailing_clause_delim(s: &str) -> &str {
+    s.trim_end()
+        .trim_end_matches([',', ';', ':', '-', '\u{2014}'])
+        .trim_end()
+}
+
+fn split_clause_spans(line: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    let bytes = line.as_bytes();
+    let mut iter = line.char_indices().peekable();
+
+    while let Some((idx, ch)) = iter.next() {
+        if idx < start {
+            continue;
+        }
+        let ch_end = idx + ch.len_utf8();
+        let next_is_ws = bytes.get(ch_end).is_some_and(u8::is_ascii_whitespace);
+        let at_end = ch_end == line.len();
+
+        let is_delim = if matches!(ch, '.' | '!' | '?' | ',' | ';') && (next_is_ws || at_end) {
+            !(ch == '.' && is_abbreviation_before_dot(line, idx))
+        } else if ch == ':' && next_is_ws {
+            true
+        } else if ch == '\u{2014}' {
+            true
+        } else if ch == '-'
+            && idx > start
+            && bytes.get(idx - 1).is_some_and(u8::is_ascii_whitespace)
+        {
+            let after_hyphen = if bytes.get(ch_end) == Some(&b'-') {
+                ch_end + 1
+            } else {
+                ch_end
+            };
+            bytes.get(after_hyphen).is_some_and(u8::is_ascii_whitespace)
+        } else {
+            false
+        };
+
+        if is_delim {
+            let end = if ch == '-' && bytes.get(ch_end) == Some(&b'-') {
+                ch_end + 1
+            } else {
+                ch_end
+            };
+            while let Some(&(next_idx, _)) = iter.peek() {
+                if next_idx < end {
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+            let slice = &line[start..end];
+            if !slice.trim().is_empty() {
+                let lead_ws = slice.len() - slice.trim_start().len();
+                spans.push((start + lead_ws, end));
+            }
+            start = end;
+            while start < line.len() && bytes[start].is_ascii_whitespace() {
+                start += 1;
+            }
+        }
     }
 
-    let sentences: Vec<&str> = spans.iter().map(|&(s, e)| &line[s..e]).collect();
-    let keys: Vec<String> = sentences.iter().map(|s| normalize_prose_key(s)).collect();
+    if start < line.len() && !line[start..].trim().is_empty() {
+        let slice = &line[start..];
+        let lead_ws = slice.len() - slice.trim_start().len();
+        spans.push((start + lead_ws, line.len()));
+    }
+    spans
+}
 
-    let (cycle_kept_idxs, mut changed) = collapse_contiguous_cycles(
+fn find_span_loop_cut_idx(
+    line: &str,
+    spans: &[(usize, usize)],
+    keys: &[String],
+    allow_4x_non_contiguous: bool,
+) -> Option<usize> {
+    if spans.len() < 2 {
+        return None;
+    }
+    let char_lens: Vec<usize> = keys.iter().map(|k| k.chars().count()).collect();
+
+    // 1. Contiguous k=1 (or multi-span cycle k>=2, e.g. "Wait, let me check X, wait, let me check X, ...").
+    for i in 0..spans.len() {
+        let max_k = (spans.len() - i) / 2;
+        for k in 1..=max_k {
+            if keys[i..i + k] != keys[i + k..i + 2 * k] {
+                continue;
+            }
+            let mut reps = 2usize;
+            while i + (reps + 1) * k <= spans.len()
+                && keys[i..i + k] == keys[i + reps * k..i + (reps + 1) * k]
+            {
+                reps += 1;
+            }
+            let unit_slice = &line[spans[i].0..spans[i + k - 1].1];
+            let unit_chars = if k == 1 {
+                char_lens[i]
+            } else {
+                normalize_clause_key(unit_slice).chars().count()
+            };
+            let protected = is_protected_boilerplate_short_item(unit_slice, unit_chars);
+            if protected {
+                continue;
+            }
+            let matched = (unit_chars >= 32 && reps >= 2) || (unit_chars >= 20 && reps >= 3);
+            if matched {
+                return Some(spans[i + k - 1].1);
+            }
+        }
+    }
+
+    // 2. Same normalized sentence (>= 24 chars) appears >= 4 times in the block/line -> stop after 1st.
+    if allow_4x_non_contiguous && spans.len() >= 4 {
+        let mut stats: HashMap<&str, (usize, usize)> = HashMap::new();
+        for (idx, key) in keys.iter().enumerate() {
+            if char_lens[idx] < 24 {
+                continue;
+            }
+            let raw_span = &line[spans[idx].0..spans[idx].1];
+            if is_protected_boilerplate_short_item(raw_span, char_lens[idx]) {
+                continue;
+            }
+            let entry = stats.entry(key.as_str()).or_insert((idx, 0));
+            entry.1 += 1;
+        }
+        if let Some(first_idx) = stats
+            .into_values()
+            .filter(|&(_, count)| count >= 4)
+            .map(|(first_idx, _)| first_idx)
+            .min()
+        {
+            return Some(spans[first_idx].1);
+        }
+    }
+
+    None
+}
+
+fn normalize_word_for_loop_check(raw: &str) -> String {
+    let trimmed = raw.trim_matches(|c: char| matches!(c, ',' | ';' | ':' | '.' | '!' | '?'));
+    let target = if trimmed.is_empty() { raw } else { trimmed };
+    normalize_prose_key(target)
+}
+
+fn tokenize_words_for_loop_check(line: &str) -> Vec<(usize, usize, String)> {
+    let mut words = Vec::new();
+    let mut word_start: Option<usize> = None;
+    for (idx, ch) in line.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(st) = word_start.take() {
+                let norm = normalize_word_for_loop_check(&line[st..idx]);
+                if !norm.is_empty() {
+                    words.push((st, idx, norm));
+                }
+            }
+        } else {
+            word_start.get_or_insert(idx);
+        }
+    }
+    if let Some(st) = word_start {
+        let norm = normalize_word_for_loop_check(&line[st..]);
+        if !norm.is_empty() {
+            words.push((st, line.len(), norm));
+        }
+    }
+    words
+}
+
+fn find_word_period_loop_end(line: &str) -> Option<usize> {
+    let words = tokenize_words_for_loop_check(line);
+    let n = words.len();
+    if n < 4 {
+        return None;
+    }
+
+    let mut positions: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, (_, _, w)) in words.iter().enumerate() {
+        positions.entry(w.as_str()).or_default().push(idx);
+    }
+
+    for i in 0..n {
+        let Some(occ) = positions.get(words[i].2.as_str()) else {
+            continue;
+        };
+        let mut checked = 0usize;
+        for &j in occ {
+            if j <= i {
+                continue;
+            }
+            let p = j - i;
+            if p < 2 || p > 80 || i + 2 * p > n {
+                continue;
+            }
+            checked += 1;
+            if checked > 12 {
+                break;
+            }
+            if !(0..p).all(|k| words[i + k].2 == words[i + p + k].2) {
+                continue;
+            }
+            let mut reps = 2usize;
+            while i + (reps + 1) * p <= n
+                && (0..p).all(|k| words[i + k].2 == words[i + reps * p + k].2)
+            {
+                reps += 1;
+            }
+            let unit_slice = &line[words[i].0..words[i + p - 1].1];
+            let unit_chars = normalize_clause_key(unit_slice).chars().count();
+            let alpha_words = (0..p)
+                .filter(|&k| words[i + k].2.chars().any(char::is_alphabetic))
+                .count();
+            if alpha_words >= 2
+                && !is_pure_number_or_divider(unit_slice)
+                && ((unit_chars >= 32 && reps >= 2) || (unit_chars >= 20 && reps >= 3))
+            {
+                return Some(words[i + p - 1].1);
+            }
+        }
+    }
+    None
+}
+
+/// Truncates intra-line repeated sentence, clause, and word-period loops
+/// while keeping the first occurrence and preserving code lines, indented/structured
+/// markdown lists, and short phrases.
+pub fn truncate_repeated_sentences_in_line(line: &str) -> String {
+    if line.trim().is_empty()
+        || line.starts_with("    ")
+        || line.starts_with('\t')
+        || is_markdown_table_row(line)
+        || is_pure_number_or_divider(line)
+    {
+        return line.to_string();
+    }
+
+    let is_list_item = starts_with_list_marker(line);
+    if !is_list_item && is_code_or_structured_line(line) {
+        return line.to_string();
+    }
+
+    let sentence_spans = split_sentence_spans(line);
+    if sentence_spans.len() >= 2 {
+        let sentence_keys: Vec<String> = sentence_spans
+            .iter()
+            .enumerate()
+            .map(|(idx, &(s, e))| {
+                let raw = if idx == 0 && is_list_item {
+                    strip_list_marker_prefix(&line[s..e])
+                } else {
+                    &line[s..e]
+                };
+                normalize_prose_key(raw)
+            })
+            .collect();
+        if let Some(cut_end) = find_span_loop_cut_idx(line, &sentence_spans, &sentence_keys, true) {
+            return line[..cut_end].trim_end().to_string();
+        }
+    }
+
+    if !is_list_item {
+        let clause_spans = split_clause_spans(line);
+        if clause_spans.len() >= 2 {
+            let clause_keys: Vec<String> = clause_spans
+                .iter()
+                .map(|&(s, e)| normalize_clause_key(&line[s..e]))
+                .collect();
+            if let Some(cut_end) = find_span_loop_cut_idx(line, &clause_spans, &clause_keys, false)
+            {
+                return trim_trailing_clause_delim(&line[..cut_end]).to_string();
+            }
+        }
+
+        if let Some(cut_end) = find_word_period_loop_end(line) {
+            return trim_trailing_clause_delim(&line[..cut_end]).to_string();
+        }
+    }
+
+    line.to_string()
+}
+
+fn deduplicate_line_sentences(line: &str) -> (String, bool) {
+    let intra_truncated = truncate_repeated_sentences_in_line(line);
+    let mut changed = intra_truncated != line;
+    let working = intra_truncated.as_str();
+
+    let spans = split_sentence_spans(working);
+    if spans.len() < 2 {
+        let (trimmed, phrase_changed) = trim_contiguous_phrase_repeats(working);
+        return (trimmed, changed || phrase_changed);
+    }
+
+    let is_list_item = starts_with_list_marker(working);
+    let sentences: Vec<&str> = spans.iter().map(|&(s, e)| &working[s..e]).collect();
+    let keys: Vec<String> = sentences
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            let raw = if idx == 0 && is_list_item {
+                strip_list_marker_prefix(s)
+            } else {
+                *s
+            };
+            normalize_prose_key(raw)
+        })
+        .collect();
+
+    let (cycle_kept_idxs, cycle_changed) = collapse_contiguous_cycles(
         &sentences,
         &keys,
         40,
@@ -1373,6 +1794,9 @@ fn deduplicate_line_sentences(line: &str) -> (String, bool) {
         15,
         |s, c| is_protected_boilerplate_short_item(s, c),
     );
+    if cycle_changed {
+        changed = true;
+    }
 
     let mut seen_substantial: HashSet<String> = HashSet::new();
     let mut kept_texts: Vec<String> = Vec::with_capacity(cycle_kept_idxs.len());
@@ -1406,7 +1830,7 @@ fn deduplicate_line_sentences(line: &str) -> (String, bool) {
     let joined = if changed {
         kept_texts.join(" ")
     } else {
-        line.to_string()
+        working.to_string()
     };
     let (final_line, phrase_changed) = trim_contiguous_phrase_repeats(&joined);
     (final_line, changed || phrase_changed)
@@ -1420,7 +1844,7 @@ fn deduplicate_paragraph_lines(para: &str) -> (String, bool) {
     let (cycle_idxs, cycle_changed) = collapse_contiguous_cycles(
         &raw_lines,
         &keys,
-        40,
+        36,
         40,
         20,
         |l, c| is_protected_boilerplate_short_item(l, c),
@@ -1456,6 +1880,44 @@ fn deduplicate_paragraph_lines(para: &str) -> (String, bool) {
         } else {
             cleaned_lines.push(line.to_string());
         }
+    }
+
+    // If the exact same normalized sentence (>= 24 chars) appears >= 4 times across lines in
+    // this block, keep only up through its first occurrence and stop the loop.
+    let mut sentence_stats: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    for (line_idx, line) in cleaned_lines.iter().enumerate() {
+        let is_indented = line.starts_with("    ") || line.starts_with('\t');
+        if is_indented || is_markdown_table_row(line) || is_code_or_structured_line(line) {
+            continue;
+        }
+        let is_list = starts_with_list_marker(line);
+        for (s_idx, (st, en)) in split_sentence_spans(line).into_iter().enumerate() {
+            let sent = &line[st..en];
+            let norm_input = if s_idx == 0 && is_list {
+                strip_list_marker_prefix(sent)
+            } else {
+                sent
+            };
+            let skey = normalize_prose_key(norm_input);
+            let schars = skey.chars().count();
+            if schars < 24 || is_protected_boilerplate_short_item(sent, schars) {
+                continue;
+            }
+            let entry = sentence_stats.entry(skey).or_insert((line_idx, en, 0));
+            entry.2 += 1;
+        }
+    }
+    if let Some((cut_line_idx, cut_byte_end)) = sentence_stats
+        .into_values()
+        .filter(|&(_, _, count)| count >= 4)
+        .map(|(l_idx, end, _)| (l_idx, end))
+        .min()
+    {
+        cleaned_lines.truncate(cut_line_idx + 1);
+        cleaned_lines[cut_line_idx] = cleaned_lines[cut_line_idx][..cut_byte_end]
+            .trim_end()
+            .to_string();
+        changed = true;
     }
 
     if cleaned_lines.len() >= 2 {
@@ -1799,19 +2261,136 @@ enum GuardTagMode {
     InToolCall,
 }
 
-/// Incremental SSE prose loop detector that monitors visible non-thinking,
-/// non-`<tool_call>`, outside-fenced-code-block text across streamed deltas
-/// and aborts verbatim repetition loops early with clean pre-loop visible text.
 #[derive(Debug, Clone, Default)]
-pub struct StreamingRepetitionGuard {
-    visible_acc: String,
-    prose_acc: String,
-    tag_pending: String,
-    tag_mode: GuardTagMode,
+struct FenceFilteredBuffer {
+    acc: String,
     line_buf: String,
     line_flushed_len: usize,
     in_fence: Option<(u8, usize)>,
+    cap_bytes: Option<usize>,
+}
+
+impl FenceFilteredBuffer {
+    fn with_cap(cap_bytes: usize) -> Self {
+        Self {
+            cap_bytes: Some(cap_bytes),
+            ..Self::default()
+        }
+    }
+
+    fn trim_to_cap(&mut self) {
+        let Some(cap) = self.cap_bytes else {
+            return;
+        };
+        if self.acc.len() <= cap {
+            return;
+        }
+        let mut cut = self.acc.len() - cap;
+        while cut < self.acc.len() && !self.acc.is_char_boundary(cut) {
+            cut += 1;
+        }
+        if let Some(rel) = self.acc[cut..].find(['\n', PROSE_BOUNDARY_MARKER]) {
+            let after = cut + rel + 1;
+            if self.acc.is_char_boundary(after) && after < self.acc.len() {
+                cut = after;
+            }
+        }
+        self.acc.drain(..cut);
+    }
+
+    fn push_boundary(&mut self) {
+        if self.in_fence.is_none() && self.line_flushed_len < self.line_buf.len() {
+            if !could_be_fence_open_prefix(&self.line_buf) {
+                self.acc.push_str(&self.line_buf[self.line_flushed_len..]);
+            }
+            self.line_buf.clear();
+            self.line_flushed_len = 0;
+        }
+        if !self.acc.is_empty() && !self.acc.ends_with(PROSE_BOUNDARY_MARKER) {
+            self.acc.push(PROSE_BOUNDARY_MARKER);
+        }
+        self.trim_to_cap();
+    }
+
+    fn flush_eof(&mut self) {
+        if self.in_fence.is_none() && self.line_flushed_len < self.line_buf.len() {
+            if !could_be_fence_open_prefix(&self.line_buf) {
+                self.acc.push_str(&self.line_buf[self.line_flushed_len..]);
+            }
+        }
+        self.line_buf.clear();
+        self.line_flushed_len = 0;
+        self.trim_to_cap();
+    }
+
+    fn close_block(&mut self) {
+        self.flush_eof();
+        self.in_fence = None;
+        self.push_boundary();
+    }
+
+    fn push_chunk(&mut self, chunk: &str) {
+        for piece in chunk.split_inclusive('\n') {
+            let ends_nl = piece.ends_with('\n');
+            let body = if ends_nl {
+                &piece[..piece.len() - 1]
+            } else {
+                piece
+            };
+            self.line_buf.push_str(body);
+
+            if ends_nl {
+                if let Some((fchar, open_len)) = self.in_fence {
+                    if is_fence_close(&self.line_buf, fchar, open_len) {
+                        self.in_fence = None;
+                        self.push_boundary();
+                    }
+                } else if let Some((fchar, open_len)) = parse_fence_open(&self.line_buf) {
+                    self.in_fence = Some((fchar, open_len));
+                    self.push_boundary();
+                } else {
+                    self.acc.push_str(&self.line_buf[self.line_flushed_len..]);
+                    self.acc.push('\n');
+                    self.trim_to_cap();
+                }
+                self.line_buf.clear();
+                self.line_flushed_len = 0;
+            } else if self.in_fence.is_none() && !could_be_fence_open_prefix(&self.line_buf) {
+                self.acc.push_str(&self.line_buf[self.line_flushed_len..]);
+                self.line_flushed_len = self.line_buf.len();
+                self.trim_to_cap();
+            }
+        }
+    }
+}
+
+/// Incremental SSE loop detector that monitors both visible outside-fenced-code-block
+/// prose AND `<think>` / `<seed:think>` reasoning text (or raw reasoning streams fed
+/// directly via [`Self::observe`]) across streamed deltas and aborts verbatim
+/// repetition loops early with clean pre-loop visible text.
+#[derive(Debug, Clone)]
+pub struct StreamingRepetitionGuard {
+    visible_acc: String,
+    prose: FenceFilteredBuffer,
+    think: FenceFilteredBuffer,
+    tag_pending: String,
+    tag_mode: GuardTagMode,
     aborted_clean: Option<String>,
+    unverified_delta_chars: usize,
+}
+
+impl Default for StreamingRepetitionGuard {
+    fn default() -> Self {
+        Self {
+            visible_acc: String::new(),
+            prose: FenceFilteredBuffer::default(),
+            think: FenceFilteredBuffer::with_cap(32 * 1024),
+            tag_pending: String::new(),
+            tag_mode: GuardTagMode::Normal,
+            aborted_clean: None,
+            unverified_delta_chars: 0,
+        }
+    }
 }
 
 impl StreamingRepetitionGuard {
@@ -1821,6 +2400,15 @@ impl StreamingRepetitionGuard {
 
     pub fn visible_so_far(&self) -> &str {
         &self.visible_acc
+    }
+
+    /// Observes a streamed delta (visible prose, inline `<think>`/`<seed:think>`, or raw
+    /// reasoning delta) and returns `true` if a repetition loop has been detected.
+    pub fn observe(&mut self, delta: &str) -> bool {
+        matches!(
+            self.push_delta(delta),
+            StreamingLoopDecision::AbortRepeatedLoop { .. }
+        )
     }
 
     pub fn push_delta(&mut self, delta: &str) -> StreamingLoopDecision {
@@ -1836,7 +2424,17 @@ impl StreamingRepetitionGuard {
         self.tag_pending.push_str(delta);
         self.drain_tag_pending(false);
 
-        self.evaluate_repetition()
+        let delta_chars = delta.chars().count();
+        self.unverified_delta_chars += delta_chars;
+
+        let has_boundary = delta.contains(['\n', '.', '?', '!', ',', ';', ':', '>']);
+        let small_stream = self.prose.acc.len() + self.think.acc.len() <= 2048;
+        if has_boundary || small_stream || self.unverified_delta_chars >= 16 {
+            self.unverified_delta_chars = 0;
+            self.evaluate_repetition()
+        } else {
+            StreamingLoopDecision::Continue
+        }
     }
 
     pub fn finish(&mut self) -> StreamingLoopDecision {
@@ -1846,7 +2444,9 @@ impl StreamingRepetitionGuard {
             };
         }
         self.drain_tag_pending(true);
-        self.flush_line_buf_eof();
+        self.prose.flush_eof();
+        self.think.flush_eof();
+        self.unverified_delta_chars = 0;
         self.evaluate_repetition()
     }
 
@@ -1856,7 +2456,7 @@ impl StreamingRepetitionGuard {
                 truncated_clean_visible: clean.clone(),
             };
         }
-        if self.detect_prose_repetition() {
+        if detect_text_repetition(&self.prose.acc) || detect_text_repetition(&self.think.acc) {
             let truncated = truncate_verbatim_prose_loops(&self.visible_acc)
                 .trim()
                 .to_string();
@@ -1874,18 +2474,29 @@ impl StreamingRepetitionGuard {
                 GuardTagMode::InThink(variant) => {
                     let close_tag = variant.close_tag();
                     if let Some(idx) = find_ci(&self.tag_pending, close_tag, 0) {
+                        if idx > 0 {
+                            let thought = self.tag_pending[..idx].to_string();
+                            self.think.push_chunk(&thought);
+                        }
                         self.tag_pending.drain(..idx + close_tag.len());
                         self.tag_mode = GuardTagMode::Normal;
+                        self.think.close_block();
                         continue;
                     }
                     if flush_all {
-                        self.tag_pending.clear();
+                        if !self.tag_pending.is_empty() {
+                            let thought = std::mem::take(&mut self.tag_pending);
+                            self.think.push_chunk(&thought);
+                        }
                         self.tag_mode = GuardTagMode::Normal;
+                        self.think.close_block();
                     } else {
                         let hold = partial_tag_suffix_len(&self.tag_pending, close_tag);
-                        let drop_len = self.tag_pending.len() - hold;
-                        if drop_len > 0 {
-                            self.tag_pending.drain(..drop_len);
+                        let emit_len = self.tag_pending.len() - hold;
+                        if emit_len > 0 {
+                            let thought = self.tag_pending[..emit_len].to_string();
+                            self.tag_pending.drain(..emit_len);
+                            self.think.push_chunk(&thought);
                         }
                     }
                     break;
@@ -1897,14 +2508,14 @@ impl StreamingRepetitionGuard {
                         self.visible_acc.push_str(&self.tag_pending[..end]);
                         self.tag_pending.drain(..end);
                         self.tag_mode = GuardTagMode::Normal;
-                        self.push_prose_boundary();
+                        self.prose.push_boundary();
                         continue;
                     }
                     if flush_all {
                         self.visible_acc.push_str(&self.tag_pending);
                         self.tag_pending.clear();
                         self.tag_mode = GuardTagMode::Normal;
-                        self.push_prose_boundary();
+                        self.prose.push_boundary();
                     } else {
                         let hold = partial_tag_suffix_len(&self.tag_pending, close_tag);
                         let emit_len = self.tag_pending.len() - hold;
@@ -1924,7 +2535,7 @@ impl StreamingRepetitionGuard {
                         if idx > 0 {
                             let vis = self.tag_pending[..idx].to_string();
                             self.visible_acc.push_str(&vis);
-                            self.push_visible_chunk(&vis);
+                            self.prose.push_chunk(&vis);
                         }
                         match kind {
                             GuardTagKind::Think(variant) => {
@@ -1936,7 +2547,7 @@ impl StreamingRepetitionGuard {
                                     .push_str(&self.tag_pending[idx..idx + open_len]);
                                 self.tag_pending.drain(..idx + open_len);
                                 self.tag_mode = GuardTagMode::InToolCall;
-                                self.push_prose_boundary();
+                                self.prose.push_boundary();
                             }
                         }
                         continue;
@@ -1952,160 +2563,275 @@ impl StreamingRepetitionGuard {
                         let vis = self.tag_pending[..emit_len].to_string();
                         self.tag_pending.drain(..emit_len);
                         self.visible_acc.push_str(&vis);
-                        self.push_visible_chunk(&vis);
+                        self.prose.push_chunk(&vis);
                     }
                     break;
                 }
             }
         }
     }
+}
 
-    fn push_prose_boundary(&mut self) {
-        if self.in_fence.is_none() && self.line_flushed_len < self.line_buf.len() {
-            if !could_be_fence_open_prefix(&self.line_buf) {
-                self.prose_acc
-                    .push_str(&self.line_buf[self.line_flushed_len..]);
-            }
-            self.line_buf.clear();
-            self.line_flushed_len = 0;
-        }
-        if !self.prose_acc.is_empty() && !self.prose_acc.ends_with(PROSE_BOUNDARY_MARKER) {
-            self.prose_acc.push(PROSE_BOUNDARY_MARKER);
-        }
+fn detect_text_repetition(acc: &str) -> bool {
+    if acc.len() < 40 {
+        return false;
+    }
+    let runs: Vec<&str> = acc
+        .split(PROSE_BOUNDARY_MARKER)
+        .filter(|r| !r.trim().is_empty())
+        .collect();
+    if runs.is_empty() {
+        return false;
     }
 
-    fn flush_line_buf_eof(&mut self) {
-        if self.in_fence.is_none() && self.line_flushed_len < self.line_buf.len() {
-            if !could_be_fence_open_prefix(&self.line_buf) {
-                self.prose_acc
-                    .push_str(&self.line_buf[self.line_flushed_len..]);
-            }
-        }
-        self.line_buf.clear();
-        self.line_flushed_len = 0;
-    }
-
-    fn push_visible_chunk(&mut self, chunk: &str) {
-        for piece in chunk.split_inclusive('\n') {
-            let ends_nl = piece.ends_with('\n');
-            let body = if ends_nl {
-                &piece[..piece.len() - 1]
-            } else {
-                piece
-            };
-            self.line_buf.push_str(body);
-
-            if ends_nl {
-                if let Some((fchar, open_len)) = self.in_fence {
-                    if is_fence_close(&self.line_buf, fchar, open_len) {
-                        self.in_fence = None;
-                        self.push_prose_boundary();
-                    }
-                } else if let Some((fchar, open_len)) = parse_fence_open(&self.line_buf) {
-                    self.in_fence = Some((fchar, open_len));
-                    self.push_prose_boundary();
-                } else {
-                    self.prose_acc
-                        .push_str(&self.line_buf[self.line_flushed_len..]);
-                    self.prose_acc.push('\n');
-                }
-                self.line_buf.clear();
-                self.line_flushed_len = 0;
-            } else if self.in_fence.is_none() && !could_be_fence_open_prefix(&self.line_buf) {
-                self.prose_acc
-                    .push_str(&self.line_buf[self.line_flushed_len..]);
-                self.line_flushed_len = self.line_buf.len();
+    // 1. Consecutive repeated non-empty lines (>= 3 consecutive repeats of >= 20 chars)
+    let mut non_empty_lines: Vec<String> = Vec::new();
+    for run in &runs {
+        for line in run.lines() {
+            let key = normalize_prose_key(line);
+            if !key.is_empty() {
+                non_empty_lines.push(key);
             }
         }
     }
+    if has_consecutive_repeated_keys(&non_empty_lines, 3, 20) {
+        return true;
+    }
 
-    fn detect_prose_repetition(&self) -> bool {
-        let runs: Vec<&str> = self
-            .prose_acc
-            .split(PROSE_BOUNDARY_MARKER)
-            .filter(|r| !r.trim().is_empty())
-            .collect();
-        if runs.is_empty() {
-            return false;
-        }
-
-        // 1. Consecutive repeated non-empty lines (>= 3 consecutive repeats of >= 20 chars)
-        let mut non_empty_lines: Vec<String> = Vec::new();
-        for run in &runs {
-            for line in run.lines() {
-                let key = normalize_prose_key(line);
-                if !key.is_empty() {
-                    non_empty_lines.push(key);
-                }
+    // 2. Substantial repeated paragraph / multi-paragraph cycle (>= 2 repeats of >= 40 chars)
+    let mut raw_paras: Vec<(String, bool)> = Vec::new();
+    let mut cleaned_paras: Vec<(String, bool)> = Vec::new();
+    for (r_idx, run) in runs.iter().enumerate() {
+        let is_last_run = r_idx + 1 == runs.len();
+        let ends_blank = run.ends_with("\n\n") || run.ends_with("\r\n\r\n");
+        let blocks = split_blank_line_blocks(run);
+        for (b_idx, block) in blocks.iter().enumerate() {
+            let is_complete = !(is_last_run && b_idx + 1 == blocks.len() && !ends_blank);
+            let raw_key = normalize_prose_key(block);
+            if !raw_key.is_empty()
+                && !is_protected_boilerplate_short_item(block, raw_key.chars().count())
+            {
+                raw_paras.push((raw_key, is_complete));
+            }
+            let (stripped, _) = strip_spurious_headers_in_paragraph(block);
+            let clean_key = normalize_prose_key(&stripped);
+            if !clean_key.is_empty()
+                && !is_protected_boilerplate_short_item(&stripped, clean_key.chars().count())
+            {
+                cleaned_paras.push((clean_key, is_complete));
             }
         }
-        if has_consecutive_repeated_keys(&non_empty_lines, 3, 20) {
-            return true;
-        }
+    }
+    if has_repeated_substantial_units(&raw_paras, 40)
+        || has_repeated_substantial_units(&cleaned_paras, 40)
+    {
+        return true;
+    }
 
-        // 2. Substantial repeated paragraph / multi-paragraph cycle (>= 2 repeats of >= 40 chars)
-        let mut raw_paras: Vec<(String, bool)> = Vec::new();
-        let mut cleaned_paras: Vec<(String, bool)> = Vec::new();
-        for (r_idx, run) in runs.iter().enumerate() {
-            let is_last_run = r_idx + 1 == runs.len();
-            let ends_blank = run.ends_with("\n\n") || run.ends_with("\r\n\r\n");
-            let blocks = split_blank_line_blocks(run);
-            for (b_idx, block) in blocks.iter().enumerate() {
-                let is_complete = !(is_last_run && b_idx + 1 == blocks.len() && !ends_blank);
-                let raw_key = normalize_prose_key(block);
-                if !raw_key.is_empty() && !is_protected_boilerplate_short_item(block, raw_key.chars().count()) {
-                    raw_paras.push((raw_key, is_complete));
-                }
-                let (stripped, _) = strip_spurious_headers_in_paragraph(block);
-                let clean_key = normalize_prose_key(&stripped);
-                if !clean_key.is_empty()
-                    && !is_protected_boilerplate_short_item(&stripped, clean_key.chars().count())
-                {
-                    cleaned_paras.push((clean_key, is_complete));
-                }
-            }
-        }
-        if has_repeated_substantial_units(&raw_paras, 40)
-            || has_repeated_substantial_units(&cleaned_paras, 40)
-        {
-            return true;
-        }
-
-        // 3. Repeated complete sentences (>= 2 repeats of >= 40 chars, or >= 3 consecutive >= 20)
-        let mut all_sentences: Vec<(String, bool)> = Vec::new();
-        for run in &runs {
-            for raw_line in run.lines() {
+    // 3. Repeated sentences: >= 3 consecutive >= 20, >= 2 consecutive terminated >= 32,
+    //    >= 2 complete >= 40, or >= 4 exact repeats >= 24 within a block.
+    let mut all_sentences: Vec<(String, bool)> = Vec::new();
+    let mut block_sentence_counts: HashMap<(usize, usize, String), usize> = HashMap::new();
+    for (r_idx, run) in runs.iter().enumerate() {
+        let blocks = split_blank_line_blocks(run);
+        for (b_idx, block) in blocks.iter().enumerate() {
+            for raw_line in block.lines() {
                 let line = raw_line.trim_end_matches('\r');
-                if is_markdown_table_row(line) {
+                let is_indented = line.starts_with("    ") || line.starts_with('\t');
+                if is_indented || is_markdown_table_row(line) {
                     continue;
                 }
+                let is_list = starts_with_list_marker(line);
                 let spans = split_sentence_spans(line);
                 for (s_idx, &(st, en)) in spans.iter().enumerate() {
                     let s = &line[st..en];
                     let terminated = s.ends_with(['.', '!', '?']) || s_idx + 1 < spans.len();
-                    let key = normalize_prose_key(s);
-                    if !key.is_empty() && !is_protected_boilerplate_short_item(s, key.chars().count()) {
+                    let norm_input = if s_idx == 0 && is_list {
+                        strip_list_marker_prefix(s)
+                    } else {
+                        s
+                    };
+                    let key = normalize_prose_key(norm_input);
+                    let kchars = key.chars().count();
+                    if !key.is_empty() && !is_protected_boilerplate_short_item(s, kchars) {
+                        if kchars >= 24 && !is_code_or_structured_line(line) {
+                            let count = block_sentence_counts
+                                .entry((r_idx, b_idx, key.clone()))
+                                .or_insert(0);
+                            *count += 1;
+                            if *count >= 4 {
+                                return true;
+                            }
+                        }
                         all_sentences.push((key, terminated));
                     }
                 }
             }
         }
-        let sentence_keys: Vec<String> = all_sentences.iter().map(|(k, _)| k.clone()).collect();
-        if has_consecutive_repeated_keys(&sentence_keys, 3, 20)
-            || has_repeated_substantial_units(&all_sentences, 40)
-        {
+    }
+    let sentence_keys: Vec<String> = all_sentences.iter().map(|(k, _)| k.clone()).collect();
+    if has_consecutive_repeated_keys(&sentence_keys, 3, 20)
+        || has_consecutive_repeated_terminated_keys(&all_sentences, 2, 32)
+        || has_repeated_substantial_units(&all_sentences, 40)
+    {
+        return true;
+    }
+
+    // 4. Intra-line / intra-paragraph clause & punctuation-less word-period loops
+    if has_intra_line_clause_or_phrase_loop(&runs) {
+        return true;
+    }
+
+    // 5. Contiguous verbatim suffix repeat (catches run-on/same-line loops >= 40 chars immediately)
+    if let Some(last_run) = runs.last() {
+        if find_contiguous_suffix_repeat(last_run, 40).is_some() {
             return true;
         }
+    }
 
-        // 4. Contiguous verbatim suffix repeat (catches run-on/same-line loops >= 40 chars immediately)
-        if let Some(last_run) = runs.last() {
-            if find_contiguous_suffix_repeat(last_run, 40).is_some() {
+    // 6. 8-word n-gram >= 3 times in recent 240 words
+    if has_repeated_8word_ngram(&runs, 240, 3) {
+        return true;
+    }
+
+    false
+}
+
+fn has_intra_line_clause_or_phrase_loop(runs: &[&str]) -> bool {
+    for run in runs {
+        for raw_line in run.lines() {
+            let line = raw_line.trim_end_matches('\r');
+            let is_indented = line.starts_with("    ") || line.starts_with('\t');
+            if is_indented
+                || is_markdown_table_row(line)
+                || is_pure_number_or_divider(line)
+                || starts_with_list_marker(line)
+                || is_code_or_structured_line(line)
+            {
+                continue;
+            }
+            let clause_spans = split_clause_spans(line);
+            if clause_spans.len() >= 2 {
+                let clause_keys: Vec<String> = clause_spans
+                    .iter()
+                    .map(|&(s, e)| normalize_clause_key(&line[s..e]))
+                    .collect();
+                if find_span_loop_cut_idx(line, &clause_spans, &clause_keys, false).is_some() {
+                    return true;
+                }
+            }
+            if find_word_period_loop_end(line).is_some() {
                 return true;
             }
         }
-
-        false
     }
+    false
+}
+
+fn has_repeated_8word_ngram(runs: &[&str], recent_words: usize, required_repeats: usize) -> bool {
+    let mut words: Vec<String> = Vec::new();
+    for run in runs {
+        for raw_line in run.lines() {
+            let line = raw_line.trim_end_matches('\r');
+            if line.starts_with("    ")
+                || line.starts_with('\t')
+                || is_markdown_table_row(line)
+                || starts_with_list_marker(line)
+                || is_code_or_structured_line(line)
+            {
+                continue;
+            }
+            for token in line.split_whitespace() {
+                let norm = normalize_word_for_loop_check(token);
+                if !norm.is_empty() {
+                    words.push(norm);
+                }
+            }
+        }
+    }
+    if words.len() < 8 * required_repeats {
+        return false;
+    }
+    let tail_start = words.len().saturating_sub(recent_words);
+    let tail = &words[tail_start..];
+    if tail.len() < 8 {
+        return false;
+    }
+
+    let mut counts: HashMap<[&str; 8], (usize, usize)> = HashMap::new();
+    for (idx, win) in tail.windows(8).enumerate() {
+        let mut total_chars = 0usize;
+        let mut alpha_tokens = 0usize;
+        let mut distinct: [&str; 8] = [""; 8];
+        let mut distinct_len = 0usize;
+        for w in win {
+            total_chars += w.chars().count();
+            if w.chars().any(char::is_alphabetic) {
+                alpha_tokens += 1;
+            }
+            let s = w.as_str();
+            if !distinct[..distinct_len].contains(&s) {
+                distinct[distinct_len] = s;
+                distinct_len += 1;
+            }
+        }
+        if total_chars < 24 || alpha_tokens < 4 || distinct_len < 3 {
+            continue;
+        }
+        let key: [&str; 8] = [
+            win[0].as_str(),
+            win[1].as_str(),
+            win[2].as_str(),
+            win[3].as_str(),
+            win[4].as_str(),
+            win[5].as_str(),
+            win[6].as_str(),
+            win[7].as_str(),
+        ];
+        match counts.get_mut(&key) {
+            Some((count, last_idx)) => {
+                if idx >= *last_idx + 8 {
+                    *count += 1;
+                    *last_idx = idx;
+                    if *count >= required_repeats {
+                        return true;
+                    }
+                }
+            }
+            None => {
+                counts.insert(key, (1, idx));
+            }
+        }
+    }
+    false
+}
+
+fn has_consecutive_repeated_terminated_keys(
+    units: &[(String, bool)],
+    required_repeats: usize,
+    min_chars: usize,
+) -> bool {
+    if units.len() < required_repeats {
+        return false;
+    }
+    let mut streak = 1usize;
+    let mut first_terminated = units[0].1;
+    for i in 1..units.len() {
+        if !units[i].0.is_empty() && units[i].0 == units[i - 1].0 {
+            streak += 1;
+            if streak >= required_repeats
+                && first_terminated
+                && units[i].0.chars().count() >= min_chars
+                && !is_pure_number_or_divider(&units[i].0)
+            {
+                return true;
+            }
+        } else {
+            streak = 1;
+            first_terminated = units[i].1;
+        }
+    }
+    false
 }
 
 fn has_consecutive_repeated_keys(keys: &[String], required_repeats: usize, min_chars: usize) -> bool {
@@ -3006,5 +3732,237 @@ Got it, Commander! Doing it again:\n\nUse this config:";
         let p2 = "The verification suite inspected all twelve modules across the workspace and confirmed each check passed cleanly now.";
         let near = format!("{p1}\n\n{p2}");
         assert_eq!(truncate_verbatim_prose_loops(&near), p1);
+    }
+
+    #[test]
+    fn streaming_repetition_guard_aborts_on_single_line_think_sentence_and_clause_loops() {
+        // (a1) Single-line sentence loop >= 32 chars (2x) inside <think> triggers observe() & push_delta()
+        let think_sentence_loop = concat!(
+            "<thi",
+            "nk>I need to inspect the workspace configuration file. ",
+            "I need to inspect the workspace configuration file.",
+            "</think>",
+        );
+        let mut guard = StreamingRepetitionGuard::new();
+        let mut triggered = false;
+        for ch in think_sentence_loop.chars() {
+            let mut buf = [0u8; 4];
+            if guard.observe(ch.encode_utf8(&mut buf)) {
+                triggered = true;
+                break;
+            }
+        }
+        assert!(
+            triggered,
+            "single-line >= 32 char sentence loop inside <think> should trigger StreamingRepetitionGuard"
+        );
+
+        // (a2) Single-line >= 20 char clause loop (3x) inside <think> without trailing period
+        let mut clause_guard = StreamingRepetitionGuard::new();
+        assert!(!clause_guard.observe("<think>Wait, verify config path, "));
+        assert!(!clause_guard.observe("wait, verify config path, "));
+        assert!(
+            clause_guard.observe("wait, verify config path"),
+            "single-line >= 20 char clause loop (3x) inside <think> should abort immediately"
+        );
+
+        // (a3) Punctuation-less single-line word-period loop inside <think>
+        let mut nopunct_guard = StreamingRepetitionGuard::new();
+        assert!(!nopunct_guard.observe("<think>"));
+        assert!(!nopunct_guard.observe("Check the runtime config path "));
+        assert!(!nopunct_guard.observe("Check the runtime config path "));
+        assert!(
+            nopunct_guard.observe("Check the runtime config path"),
+            "3x punctuation-less >= 20 char phrase in <think> must trigger observe()"
+        );
+
+        // (a4) 8-word n-gram appearing >= 3 times within recent 240 words inside <think>
+        let mut ngram_guard = StreamingRepetitionGuard::new();
+        let ngram = "inspecting every configuration entry inside the local workspace";
+        assert!(!ngram_guard.observe(&format!("<think>First step: {ngram} carefully. ")));
+        assert!(!ngram_guard.observe(&format!("Second angle: maybe avoid stale cache; {ngram} again. ")));
+        assert!(
+            ngram_guard.observe(&format!("Third pass: confirm why {ngram} matters.")),
+            "8-word n-gram >= 3 times in recent 240 words inside <think> should trigger observe()"
+        );
+
+        // (a5) Normal visible prose single-paragraph sentence loop without newlines triggers observe()
+        let mut prose_guard = StreamingRepetitionGuard::new();
+        assert!(!prose_guard.observe("Intro summary. Checking the service config file now. "));
+        assert!(
+            prose_guard.observe("Checking the service config file now."),
+            "single-paragraph visible sentence loop without newlines should trigger observe()"
+        );
+    }
+
+    #[test]
+    fn streaming_repetition_guard_aborts_on_seed_think_paragraph_and_line_loops() {
+        // (b1) <seed:think> paragraph loop triggers StreamingRepetitionGuard
+        let mut para_guard = StreamingRepetitionGuard::new();
+        let para = "Let me check all configuration parameters and verify the local server endpoints carefully.";
+        assert!(!para_guard.observe("<seed:think>\n"));
+        assert!(!para_guard.observe(&format!("{para}\n\n")));
+        assert!(
+            para_guard.observe(&format!("{para}\n\n")),
+            "<seed:think> paragraph loop must trigger StreamingRepetitionGuard"
+        );
+
+        // (b2) <seed:think> line loop (3x >= 20 chars) triggers StreamingRepetitionGuard
+        let mut line_guard = StreamingRepetitionGuard::new();
+        assert!(!line_guard.observe("<seed:think>Inspect target binary path\n"));
+        assert!(!line_guard.observe("Inspect target binary path\n"));
+        let decision = line_guard.push_delta("Inspect target binary path\n");
+        assert_eq!(
+            decision,
+            StreamingLoopDecision::AbortRepeatedLoop {
+                truncated_clean_visible: String::new(),
+            }
+        );
+
+        // (b3) Non-looping <seed:think> followed by repeated visible text preserves pre-loop visible prose
+        let mut mixed_guard = StreamingRepetitionGuard::new();
+        assert_eq!(
+            mixed_guard.push_delta("<seed:think>Planning steps carefully.</seed:think>Ready.\n\n"),
+            StreamingLoopDecision::Continue
+        );
+        let d2 = mixed_guard.push_delta(
+            "Verify the server endpoint configuration cleanly. \
+             Verify the server endpoint configuration cleanly.",
+        );
+        assert_eq!(
+            d2,
+            StreamingLoopDecision::AbortRepeatedLoop {
+                truncated_clean_visible: "Ready.\n\nVerify the server endpoint configuration cleanly."
+                    .to_string(),
+            }
+        );
+
+        // (b4) Lowercase prose starting with ambiguous words ("let ", "use ", "from ") inside <think>
+        //      must NOT be misclassified as code and must still trigger StreamingRepetitionGuard.
+        let mut let_guard = StreamingRepetitionGuard::new();
+        assert!(!let_guard.observe("<think>let me inspect the server config! "));
+        assert!(
+            let_guard.observe("let me inspect the server config!"),
+            "lowercase 'let me ...' 33-char 2x sentence loop in <think> must abort"
+        );
+
+        let mut clause_let_guard = StreamingRepetitionGuard::new();
+        assert!(!clause_let_guard.observe("<think>let me verify config path, "));
+        assert!(!clause_let_guard.observe("let me verify config path, "));
+        assert!(
+            clause_let_guard.observe("let me verify config path"),
+            "lowercase 'let me ...' 3x clause loop in <think> must abort"
+        );
+
+        // (b5) Structured markdown list sharing an 8-word template prefix across >= 3 distinct items
+        //      must NOT false-trigger 8-word n-gram repetition abort in visible prose.
+        let mut list_guard = StreamingRepetitionGuard::new();
+        let structured_list = concat!(
+            "1. Check whether the local HTTP proxy server is listening on port 8080.\n",
+            "2. Check whether the local HTTP proxy server is listening on port 8081.\n",
+            "3. Check whether the local HTTP proxy server is listening on port 8082.\n",
+        );
+        assert_eq!(
+            list_guard.push_delta(structured_list),
+            StreamingLoopDecision::Continue
+        );
+        assert_eq!(list_guard.finish(), StreamingLoopDecision::Continue);
+    }
+
+    #[test]
+    fn truncate_verbatim_prose_loops_and_parse_model_output_truncate_intra_line_thinking_sentences()
+    {
+        // (c1) truncate_verbatim_prose_loops & truncate_repeated_sentences_in_line:
+        //  - >= 20 chars repeated >= 3x contiguously -> keeps 1st and stops
+        let line_3x = "First step. Check the config value! Check the config value! Check the config value! Trailing noise.";
+        assert_eq!(
+            truncate_verbatim_prose_loops(line_3x),
+            "First step. Check the config value!"
+        );
+
+        //  - >= 32 chars repeated >= 2x contiguously -> keeps 1st and stops
+        let line_2x = "I need to inspect the local runtime config. I need to inspect the local runtime config. I need to";
+        assert_eq!(
+            truncate_verbatim_prose_loops(line_2x),
+            "I need to inspect the local runtime config."
+        );
+
+        //  - lowercase prose with ambiguous code-like leading words ("let ", "use ", "from ")
+        assert_eq!(
+            truncate_verbatim_prose_loops(
+                "let me inspect the server config! let me inspect the server config!"
+            ),
+            "let me inspect the server config!"
+        );
+        assert_eq!(
+            truncate_verbatim_prose_loops(
+                "use the local workspace path! use the local workspace path! use the local workspace path!"
+            ),
+            "use the local workspace path!"
+        );
+        assert_eq!(
+            truncate_verbatim_prose_loops(
+                "from the server logs check! from the server logs check! from the server logs check!"
+            ),
+            "from the server logs check!"
+        );
+
+        //  - exact normalized sentence >= 24 chars appearing >= 4x non-contiguously in a block -> keeps 1st and stops
+        let block_4x = "Intro note. Verify the server port now! Alpha branch. Verify the server port now! \
+                        Beta branch. Verify the server port now! Gamma branch. Verify the server port now!";
+        assert_eq!(
+            truncate_verbatim_prose_loops(block_4x),
+            "Intro note. Verify the server port now!"
+        );
+
+        //  - >= 36 char line deduplication across newlines
+        let line_36 = "Checking thirty-six character line!!\nChecking thirty-six character line!!";
+        assert_eq!(
+            truncate_verbatim_prose_loops(line_36),
+            "Checking thirty-six character line!!"
+        );
+
+        // (c2) Safety: code lines, indented/structured markdown lists, and short phrases stay intact
+        let safe_code_and_lists = concat!(
+            "let x = compute(a); let x = compute(a); let x = compute(a);\n\n",
+            "    indented item alpha; indented item alpha; indented item alpha\n\n",
+            "- Alpha check: step 1, step 2, step 3\n",
+            "- Beta check: step 1, step 2, step 3\n\n",
+            "1. Check whether the local HTTP proxy server is listening on port 8080.\n",
+            "2. Check whether the local HTTP proxy server is listening on port 8081.\n",
+            "3. Check whether the local HTTP proxy server is listening on port 8082.\n\n",
+            "ok. ok. ok. yes, yes, yes."
+        );
+        assert_eq!(
+            truncate_verbatim_prose_loops(safe_code_and_lists),
+            safe_code_and_lists
+        );
+
+        // (c3) parse_model_output truncates repeated intra-line thinking sentences in both <think>
+        //      and <seed:think> as well as passed api_reasoning_parts.
+        let model_raw = concat!(
+            "<think>Let me verify the workspace setup. ",
+            "Checking the configuration settings now! Checking the configuration settings now! ",
+            "Checking the configuration settings now! Checking the",
+            "</think>\nFinal clean answer.",
+        );
+        let parsed = parse_model_output(model_raw, None, vec![]);
+        assert_eq!(
+            parsed.reasoning.as_deref(),
+            Some("Let me verify the workspace setup. Checking the configuration settings now!")
+        );
+        assert_eq!(parsed.content, "Final clean answer.");
+
+        let api_loop = "Analyzing task requirements carefully, analyzing task requirements carefully, analyzing task requirements carefully";
+        let parsed_api = parse_model_output(
+            "<seed:think>Step one is verified! Step one is verified! Step one is verified! trailing</seed:think>Done.",
+            Some(api_loop.to_string()),
+            vec![],
+        );
+        assert_eq!(
+            parsed_api.reasoning.as_deref(),
+            Some("Analyzing task requirements carefully\nStep one is verified!")
+        );
+        assert_eq!(parsed_api.content, "Done.");
     }
 }
